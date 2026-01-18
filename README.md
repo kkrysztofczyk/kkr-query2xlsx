@@ -64,14 +64,36 @@ pip install -r requirements.txt
 
 Copy the sample connection file:
 
+**macOS / Linux**
 ```bash
 cp secure.sample.json secure.txt
 ```
 
+**Windows (PowerShell)**
+```powershell
+Copy-Item secure.sample.json secure.txt
+```
+
+**Windows (CMD)**
+```bat
+copy secure.sample.json secure.txt
+```
+
 (Optional) Copy example query list:
 
+**macOS / Linux**
 ```bash
 cp queries.sample.txt queries.txt
+```
+
+**Windows (PowerShell)**
+```powershell
+Copy-Item queries.sample.txt queries.txt
+```
+
+**Windows (CMD)**
+```bat
+copy queries.sample.txt queries.txt
 ```
 
 > `secure.txt` is **gitignored** and must never be committed.
@@ -187,10 +209,10 @@ Do **not** share logs from production systems.
 
 - SQL Server queries are automatically prefixed with:
   ```sql
-  SET ARITHABORT ON;
-  SET NOCOUNT ON;
-  SET ANSI_WARNINGS OFF;
-  ```
+SET ARITHABORT ON;
+SET NOCOUNT ON;
+SET ANSI_WARNINGS OFF;
+```
 
 ---
 
