@@ -208,7 +208,7 @@ Do **not** share logs from production systems.
 - Exported files may overwrite existing files with the same name.
 
 - SQL Server queries are automatically prefixed with:
-  ```sql
+```sql
 SET ARITHABORT ON;
 SET NOCOUNT ON;
 SET ANSI_WARNINGS OFF;
@@ -225,4 +225,5 @@ MIT License
 ## Disclaimer
 
 This tool is provided as-is.  
-Use at your own risk, especially when connecting to production databases.
+Use at your own risk, especially when connecting to production databases.  
+This project uses third-party libraries licensed under their respective licenses (MIT, BSD, LGPL).
