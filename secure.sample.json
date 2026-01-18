@@ -1,0 +1,28 @@
+{
+  "last_selected": "Demo SQLite",
+  "connections": [
+    {
+      "name": "Demo SQLite",
+      "type": "sqlite",
+      "url": "sqlite:///examples/db/demo.sqlite",
+      "details": {
+        "path": "examples/db/demo.sqlite"
+      }
+    },
+    {
+      "name": "Example MSSQL",
+      "type": "mssql_odbc",
+      "url": "mssql+pyodbc:///?odbc_connect=DRIVER%3D%7BODBC+Driver+17+for+SQL+Server%7D%3BSERVER%3Dlocalhost%3BDATABASE%3Dexample_db%3BUID%3Duser%3BPWD%3Dpassword",
+      "details": {
+        "driver": "ODBC Driver 17 for SQL Server",
+        "server": "localhost",
+        "database": "example_db",
+        "username": "user",
+        "password": "password",
+        "trusted": false,
+        "encrypt": true,
+        "trust_server_certificate": true
+      }
+    }
+  ]
+}

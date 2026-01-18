@@ -1,0 +1,31 @@
+# --- Secrets & local config ---
+secure.txt
+queries.txt
+csv_profiles.json
+
+# --- Generated output ---
+generated_reports/
+logs/
+
+# --- Databases ---
+*.db
+*.sqlite
+*.sqlite3
+
+# --- Python ---
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+.venv
+venv/
+
+# --- OS / IDE ---
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Keep the demo database in the repo
+!examples/db/demo.sqlite

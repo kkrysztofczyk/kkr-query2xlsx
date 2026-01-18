@@ -1,0 +1,3 @@
+examples/queries/01_simple_select.sql
+examples/queries/02_join.sql
+examples/queries/03_aggregation.sql
