@@ -5,6 +5,14 @@ Includes **GUI and CLI modes**, retry handling, CSV profiles, XLSX templates, an
 
 ---
 
+## Screenshot
+
+> Recommended file location in the repo: `docs/gui.png`
+
+![KKr SQL to XLSX/CSV GUI](docs/gui.png)
+
+---
+
 ## What this tool is for
 
 - Running SQL queries stored in `.sql` files
@@ -22,10 +30,21 @@ Includes **GUI and CLI modes**, retry handling, CSV profiles, XLSX templates, an
 - File-based SQL queries
 - Excel (XLSX) and CSV export
 - CSV profiles (delimiter, encoding, decimal separator, date format)
-- XLSX template support (paste results into existing sheets)
+- XLSX template support (paste results into existing sheets) — **GUI only**
 - Retry logic for deadlocks / serialization errors
 - Rotating logs
 - Demo SQLite database + example queries included
+
+---
+
+## Requirements
+
+- Python **3.9+** recommended
+- Dependencies are listed in `requirements.txt`
+- Notes:
+  - **SQL Server (ODBC)** requires Microsoft ODBC Driver (e.g. *ODBC Driver 17/18 for SQL Server*) and `pyodbc`
+  - **PostgreSQL** requires a PostgreSQL driver (e.g. `psycopg2-binary`)
+  - SQLite works out-of-the-box (file-based)
 
 ---
 
@@ -43,10 +62,13 @@ Includes **GUI and CLI modes**, retry handling, CSV profiles, XLSX templates, an
 │     ├─ 01_simple_select.sql
 │     ├─ 02_join.sql
 │     └─ 03_aggregation.sql
+├─ docs/
+│  └─ gui.png
 ├─ templates/
 ├─ generated_reports/   (created at runtime)
 ├─ logs/                (created at runtime)
 ├─ requirements.txt
+├─ LICENSE
 └─ README.md
 ```
 
@@ -57,7 +79,7 @@ Includes **GUI and CLI modes**, retry handling, CSV profiles, XLSX templates, an
 ### 1. Install dependencies
 
 ```bash
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
 ```
 
 ### 2. Prepare local config
@@ -131,11 +153,34 @@ generated_reports/
 
 ---
 
+## Usage
+
+### GUI usage
+
+- Configure a connection (or use **Demo SQLite**)
+- Pick a `.sql` file (or use `queries.txt` list)
+- Choose export format (XLSX/CSV)
+- Click **Start**
+- Use “Open file” / “Open folder” buttons after export
+
+### CLI usage (`-c`)
+
+```bash
+python main.pyw -c
+```
+
+Notes:
+- CLI mode requires at least one saved connection in `secure.txt`
+- You will be prompted to choose a query file and output format
+- Output is written to `generated_reports/`
+
+---
+
 ## Configuration
 
 ### Connections (`secure.txt`)
 
-Connections are stored locally in `secure.txt`.
+Connections are stored locally in `secure.txt` (JSON).
 
 Supported types:
 - SQLite (file-based)
@@ -143,8 +188,6 @@ Supported types:
 - PostgreSQL
 
 Use `secure.sample.json` as a template and rename it to `secure.txt`.
-
----
 
 ### Query list (`queries.txt`)
 
@@ -159,8 +202,6 @@ examples/queries/02_join.sql
 
 You can also pick any `.sql` file manually from the GUI.
 
----
-
 ### CSV profiles
 
 CSV export can be customized via profiles:
@@ -172,8 +213,6 @@ CSV export can be customized via profiles:
 Profiles can be managed directly from the GUI.
 
 ⚠️ Note: `delimiter_replacement` intentionally **modifies string values** to avoid escaping issues. Use with care.
-
----
 
 ### XLSX templates (GUI only)
 
@@ -187,38 +226,41 @@ The template file is copied before writing.
 
 ---
 
-## Logging
+## Output & logs
 
-- Logs are written to `logs/kkr_query2sheet.log`
-- Rotating log files (max ~1 MB, 3 backups)
-- Logs may include SQL text and error details
-
-Do **not** share logs from production systems.
+- Exports are written to: `generated_reports/`
+- Logs are written to: `logs/kkr_query2sheet.log`
+  - Rotating log files (max ~1 MB, 3 backups)
+  - Logs may include SQL text and error details
 
 ---
 
-## Important notes
+## Troubleshooting
 
-- This tool executes **arbitrary SQL**  
-  Run only queries you trust.
+- **SQL Server: ODBC driver missing / pyodbc missing**
+  - Install Microsoft ODBC Driver 17/18 and ensure `pyodbc` is installed.
+- **PostgreSQL: psycopg2 missing**
+  - Install `psycopg2-binary` (or another PostgreSQL driver).
+- **PermissionError when exporting**
+  - The output file may be open in Excel. Close it and retry.
+- **Nothing happens / no rows returned**
+  - The query executed but returned 0 rows — check your SQL and filters.
+- **Where are details of an error?**
+  - See `logs/kkr_query2sheet.log`
 
-- Credentials are stored locally in plain text  
-  (`secure.txt` is gitignored by design).
+---
 
-- Exported files may overwrite existing files with the same name.
+## Security notes
 
-- SQL Server queries are automatically prefixed with:
-```sql
-SET ARITHABORT ON;
-SET NOCOUNT ON;
-SET ANSI_WARNINGS OFF;
-```
+- This tool executes **arbitrary SQL** — run only queries you trust.
+- `secure.txt` may contain database credentials — **never commit it**.
+- Logs can contain SQL fragments and connection/driver error details — treat logs as sensitive.
 
 ---
 
 ## License
 
-MIT License
+MIT License (see `LICENSE`)
 
 ---
 
