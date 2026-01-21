@@ -1,0 +1,66 @@
+name: Bug report
+description: Zgłoś błąd w aplikacji (bez danych wrażliwych)
+title: "[BUG] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ⚠️ Nie wklejaj haseł, tokenów, connection stringów, nazw hostów, danych osobowych ani produkcyjnego SQL.
+        Opisz problem tak, żeby dało się go odtworzyć na danych testowych.
+
+  - type: dropdown
+    id: mode
+    attributes:
+      label: Tryb
+      options:
+        - GUI
+        - CLI
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: System
+      options:
+        - Windows
+        - macOS
+        - Linux
+        - Inne
+    validations:
+      required: true
+
+  - type: textarea
+    id: what
+    attributes:
+      label: Co się stało?
+      description: Krótko i konkretnie.
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Kroki do odtworzenia
+      placeholder: |
+        1.
+        2.
+        3.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Oczekiwane zachowanie
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Bezpieczeństwo danych
+      options:
+        - label: Potwierdzam, że nie wkleiłem(-am) żadnych sekretów ani danych wrażliwych.
+          required: true

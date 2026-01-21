@@ -10,6 +10,7 @@ import sys
 import time
 import tkinter as tk
 import tkinter.font as tkfont
+import webbrowser
 from datetime import datetime
 from tkinter import filedialog, messagebox, simpledialog
 from tkinter import ttk
@@ -25,6 +26,9 @@ from openpyxl.utils import coordinate_to_tuple
 
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+GITHUB_NEW_ISSUE_CHOOSE_URL = (
+    "https://github.com/kkrysztofczyk/kkr-query2xlsx/issues/new/choose"
+)
 
 
 def _build_path(name: str) -> str:
@@ -62,6 +66,26 @@ def _center_window(win, parent=None):
     x = max(x, vroot_x)
     y = max(y, vroot_y)
     win.geometry(f"+{x}+{y}")
+
+
+def open_github_issue_chooser(parent=None) -> None:
+    try:
+        ok = webbrowser.open_new_tab(GITHUB_NEW_ISSUE_CHOOSE_URL)
+        if not ok and parent is not None:
+            messagebox.showwarning(
+                "Nie mogę otworzyć przeglądarki",
+                "Nie udało się automatycznie otworzyć linku.\n"
+                "Skopiuj i otwórz ręcznie:\n\n" + GITHUB_NEW_ISSUE_CHOOSE_URL,
+                parent=parent,
+            )
+    except Exception as exc:  # noqa: BLE001
+        if parent is not None:
+            messagebox.showerror(
+                "Błąd",
+                "Nie udało się otworzyć przeglądarki.\n\n"
+                f"{exc}\n\nLink:\n{GITHUB_NEW_ISSUE_CHOOSE_URL}",
+                parent=parent,
+            )
 
 
 SECURE_PATH = _build_path("secure.txt")
@@ -3320,6 +3344,12 @@ def run_gui(connection_store, output_directory):
     btn_start = tk.Button(result_frame, text="Start", command=run_export_gui)
     btn_start.grid(row=0, column=0, pady=(0, 10), sticky="w")
     start_button_holder["widget"] = btn_start
+    btn_report_issue = tk.Button(
+        result_frame,
+        text="Zgłoś problem / sugestię",
+        command=lambda: open_github_issue_chooser(parent=root),
+    )
+    btn_report_issue.grid(row=0, column=1, padx=(10, 0), pady=(0, 10), sticky="w")
 
     refresh_connection_combobox()
     refresh_secure_edit_button()

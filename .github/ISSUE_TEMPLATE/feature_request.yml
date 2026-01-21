@@ -1,0 +1,32 @@
+name: Feature request
+description: Zaproponuj ulepszenie / nową funkcję (bez danych wrażliwych)
+title: "[IDEA] "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ⚠️ Nie wklejaj haseł, tokenów, connection stringów, nazw hostów, danych osobowych ani produkcyjnego SQL.
+        Opisz przypadek użycia i oczekiwany efekt.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Jaki problem chcesz rozwiązać?
+    validations:
+      required: true
+
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proponowane rozwiązanie
+      description: Jak powinno działać w GUI/CLI? Jakie opcje?
+    validations:
+      required: true
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Kontekst (opcjonalnie)
+    validations:
+      required: false
