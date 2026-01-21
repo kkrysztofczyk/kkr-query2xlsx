@@ -669,6 +669,55 @@ def save_csv_profiles(config, path=CSV_PROFILES_PATH):
         json.dump(data_to_save, f, ensure_ascii=False, indent=2)
 
 
+def remember_last_used_csv_profile(
+    profile_name: str,
+    current_config: dict,
+    path: str = CSV_PROFILES_PATH,
+) -> dict:
+    """
+    Ustawia profile_name jako default_profile i zapisuje do csv_profiles.json.
+    Zwraca odświeżoną konfigurację (load_csv_profiles).
+    Ma być bezpieczna: jeśli zapis się nie uda, nie przerywa działania eksportu.
+    """
+    if not profile_name:
+        return current_config or {}
+
+    config = current_config or {}
+    profiles = config.get("profiles") or []
+    names = {p.get("name") for p in profiles if p.get("name")}
+
+    if profile_name not in names:
+        return config
+
+    if config.get("default_profile") == profile_name:
+        return config
+
+    new_config = dict(config)
+    new_config["default_profile"] = profile_name
+
+    try:
+        save_csv_profiles(new_config, path=path)
+    except OSError as exc:
+        try:
+            LOGGER.warning(
+                "Nie udało się zapisać domyślnego profilu CSV (%s): %s",
+                profile_name,
+                exc,
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        return config
+
+    try:
+        return load_csv_profiles(path=path)
+    except Exception as exc:  # noqa: BLE001
+        try:
+            LOGGER.warning("Nie udało się ponownie wczytać csv_profiles.json: %s", exc)
+        except Exception:  # noqa: BLE001
+            pass
+        return new_config
+
+
 def ensure_directories(paths):
     for path in paths:
         os.makedirs(path, exist_ok=True)
@@ -1024,6 +1073,11 @@ def run_console(engine, output_directory, selected_connection):
     sql_dur, export_dur, total_dur, rows_count = run_export(
         engine, sql_query, output_file_path, output_format, csv_profile=selected_csv_profile
     )
+
+    if output_format == "csv" and selected_csv_profile:
+        prof_name = (selected_csv_profile.get("name") or "").strip()
+        if prof_name:
+            csv_config = remember_last_used_csv_profile(prof_name, csv_config)
 
     if rows_count > 0:
         print(f"Query results have been saved to: {output_file_path}")
@@ -3091,6 +3145,15 @@ def run_gui(connection_store, output_directory):
                 )
 
             last_output_path["path"] = params["output_file_path"]
+
+            if output_format == "csv" and csv_profile:
+                prof_name = (csv_profile.get("name") or "").strip()
+                if prof_name:
+                    csv_profile_state["config"] = remember_last_used_csv_profile(
+                        prof_name,
+                        csv_profile_state["config"],
+                    )
+                    refresh_csv_profile_controls(prof_name)
 
             if rows_count > 0:
                 msg = (
