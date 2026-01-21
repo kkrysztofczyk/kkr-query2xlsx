@@ -68,6 +68,9 @@ SECURE_PATH = _build_path("secure.txt")
 QUERIES_PATH = _build_path("queries.txt")
 CSV_PROFILES_PATH = _build_path("csv_profiles.json")
 
+SECURE_SAMPLE_PATH = _build_path("secure.sample.json")
+QUERIES_SAMPLE_PATH = _build_path("queries.sample.txt")
+
 
 BUILTIN_CSV_PROFILES = [
     {
@@ -115,6 +118,57 @@ def shorten_path(path, max_len=80):
     if len(short) > max_len:
         short = short[-max_len:]
     return short
+
+
+def resolve_path(path: str) -> str:
+    path = (path or "").strip()
+    path = os.path.expandvars(os.path.expanduser(path))
+    if path and not os.path.isabs(path):
+        path = os.path.join(BASE_DIR, path)
+    return os.path.abspath(os.path.normpath(path))
+
+
+def _normalize_missing_path(path: str) -> str:
+    normalized = os.path.abspath(os.path.normpath(path))
+    if sys.platform == "win32":
+        return os.path.normcase(normalized)
+    return normalized
+
+
+def query_path_key(path: str) -> tuple:
+    resolved = resolve_path(path)
+    try:
+        stat_result = os.stat(resolved)
+    except (FileNotFoundError, OSError):
+        return ("path", _normalize_missing_path(resolved))
+
+    inode = getattr(stat_result, "st_ino", None)
+    if not inode:
+        return ("path", _normalize_missing_path(resolved))
+
+    return ("stat", stat_result.st_dev, stat_result.st_ino)
+
+
+def to_storage_path(path: str) -> str:
+    resolved = resolve_path(path)
+    base_dir = os.path.abspath(BASE_DIR)
+    if sys.platform == "win32":
+        resolved_cmp = os.path.normcase(resolved)
+        base_cmp = os.path.normcase(base_dir)
+    else:
+        resolved_cmp = resolved
+        base_cmp = base_dir
+    try:
+        if os.path.commonpath([resolved_cmp, base_cmp]) == base_cmp:
+            return os.path.relpath(resolved, base_dir)
+    except ValueError:
+        pass
+    return resolved
+
+
+def is_sql_path(path: str) -> bool:
+    # Filtr w oknie wyboru to nie walidacja -> walidujemy w kodzie
+    return (path or "").strip().lower().endswith(".sql")
 
 
 def remove_bom(content: bytes) -> str:
@@ -254,6 +308,47 @@ def save_query_paths(paths, queries_file=QUERIES_PATH):
     with open(queries_file, "w", encoding="utf-8") as f:
         for path in paths:
             f.write(f"{path}\n")
+
+
+def bootstrap_local_files():
+    """Create local config files from *.sample.* on first run.
+
+    The app will copy (only if missing):
+    - secure.sample.json  -> secure.txt
+    - queries.sample.txt  -> queries.txt
+
+    Existing files are never overwritten.
+    """
+
+    created = []
+
+    if not os.path.exists(SECURE_PATH) and os.path.exists(SECURE_SAMPLE_PATH):
+        try:
+            shutil.copyfile(SECURE_SAMPLE_PATH, SECURE_PATH)
+            created.append(os.path.basename(SECURE_PATH))
+        except Exception as exc:  # noqa: BLE001
+            try:
+                LOGGER.exception(
+                    "Failed to create secure.txt from secure.sample.json",
+                    exc_info=exc,
+                )
+            except Exception:
+                pass
+
+    if not os.path.exists(QUERIES_PATH) and os.path.exists(QUERIES_SAMPLE_PATH):
+        try:
+            shutil.copyfile(QUERIES_SAMPLE_PATH, QUERIES_PATH)
+            created.append(os.path.basename(QUERIES_PATH))
+        except Exception as exc:  # noqa: BLE001
+            try:
+                LOGGER.exception(
+                    "Failed to create queries.txt from queries.sample.txt",
+                    exc_info=exc,
+                )
+            except Exception:
+                pass
+
+    return created
 
 
 DEFAULT_CSV_PROFILE = {
@@ -834,13 +929,14 @@ def run_console(engine, output_directory, selected_connection):
                 )
                 if selection == 0:
                     custom_path = input("Please enter full path to the .sql file: ").strip()
-                    if not os.path.isfile(custom_path):
+                    resolved = resolve_path(custom_path)
+                    if not os.path.isfile(resolved):
                         print("File does not exist. Please try again.")
                         continue
-                    sql_query_file_path = custom_path
+                    sql_query_file_path = resolved
                     break
                 if 1 <= selection <= len(sql_query_file_paths):
-                    sql_query_file_path = sql_query_file_paths[selection - 1]
+                    sql_query_file_path = resolve_path(sql_query_file_paths[selection - 1])
                     break
                 print(f"Please enter a number between 0 and {len(sql_query_file_paths)}.")
             except ValueError:
@@ -849,8 +945,9 @@ def run_console(engine, output_directory, selected_connection):
         print("No SQL query file paths found in queries.txt")
         while True:
             custom_path = input("Please enter full path to the .sql file: ").strip()
-            if os.path.isfile(custom_path):
-                sql_query_file_path = custom_path
+            resolved = resolve_path(custom_path)
+            if os.path.isfile(resolved):
+                sql_query_file_path = resolved
                 break
             print("File does not exist. Please try again.")
 
@@ -1030,6 +1127,26 @@ def _create_sqlite_frame(parent):
     frame.columnconfigure(1, weight=1)
 
     path_var = tk.StringVar()
+    sqlite_filetypes = [("SQLite", "*.db *.sqlite *.sqlite3"), ("All files", "*.*")]
+
+    def _choose_sqlite_path():
+        chosen_path = filedialog.askopenfilename(
+            title="Wybierz istniejącą bazę SQLite",
+            filetypes=sqlite_filetypes,
+        )
+        if not chosen_path:
+            if not messagebox.askyesno(
+                "Utworzyć nową bazę?",
+                "Nie wybrano istniejącej bazy. Czy chcesz utworzyć nową?",
+            ):
+                return
+            chosen_path = filedialog.asksaveasfilename(
+                title="Utwórz nową bazę SQLite",
+                defaultextension=".sqlite",
+                filetypes=sqlite_filetypes,
+            )
+        if chosen_path:
+            path_var.set(os.path.abspath(chosen_path))
 
     tk.Label(frame, text="Ścieżka do pliku").grid(
         row=0, column=0, sticky="w", padx=5, pady=(5, 0)
@@ -1040,13 +1157,7 @@ def _create_sqlite_frame(parent):
     tk.Button(
         frame,
         text="Wybierz",
-        command=lambda: path_var.set(
-            filedialog.asksaveasfilename(
-                title="Wybierz lub utwórz plik SQLite",
-                defaultextension=".db",
-                filetypes=[("SQLite", "*.db"), ("All files", "*.*")],
-            )
-        ),
+        command=_choose_sqlite_path,
     ).grid(row=0, column=2, padx=5, pady=(5, 0))
 
     return frame, {"path": path_var}
@@ -2145,7 +2256,8 @@ def run_gui(connection_store, output_directory):
     }
 
     def _set_sql_path(path):
-        selected_sql_path_full.set(path)
+        resolved = resolve_path(path)
+        selected_sql_path_full.set(resolved)
         sql_label_var.set(shorten_path(path))
 
     def set_connection_status(message, connected):
@@ -2519,8 +2631,16 @@ def run_gui(connection_store, output_directory):
         dlg.grab_set()
         dlg.resizable(True, True)
 
-        paths = load_query_paths()
-        query_paths_state["paths"] = list(paths)
+        # Uwaga: nie modyfikuj query_paths_state przed udanym zapisem (bez efektów ubocznych).
+        raw_paths = load_query_paths()
+        paths = []
+        seen_keys = set()
+        for raw in raw_paths:
+            key = query_path_key(raw)
+            if key in seen_keys:
+                continue
+            paths.append(raw)
+            seen_keys.add(key)
 
         dlg.columnconfigure(0, weight=1)
         dlg.rowconfigure(0, weight=1)
@@ -2555,24 +2675,59 @@ def run_gui(connection_store, output_directory):
             delete_btn.config(state=delete_state)
 
         def add_from_dialog():
-            path = filedialog.askopenfilename(
-                title="Dodaj plik SQL",
+            selected = filedialog.askopenfilenames(
+                title="Dodaj pliki SQL",
                 filetypes=[("SQL files", "*.sql"), ("All files", "*.*")],
             )
-            if not path:
+            if not selected:
+                return
+            existing_keys = {query_path_key(p) for p in paths}
+
+            added_indices = []
+            skipped_non_sql = []
+            skipped_duplicates = 0
+
+            for p in selected:
+                if not is_sql_path(p):
+                    skipped_non_sql.append(p)
+                    continue
+
+                p_key = query_path_key(p)
+                if p_key in existing_keys:
+                    skipped_duplicates += 1
+                    continue
+
+                paths.append(to_storage_path(p))
+                existing_keys.add(p_key)
+                added_indices.append(len(paths) - 1)
+
+            if skipped_non_sql:
+                messagebox.showwarning(
+                    "Pominięto pliki",
+                    "Niektóre wybrane pliki nie mają rozszerzenia .sql i zostały pominięte:\n\n"
+                    + "\n".join(skipped_non_sql[:20])
+                    + (
+                        f"\n\n(+ {len(skipped_non_sql) - 20} kolejnych)"
+                        if len(skipped_non_sql) > 20
+                        else ""
+                    ),
+                )
+
+            if not added_indices:
+                if skipped_duplicates and not skipped_non_sql:
+                    messagebox.showinfo("Informacja", "Wybrane pliki są już na liście.")
                 return
 
-            if path in paths:
-                messagebox.showinfo("Informacja", "Ta ścieżka jest już na liście.")
-                return
-
-            paths.append(path)
             refresh_list()
-            new_idx = len(paths) - 1
+
             listbox.selection_clear(0, tk.END)
-            listbox.selection_set(new_idx)
-            listbox.activate(new_idx)
-            listbox.see(new_idx)
+            for idx in added_indices:
+                listbox.selection_set(idx)
+
+            last_idx = added_indices[-1]
+            listbox.activate(last_idx)
+            listbox.see(last_idx)
+            update_delete_state()
 
         def edit_selected(event=None):  # noqa: ANN001
             sel = listbox.curselection()
@@ -2593,17 +2748,42 @@ def run_gui(connection_store, output_directory):
             new_path = new_path.strip()
             if not new_path:
                 return
-
-            if new_path in paths and new_path != current_path:
-                messagebox.showinfo("Informacja", "Ta ścieżka jest już na liście.")
+            if not is_sql_path(new_path):
+                messagebox.showwarning(
+                    "Nieprawidłowy plik",
+                    "Wpis musi wskazywać plik z rozszerzeniem .sql.",
+                )
                 return
 
-            paths[idx] = new_path
+            new_key = query_path_key(new_path)
+
+            # Duplikaty sprawdzamy po kluczu pliku (z pominięciem edytowanego indeksu)
+            for j, existing in enumerate(paths):
+                if j == idx:
+                    continue
+                if query_path_key(existing) == new_key:
+                    messagebox.showinfo("Informacja", "Ta ścieżka jest już na liście.")
+                    return
+
+            # Opcjonalna polerka: ostrzeż, ale nie blokuj (sieciówki / dyski zewnętrzne)
+            resolved_new_path = resolve_path(new_path)
+            if not os.path.isfile(resolved_new_path):
+                messagebox.showwarning(
+                    "Uwaga",
+                    "Plik nie istnieje (lub jest chwilowo niedostępny).\n"
+                    "Zapisuję ścieżkę, ale upewnij się, że jest poprawna:\n\n"
+                    f"{resolved_new_path}",
+                )
+
+            # Zapis „ładnej” wersji ścieżki (bez normcase)
+            paths[idx] = to_storage_path(new_path)
+
             refresh_list()
             listbox.selection_clear(0, tk.END)
             listbox.selection_set(idx)
             listbox.activate(idx)
             listbox.see(idx)
+            update_delete_state()
 
         def delete_selected(event=None):  # noqa: ANN001
             sel = listbox.curselection()
@@ -2621,6 +2801,7 @@ def run_gui(connection_store, output_directory):
                 listbox.selection_set(next_idx)
                 listbox.activate(next_idx)
                 listbox.see(next_idx)
+                update_delete_state()
 
             return "break" if event is not None else None
 
@@ -2643,7 +2824,7 @@ def run_gui(connection_store, output_directory):
         button_frame = tk.Frame(dlg)
         button_frame.grid(row=1, column=0, pady=(0, 10), padx=10, sticky="e")
 
-        add_btn = tk.Button(button_frame, text="Dodaj plik...", command=add_from_dialog, width=15)
+        add_btn = tk.Button(button_frame, text="Dodaj pliki...", command=add_from_dialog, width=15)
         delete_btn = tk.Button(
             button_frame,
             text="Usuń zaznaczone",
@@ -3190,6 +3371,19 @@ def run_gui(connection_store, output_directory):
 
 
 if __name__ == "__main__":
+    output_directory = r"generated_reports"
+    ensure_directories([output_directory, "templates", "queries"])
+
+    created_files = bootstrap_local_files()
+    if created_files:
+        try:
+            LOGGER.info(
+                "Bootstrapped local files from samples: %s",
+                ", ".join(created_files),
+            )
+        except Exception:
+            pass
+
     connection_store = load_connections()
     selected_name = connection_store.get("last_selected")
     selected_connection = None
@@ -3199,9 +3393,6 @@ if __name__ == "__main__":
             break
     if selected_connection is None and connection_store.get("connections"):
         selected_connection = connection_store["connections"][0]
-
-    output_directory = r"generated_reports"
-    ensure_directories([output_directory, "templates", "queries"])
 
     if len(sys.argv) > 1 and sys.argv[1] == "-c":
         if not selected_connection:
