@@ -1,32 +1,33 @@
 name: Feature request
-description: Zaproponuj ulepszenie / nową funkcję (bez danych wrażliwych)
+description: Propose an improvement or new feature (no sensitive data)
 title: "[IDEA] "
 labels: ["enhancement"]
 body:
   - type: markdown
     attributes:
       value: |
-        ⚠️ Nie wklejaj haseł, tokenów, connection stringów, nazw hostów, danych osobowych ani produkcyjnego SQL.
-        Opisz przypadek użycia i oczekiwany efekt.
+        ⚠️ Do not paste passwords, tokens, connection strings, hostnames, personal data, or production SQL.
+        Describe the use case and the expected outcome.
+        If English is hard, write in your language - we'll translate.
 
   - type: textarea
     id: problem
     attributes:
-      label: Jaki problem chcesz rozwiązać?
+      label: What problem do you want to solve?
     validations:
       required: true
 
   - type: textarea
     id: solution
     attributes:
-      label: Proponowane rozwiązanie
-      description: Jak powinno działać w GUI/CLI? Jakie opcje?
+      label: Proposed solution
+      description: How should it work in the GUI/CLI? What options?
     validations:
       required: true
 
   - type: textarea
     id: context
     attributes:
-      label: Kontekst (opcjonalnie)
+      label: Context (optional)
     validations:
       required: false
