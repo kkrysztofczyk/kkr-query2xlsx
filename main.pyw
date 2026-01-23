@@ -1,6 +1,8 @@
+import argparse
 import csv
 import json
 import logging
+import locale
 import textwrap
 import traceback
 import os
@@ -10,6 +12,7 @@ import sys
 import time
 import tkinter as tk
 import tkinter.font as tkfont
+import webbrowser
 from datetime import datetime
 from tkinter import filedialog, messagebox, simpledialog
 from tkinter import ttk
@@ -25,6 +28,789 @@ from openpyxl.utils import coordinate_to_tuple
 
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+GITHUB_NEW_ISSUE_CHOOSE_URL = (
+    "https://github.com/kkrysztofczyk/kkr-query2xlsx/issues/new/choose"
+)
+
+
+# =========================
+# I18N (EN as source)
+# =========================
+I18N: dict[str, dict[str, str]] = {
+    "en": {
+        # GUI
+        "APP_TITLE": "KKr Query Runner",
+        "BTN_RUN": "Run",
+        "BTN_EXPORT": "Export",
+        "BTN_BROWSE": "Browse...",
+        "LBL_SQL_FILE": "SQL file",
+        "LBL_DB": "Database",
+        "LBL_OUTPUT": "Output",
+        "LBL_LANGUAGE": "Language",
+        "MSG_DONE": "Done.",
+        "ERR_TITLE": "Error",
+        "WARN_TITLE": "Warning",
+        "APP_TITLE_FULL": "KKr SQL to XLSX/CSV",
+        "BROWSER_OPEN_FAIL_TITLE": "Unable to open browser",
+        "BROWSER_OPEN_FAIL_BODY": (
+            "Could not automatically open the link.\n"
+            "Copy and open it manually:\n\n{url}"
+        ),
+        "BROWSER_OPEN_FAIL_ERROR_BODY": (
+            "Could not open the browser.\n\n{error}\n\nLink:\n{url}"
+        ),
+        "ERR_ODBC_MISSING_TITLE": "Missing ODBC driver",
+        "ERR_ODBC_MISSING_BODY": (
+            "Cannot connect to SQL Server. Required ODBC driver "
+            "('ODBC Driver 17 for SQL Server' or compatible) or the pyodbc "
+            "library is not installed. Install the driver and try again."
+        ),
+        "ERR_PG_MISSING_TITLE": "Missing PostgreSQL library",
+        "ERR_PG_MISSING_BODY": (
+            "Cannot connect to PostgreSQL. Required Python library (e.g. psycopg2) "
+            "is not installed. Install the missing library and try again."
+        ),
+        "ERR_MYSQL_MISSING_TITLE": "Missing MySQL library",
+        "ERR_MYSQL_MISSING_BODY": (
+            "Cannot connect to MySQL. Required Python library (e.g. pymysql) "
+            "is not installed. Install the missing library and try again."
+        ),
+        "ERR_ORACLE_MISSING_TITLE": "Missing Oracle library",
+        "ERR_ORACLE_MISSING_BODY": (
+            "Cannot connect to Oracle. Required Python library (e.g. cx_Oracle) "
+            "is not installed. Install the missing library and try again."
+        ),
+        "MSG_UI_TRUNCATED": (
+            "...\n(Trimmed in UI, full details in kkr_query2sheet.log)"
+        ),
+        "CONSOLE_AVAILABLE_FILES": "Available SQL query files:",
+        "CONSOLE_CUSTOM_PATH": "0: [Custom path]",
+        "CONSOLE_PROMPT_SELECT": (
+            "Please enter the number of the SQL query file to execute "
+            "(0 for custom path, 1-{max_idx}): "
+        ),
+        "CONSOLE_PROMPT_CUSTOM_PATH": "Please enter full path to the .sql file: ",
+        "CONSOLE_FILE_NOT_FOUND": "File does not exist. Please try again.",
+        "CONSOLE_SELECT_RANGE": "Please enter a number between 0 and {max_idx}.",
+        "CONSOLE_INVALID_INPUT": "Invalid input. Please enter a number.",
+        "CONSOLE_NO_QUERIES": "No SQL query file paths found in queries.txt",
+        "CONSOLE_PROMPT_FORMAT": "Please enter the desired output format (xlsx or csv): ",
+        "CONSOLE_INVALID_FORMAT": "Invalid input. Please enter 'xlsx' or 'csv'.",
+        "CONSOLE_AVAILABLE_CSV_PROFILES": "Available CSV profiles:",
+        "CONSOLE_DEFAULT_MARKER": " (default)",
+        "CONSOLE_PROMPT_CSV_PROFILE": (
+            "Enter CSV profile number to use or press Enter to use the default: "
+        ),
+        "CONSOLE_INVALID_SELECTION": "Invalid selection. Please try again.",
+        "CONSOLE_SAVED_PATH": "Query results have been saved to: {path}",
+        "CONSOLE_NO_ROWS": "The query did not return any rows.",
+        "CONSOLE_SQL_TIME": "Data fetch time (SQL): {seconds:.2f} seconds",
+        "CONSOLE_EXPORT_TIME": "Export time ({fmt}): {seconds:.2f} seconds",
+        "CONSOLE_TOTAL_TIME": "Total time: {seconds:.2f} seconds",
+        "DEFAULT_MSSQL_NAME": "Default MSSQL",
+        "FRAME_MSSQL": "MSSQL (ODBC)",
+        "LBL_ODBC_DRIVER": "ODBC driver",
+        "LBL_SERVER": "Server",
+        "LBL_DATABASE_NAME": "Database name",
+        "LBL_LOGIN": "Login",
+        "LBL_PASSWORD": "Password",
+        "CHK_TRUSTED": "Windows authentication (Trusted_Connection)",
+        "CHK_ENCRYPT": "Encrypt",
+        "CHK_TRUST_CERT": "TrustServerCertificate",
+        "FRAME_POSTGRES": "PostgreSQL",
+        "LBL_HOST": "Host",
+        "LBL_PORT": "Port",
+        "LBL_DATABASE": "Database",
+        "LBL_USER": "User",
+        "FRAME_MYSQL": "MySQL",
+        "FRAME_SQLITE": "SQLite",
+        "FILETYPE_SQLITE": "SQLite",
+        "FILETYPE_ALL": "All files",
+        "TITLE_SELECT_SQLITE": "Select existing SQLite database",
+        "TITLE_CREATE_SQLITE": "Create new SQLite database",
+        "ASK_CREATE_SQLITE": "Create a new database?",
+        "ASK_CREATE_SQLITE_BODY": (
+            "No existing database selected. Do you want to create a new one?"
+        ),
+        "LBL_SQLITE_PATH": "File path",
+        "BTN_SELECT": "Select",
+        "ERR_DATA_TITLE": "Data error",
+        "ERR_FILL_ODBC": "Fill in: driver, server, and database name.",
+        "ERR_LOGIN_REQUIRED": (
+            "Provide login and password or select Windows authentication "
+            "(Trusted_Connection)."
+        ),
+        "ERR_FILL_PG": "Fill in: host, database name, and user.",
+        "ERR_FILL_MYSQL": "Fill in: host, database name, and user.",
+        "ERR_FILL_SQLITE": "Provide the SQLite database file path.",
+        "LBL_CONN_NAME": "Connection name",
+        "LBL_DB_TYPE": "Database type",
+        "ERR_INVALID_CONN_TYPE": "Invalid connection type.",
+        "ERR_CONN_NAME_REQUIRED": "Connection name cannot be empty.",
+        "INFO_CONN_SAVED_TITLE": "Saved",
+        "INFO_CONN_SAVED_BODY": "Connection has been saved.",
+        "BTN_SAVE": "Save",
+        "BTN_SAVE_NO_TEST": "Save without test",
+        "BTN_CANCEL": "Cancel",
+        "CSV_PROFILE_TITLE": "CSV profile details",
+        "CSV_PROFILE_NAME": "Profile name:",
+        "CSV_PROFILE_ENCODING": "Encoding:",
+        "CSV_PROFILE_DELIMITER": "Field delimiter:",
+        "CSV_PROFILE_DELIM_REPLACE": "Replace delimiter in values:",
+        "CSV_PROFILE_DECIMAL": "Decimal separator:",
+        "CSV_PROFILE_LINE_END": "Line terminator:",
+        "CSV_PROFILE_QUOTECHAR": "Quote character:",
+        "CSV_PROFILE_QUOTING": "Quoting:",
+        "CSV_PROFILE_ESCAPECHAR": "Escape character:",
+        "CSV_PROFILE_ESCAPE_HINT": "(escape char; empty = quoting)",
+        "CSV_PROFILE_DOUBLEQUOTE": "Double quote in fields",
+        "CSV_PROFILE_DATE_FORMAT": "Date format:",
+        "CSV_PROFILE_FIELD_SEPARATOR": "Field separator:",
+        "CSV_PROFILE_WARNING_EMPTY": "Profile name cannot be empty.",
+        "CSV_PROFILE_WARNING_EXISTS": "A profile with this name already exists.",
+        "CSV_PROFILE_WARNING_SELECT": "Select a profile from the list.",
+        "CSV_PROFILE_INFO_BUILTIN": "Built-in profiles cannot be deleted.",
+        "CSV_PROFILE_WARNING_MIN_ONE": "There must be at least one CSV profile.",
+        "CSV_PROFILE_INFO_SAVED_TITLE": "Information",
+        "CSV_PROFILE_INFO_SAVED_BODY": "CSV profiles saved.",
+        "CSV_PROFILE_CONFIRM_DELETE": (
+            "Delete selected profile?\n\nThis cannot be undone."
+        ),
+        "BTN_SAVE_AS_NEW": "Save as new",
+        "BTN_UPDATE_PROFILE": "Update profile",
+        "BTN_DELETE": "Delete",
+        "BTN_SET_DEFAULT": "Set as default",
+        "BTN_CLOSE_SAVE": "Close and save",
+        "ERR_QUERY_TITLE": "Query error",
+        "BTN_COPY": "Copy",
+        "BTN_CLOSE": "Close",
+        "ERR_NO_CONNECTION_TITLE": "No connection",
+        "ERR_NO_CONNECTION_BODY": "No saved connections. Create and save a new connection.",
+        "ERR_NO_CONNECTION_DELETE": "No connection to delete.",
+        "ASK_DELETE_CONNECTION_TITLE": "Delete connection",
+        "ASK_DELETE_CONNECTION_BODY": "Are you sure you want to delete connection {name}?",
+        "TITLE_EDIT_SECURE": "Edit secure.txt",
+        "INFO_SECURE_SAVED_TITLE": "Saved",
+        "INFO_SECURE_SAVED_BODY": "Updated secure.txt content.",
+        "ERR_SECURE_SAVE_TITLE": "Save error",
+        "ERR_SECURE_SAVE_BODY": (
+            "Failed to save secure.txt.\n\nTechnical details:\n{error}"
+        ),
+        "TITLE_SELECT_SQL": "Select SQL file",
+        "FILETYPE_SQL": "SQL files",
+        "TITLE_SELECT_TEMPLATE": "Select XLSX template file",
+        "FILETYPE_EXCEL": "Excel files",
+        "ERR_TEMPLATE_TITLE": "Template error",
+        "ERR_TEMPLATE_SHEETS": (
+            "Cannot read sheets from the template file.\n\nTechnical details:\n{error}"
+        ),
+        "CSV_DEFAULT_PROFILE_LABEL": "Default CSV profile: {name}",
+        "TITLE_EDIT_QUERIES": "Edit queries.txt",
+        "TITLE_ADD_SQL_FILES": "Add SQL files",
+        "WARN_SKIPPED_FILES_TITLE": "Skipped files",
+        "WARN_SKIPPED_FILES_BODY": (
+            "Some selected files do not have the .sql extension and were skipped:\n\n"
+            "{files}{more}"
+        ),
+        "INFO_ALREADY_LISTED": "Selected files are already on the list.",
+        "TITLE_EDIT_QUERY_PATH": "Edit query path",
+        "PROMPT_EDIT_QUERY_PATH": "Edit query path:",
+        "WARN_INVALID_SQL_FILE": "The entry must point to a .sql file.",
+        "WARN_FILE_MISSING_TITLE": "Warning",
+        "WARN_FILE_MISSING_BODY": (
+            "File does not exist (or is temporarily unavailable).\n"
+            "Saving the path anyway, but make sure it is correct:\n\n{path}"
+        ),
+        "INFO_SELECT_ENTRY_DELETE": "Select an entry to delete.",
+        "ERR_QUERIES_SAVE_TITLE": "Save error",
+        "ERR_QUERIES_SAVE_BODY": (
+            "Cannot save queries.txt.\n\nTechnical details:\n{error}"
+        ),
+        "BTN_ADD_FILES": "Add files...",
+        "BTN_REMOVE_SELECTED": "Remove selected",
+        "TITLE_SELECT_REPORT": "Select report from list",
+        "ERR_NO_REPORTS": "No reports in queries.txt",
+        "WARN_NO_REPORT_SELECTED": "No report selected.",
+        "ERR_NO_SQL_SELECTED": "No SQL file selected.",
+        "ERR_SQL_NOT_FOUND": "Selected SQL file does not exist.",
+        "ERR_NEED_CONNECTION": "Create a database connection before running the report.",
+        "ERR_TEMPLATE_ONLY_XLSX": "Template can only be used for XLSX.",
+        "ERR_TEMPLATE_NOT_SELECTED": "No template file selected.",
+        "ERR_TEMPLATE_SHEET_NOT_SELECTED": "No template worksheet selected.",
+        "MSG_RUNNING": "Running query and export. Please wait...",
+        "MSG_SAVED_DETAILS": (
+            "Saved: {path}\n"
+            "Rows: {rows}\n"
+            "SQL time: {sql_time:.2f} s\n"
+            "Export time: {export_time:.2f} s\n"
+            "Total time: {total_time:.2f} s"
+        ),
+        "MSG_SAVED_DETAILS_CSV": "CSV profile: {profile}",
+        "MSG_NO_ROWS": "Query returned no rows.\nSQL time: {sql_time:.2f} s",
+        "ERR_EXPORT": "Export error. Full details in log.",
+        "FRAME_DB_CONNECTION": "Database connection",
+        "LBL_CONNECTION": "Connection:",
+        "BTN_ADD_EDIT_CONNECTION": "Add/edit connection",
+        "BTN_TEST_CONNECTION": "Test connection",
+        "BTN_DELETE_CONNECTION": "Delete connection",
+        "BTN_EDIT_SECURE": "Edit secure.txt",
+        "FRAME_SQL_SOURCE": "SQL query source",
+        "FRAME_OUTPUT_FORMAT": "Output format",
+        "FRAME_TEMPLATE_OPTIONS": "XLSX template options (GUI)",
+        "FRAME_RESULTS": "Result and actions",
+        "LBL_SELECTED_SQL": "Selected SQL file:",
+        "BTN_SELECT_SQL": "Select SQL file",
+        "BTN_SELECT_FROM_LIST": "Select from report list",
+        "BTN_EDIT_QUERIES": "Edit queries.txt",
+        "LBL_CSV_PROFILE": "CSV profile:",
+        "BTN_MANAGE_CSV_PROFILES": "Manage CSV profiles",
+        "CHK_USE_TEMPLATE": "Use template file (XLSX only, GUI only)",
+        "LBL_TEMPLATE_FILE": "Template file:",
+        "BTN_SELECT_TEMPLATE": "Select template",
+        "LBL_TEMPLATE_SHEET": "Worksheet:",
+        "LBL_TEMPLATE_START_CELL": "Start cell:",
+        "CHK_INCLUDE_HEADERS": "Write headers (column names) to worksheet",
+        "BTN_START": "Start",
+        "BTN_REPORT_ISSUE": "Report issue / suggestion",
+        "LBL_EXPORT_INFO": "Export info:",
+        "BTN_OPEN_FILE": "Open file",
+        "BTN_OPEN_FOLDER": "Open folder",
+        "LBL_ERRORS_SHORT": "Errors (summary):",
+        "STATUS_NO_CONNECTION": "No connection. Create a new connection.",
+        "STATUS_CONNECTION_ERROR": "Connection error. Create a new connection.",
+        "ERR_CONNECTION_TITLE": "Connection error",
+        "ERR_CONNECTION_BODY": (
+            "Failed to establish a connection.\n\nTechnical details:\n{error}"
+        ),
+        "STATUS_CONNECTED": "Connected to {name} ({type}).",
+        "INFO_CONNECTION_OK_TITLE": "Connection works",
+        "INFO_CONNECTION_OK_BODY": "Connection {name} succeeded.",
+        "ERR_NO_SECURE_CONFIG": "No connection configuration.",
+        "ERR_SELECT_TEMPLATE": "Select template file",
+        "ERR_GENERIC": "Error",
+        "ERR_TEMPLATE_MISSING_SHEET": "Worksheet '{sheet}' does not exist in template file.",
+        "CLI_DESC": "Run SQL files and export results to XLSX/CSV.",
+        "CLI_LANG_HELP": "UI language (en/pl).",
+        "CLI_CONSOLE_HELP": "Run in console mode.",
+        "CLI_NO_CONNECTIONS": (
+            "No saved connections. Create a connection in GUI mode to run console."
+        ),
+        "CLI_CONNECTION_FAIL": "Failed to create connection. Full details in log.",
+        "MENU_LANGUAGE": "Language",
+        "ERR_FILE_PATH": "Path: {path}",
+        "ERR_FILE_LOCKED": (
+            "The output file already exists and may be open in another app (e.g. Excel). "
+            "Close it and try again.{path}"
+        ),
+        "ERR_NO_WRITE_PERMISSION": (
+            "No permission to write the output file or the path is unavailable. "
+            "Check the file location."
+        ),
+        "ERR_DB_MESSAGE": "Database message (excerpt):",
+        "ERR_SQL_PREVIEW": "SQL (start):",
+        "ERR_FULL_LOG": "Full error saved in kkr_query2sheet.log",
+        "ERR_HINT_LABEL": "Hint:",
+        "DB_TYPE_MSSQL": "SQL Server (ODBC)",
+        "DB_TYPE_PG": "PostgreSQL",
+        "DB_TYPE_MYSQL": "MySQL",
+        "DB_TYPE_SQLITE": "SQLite (.db file)",
+        "TITLE_CONN_DIALOG": "Add or update connection",
+        "CONN_DIALOG_HINT": (
+            "To create a new connection, enter a new name.\n"
+            "To edit an existing connection, keep the name and adjust details."
+        ),
+        "INFO_CONN_SAVED_NO_TEST": (
+            "Connection saved without testing.\n"
+            "Use the \"Test connection\" button to verify it."
+        ),
+        "INFO_ICON": "i",
+        "BTN_OK": "OK",
+        "FORMAT_XLSX": "XLSX",
+        "FORMAT_CSV": "CSV",
+        "CSV_PROFILE_DIALOG_TITLE": "CSV profiles",
+        "CSV_PROFILE_DEFAULT_SUFFIX": "(default)",
+        "CSV_PROFILE_BUILTIN_SUFFIX": "[built-in]",
+        "CSV_PROFILE_INVALID_DATE": (
+            "The provided date format is invalid. Use strftime syntax."
+        ),
+        "CSV_PROFILE_DATE_DEFAULT": "Pandas default format (example: {example})",
+        "CSV_PROFILE_DATE_INVALID": (
+            "Invalid date format (use strftime syntax, e.g. %Y-%m-%d)."
+        ),
+        "CSV_PROFILE_DATE_PREVIEW": "Current time in this format: {example}",
+        "CSV_PROFILE_BUILTIN_NOTICE": (
+            "Built-in profile: changes cannot be saved or deleted. "
+            "Use Save as new to create your own variant."
+        ),
+        "CSV_PROFILE_NAME_RESERVED": (
+            "This name is reserved for a built-in profile. Choose another name."
+        ),
+        "CSV_PROFILE_NO_SELECTION_TITLE": "No profile",
+        "CSV_PROFILE_BUILTIN_OVERWRITE": (
+            "You cannot overwrite a built-in profile. Change the name and save as a new profile."
+        ),
+        "CSV_PROFILE_UNSAVED_TITLE": "Unsaved changes",
+        "CSV_PROFILE_UNSAVED_BODY": (
+            "You have unsaved CSV profile changes. Save before closing?"
+        ),
+        "WARN_SKIPPED_FILES_MORE": "\n\n(+ {count} more)",
+        "CSV_HELP_NAME_TITLE": "Profile name",
+        "CSV_HELP_NAME_BODY": (
+            "Any unique name that helps select the profile, e.g. "
+            "\"UTF-8 (comma)\" or \"Windows-1250 (semicolon)\"."
+        ),
+        "CSV_HELP_ENCODING_TITLE": "Encoding",
+        "CSV_HELP_ENCODING_BODY": (
+            "Character encoding used in the CSV file. Default is UTF-8; for older "
+            "Excel sheets you can use windows-1250."
+        ),
+        "CSV_HELP_DELIMITER_TITLE": "Field delimiter",
+        "CSV_HELP_DELIMITER_BODY": (
+            "Character separating columns. Usually comma (,) or semicolon (;), "
+            "depending on regional settings."
+        ),
+        "CSV_HELP_DELIM_REPLACE_TITLE": "Replace delimiter in values",
+        "CSV_HELP_DELIM_REPLACE_BODY": (
+            "Optionally replace the delimiter character inside values (e.g. semicolon to comma). "
+            "Useful when the import system does not handle escaping. Note: replacement is global "
+            "for all text fields (including JSON/IDs)."
+        ),
+        "CSV_HELP_DECIMAL_TITLE": "Decimal separator",
+        "CSV_HELP_DECIMAL_BODY": (
+            "Character separating integer and fractional parts. Dot (.) for English format, "
+            "comma (,) for Polish."
+        ),
+        "CSV_HELP_LINETERM_TITLE": "Line terminator",
+        "CSV_HELP_LINETERM_BODY": (
+            "Default is \\n. For full Windows compatibility you can use \\r\\n. "
+            "Change only if required by import."
+        ),
+        "CSV_HELP_QUOTECHAR_TITLE": "Quote character",
+        "CSV_HELP_QUOTECHAR_BODY": (
+            "Usually \". Used to wrap fields that require quoting (e.g. containing the delimiter)."
+        ),
+        "CSV_HELP_QUOTING_TITLE": "Quoting strategy",
+        "CSV_HELP_QUOTING_BODY": (
+            "minimal – only when needed (recommended), all – always, nonnumeric – for text, "
+            "none – no quoting (requires escapechar)."
+        ),
+        "CSV_HELP_ESCAPECHAR_TITLE": "Escape character",
+        "CSV_HELP_ESCAPECHAR_BODY": (
+            "Escape character used when quoting=none or fields may include the delimiter. "
+            "Leave empty when using standard quoting."
+        ),
+        "CSV_HELP_DOUBLEQUOTE_TITLE": "Double quote",
+        "CSV_HELP_DOUBLEQUOTE_BODY": (
+            "When enabled, internal \" in a field becomes \"\". Keep enabled unless the import "
+            "system requires otherwise."
+        ),
+        "CSV_HELP_DATE_FORMAT_TITLE": "Date format",
+        "CSV_HELP_DATE_FORMAT_BODY": (
+            "Optional strftime pattern, e.g. %Y-%m-%d or %d.%m.%Y. Leave empty to use Pandas defaults."
+        ),
+    },
+    "pl": {
+        # GUI
+        "APP_TITLE": "KKr Runner Zapytań",
+        "BTN_RUN": "Uruchom",
+        "BTN_EXPORT": "Eksportuj",
+        "BTN_BROWSE": "Wybierz...",
+        "LBL_SQL_FILE": "Plik SQL",
+        "LBL_DB": "Baza danych",
+        "LBL_OUTPUT": "Wyjście",
+        "LBL_LANGUAGE": "Język",
+        "MSG_DONE": "Gotowe.",
+        "ERR_TITLE": "Błąd",
+        "WARN_TITLE": "Uwaga",
+        "APP_TITLE_FULL": "KKr SQL to XLSX/CSV",
+        "BROWSER_OPEN_FAIL_TITLE": "Nie mogę otworzyć przeglądarki",
+        "BROWSER_OPEN_FAIL_BODY": (
+            "Nie udało się automatycznie otworzyć linku.\n"
+            "Skopiuj i otwórz ręcznie:\n\n{url}"
+        ),
+        "BROWSER_OPEN_FAIL_ERROR_BODY": (
+            "Nie udało się otworzyć przeglądarki.\n\n{error}\n\nLink:\n{url}"
+        ),
+        "ERR_ODBC_MISSING_TITLE": "Brak sterownika ODBC",
+        "ERR_ODBC_MISSING_BODY": (
+            "Nie można połączyć z SQL Server. Wymagany sterownik ODBC "
+            "('ODBC Driver 17 for SQL Server' lub zgodny) lub biblioteka pyodbc "
+            "nie jest zainstalowana. Zainstaluj sterownik i spróbuj ponownie."
+        ),
+        "ERR_PG_MISSING_TITLE": "Brak biblioteki PostgreSQL",
+        "ERR_PG_MISSING_BODY": (
+            "Nie można połączyć z PostgreSQL. Wymagana biblioteka Pythona (np. psycopg2) "
+            "nie jest zainstalowana. Zainstaluj brakującą bibliotekę i spróbuj ponownie."
+        ),
+        "ERR_MYSQL_MISSING_TITLE": "Brak biblioteki MySQL",
+        "ERR_MYSQL_MISSING_BODY": (
+            "Nie można połączyć z MySQL. Wymagana biblioteka Pythona (np. pymysql) "
+            "nie jest zainstalowana. Zainstaluj brakującą bibliotekę i spróbuj ponownie."
+        ),
+        "ERR_ORACLE_MISSING_TITLE": "Brak biblioteki Oracle",
+        "ERR_ORACLE_MISSING_BODY": (
+            "Nie można połączyć z Oracle. Wymagana biblioteka Pythona (np. cx_Oracle) "
+            "nie jest zainstalowana. Zainstaluj brakującą bibliotekę i spróbuj ponownie."
+        ),
+        "MSG_UI_TRUNCATED": (
+            "...\n(Przycięto w UI, pełna treść w kkr_query2sheet.log)"
+        ),
+        "CONSOLE_AVAILABLE_FILES": "Dostępne pliki zapytań SQL:",
+        "CONSOLE_CUSTOM_PATH": "0: [Własna ścieżka]",
+        "CONSOLE_PROMPT_SELECT": (
+            "Podaj numer pliku SQL do uruchomienia "
+            "(0 = własna ścieżka, 1-{max_idx}): "
+        ),
+        "CONSOLE_PROMPT_CUSTOM_PATH": "Podaj pełną ścieżkę do pliku .sql: ",
+        "CONSOLE_FILE_NOT_FOUND": "Plik nie istnieje. Spróbuj ponownie.",
+        "CONSOLE_SELECT_RANGE": "Wpisz liczbę z zakresu 0-{max_idx}.",
+        "CONSOLE_INVALID_INPUT": "Nieprawidłowe dane. Wpisz liczbę.",
+        "CONSOLE_NO_QUERIES": "Brak ścieżek do plików SQL w queries.txt",
+        "CONSOLE_PROMPT_FORMAT": "Podaj format wyjściowy (xlsx lub csv): ",
+        "CONSOLE_INVALID_FORMAT": "Nieprawidłowe dane. Wpisz 'xlsx' lub 'csv'.",
+        "CONSOLE_AVAILABLE_CSV_PROFILES": "Dostępne profile CSV:",
+        "CONSOLE_DEFAULT_MARKER": " (domyślny)",
+        "CONSOLE_PROMPT_CSV_PROFILE": (
+            "Podaj numer profilu CSV lub naciśnij Enter, aby użyć domyślnego: "
+        ),
+        "CONSOLE_INVALID_SELECTION": "Nieprawidłowy wybór. Spróbuj ponownie.",
+        "CONSOLE_SAVED_PATH": "Wyniki zapytania zapisano w: {path}",
+        "CONSOLE_NO_ROWS": "Zapytanie nie zwróciło żadnych wierszy.",
+        "CONSOLE_SQL_TIME": "Czas pobrania danych (SQL): {seconds:.2f} s",
+        "CONSOLE_EXPORT_TIME": "Czas eksportu ({fmt}): {seconds:.2f} s",
+        "CONSOLE_TOTAL_TIME": "Czas łączny: {seconds:.2f} s",
+        "DEFAULT_MSSQL_NAME": "Domyślne MSSQL",
+        "FRAME_MSSQL": "MSSQL (ODBC)",
+        "LBL_ODBC_DRIVER": "Sterownik ODBC",
+        "LBL_SERVER": "Serwer",
+        "LBL_DATABASE_NAME": "Nazwa bazy",
+        "LBL_LOGIN": "Login",
+        "LBL_PASSWORD": "Hasło",
+        "CHK_TRUSTED": "Logowanie Windows (Trusted_Connection)",
+        "CHK_ENCRYPT": "Encrypt",
+        "CHK_TRUST_CERT": "TrustServerCertificate",
+        "FRAME_POSTGRES": "PostgreSQL",
+        "LBL_HOST": "Host",
+        "LBL_PORT": "Port",
+        "LBL_DATABASE": "Baza danych",
+        "LBL_USER": "Użytkownik",
+        "FRAME_MYSQL": "MySQL",
+        "FRAME_SQLITE": "SQLite",
+        "FILETYPE_SQLITE": "SQLite",
+        "FILETYPE_ALL": "Wszystkie pliki",
+        "TITLE_SELECT_SQLITE": "Wybierz istniejącą bazę SQLite",
+        "TITLE_CREATE_SQLITE": "Utwórz nową bazę SQLite",
+        "ASK_CREATE_SQLITE": "Utworzyć nową bazę?",
+        "ASK_CREATE_SQLITE_BODY": (
+            "Nie wybrano istniejącej bazy. Czy chcesz utworzyć nową?"
+        ),
+        "LBL_SQLITE_PATH": "Ścieżka do pliku",
+        "BTN_SELECT": "Wybierz",
+        "ERR_DATA_TITLE": "Błąd danych",
+        "ERR_FILL_ODBC": "Wypełnij: sterownik, serwer i nazwę bazy danych.",
+        "ERR_LOGIN_REQUIRED": (
+            "Podaj login i hasło lub zaznacz logowanie Windows (Trusted_Connection)."
+        ),
+        "ERR_FILL_PG": "Wypełnij: host, nazwę bazy i użytkownika.",
+        "ERR_FILL_MYSQL": "Wypełnij: host, nazwę bazy i użytkownika.",
+        "ERR_FILL_SQLITE": "Podaj ścieżkę do pliku bazy SQLite.",
+        "LBL_CONN_NAME": "Nazwa połączenia",
+        "LBL_DB_TYPE": "Typ bazy",
+        "ERR_INVALID_CONN_TYPE": "Nieprawidłowy typ połączenia.",
+        "ERR_CONN_NAME_REQUIRED": "Nazwa połączenia nie może być pusta.",
+        "INFO_CONN_SAVED_TITLE": "Zapisano",
+        "INFO_CONN_SAVED_BODY": "Połączenie zostało zapisane.",
+        "BTN_SAVE": "Zapisz",
+        "BTN_SAVE_NO_TEST": "Zapisz bez testu",
+        "BTN_CANCEL": "Anuluj",
+        "CSV_PROFILE_TITLE": "Szczegóły profilu",
+        "CSV_PROFILE_NAME": "Nazwa profilu:",
+        "CSV_PROFILE_ENCODING": "Kodowanie:",
+        "CSV_PROFILE_DELIMITER": "Separator pól:",
+        "CSV_PROFILE_DELIM_REPLACE": "Zastąp separator w wartościach:",
+        "CSV_PROFILE_DECIMAL": "Separator dziesiętny:",
+        "CSV_PROFILE_LINE_END": "Znak końca linii:",
+        "CSV_PROFILE_QUOTECHAR": "Znak cudzysłowu:",
+        "CSV_PROFILE_QUOTING": "Tryb cytowania:",
+        "CSV_PROFILE_ESCAPECHAR": "Znak ucieczki:",
+        "CSV_PROFILE_ESCAPE_HINT": "(znak ucieczki; puste = cytowanie)",
+        "CSV_PROFILE_DOUBLEQUOTE": "Podwajaj cudzysłowy w polach",
+        "CSV_PROFILE_DATE_FORMAT": "Format daty:",
+        "CSV_PROFILE_FIELD_SEPARATOR": "Separator pól:",
+        "CSV_PROFILE_WARNING_EMPTY": "Nazwa profilu nie może być pusta.",
+        "CSV_PROFILE_WARNING_EXISTS": "Profil o podanej nazwie już istnieje.",
+        "CSV_PROFILE_WARNING_SELECT": "Zaznacz profil na liście.",
+        "CSV_PROFILE_INFO_BUILTIN": "Wbudowanych profili nie można usuwać.",
+        "CSV_PROFILE_WARNING_MIN_ONE": "Musi istnieć co najmniej jeden profil CSV.",
+        "CSV_PROFILE_INFO_SAVED_TITLE": "Informacja",
+        "CSV_PROFILE_INFO_SAVED_BODY": "Zapisano profile CSV.",
+        "CSV_PROFILE_CONFIRM_DELETE": "Usunąć wybrany profil?\n\nNie można cofnąć.",
+        "BTN_SAVE_AS_NEW": "Zapisz jako nowy",
+        "BTN_UPDATE_PROFILE": "Zaktualizuj profil",
+        "BTN_DELETE": "Usuń",
+        "BTN_SET_DEFAULT": "Ustaw jako domyślny",
+        "BTN_CLOSE_SAVE": "Zamknij i zapisz",
+        "ERR_QUERY_TITLE": "Błąd zapytania",
+        "BTN_COPY": "Kopiuj",
+        "BTN_CLOSE": "Zamknij",
+        "ERR_NO_CONNECTION_TITLE": "Brak połączenia",
+        "ERR_NO_CONNECTION_BODY": "Brak zapisanych połączeń. Utwórz i zapisz nowe połączenie.",
+        "ERR_NO_CONNECTION_DELETE": "Brak połączenia do usunięcia.",
+        "ASK_DELETE_CONNECTION_TITLE": "Usuń połączenie",
+        "ASK_DELETE_CONNECTION_BODY": "Czy na pewno chcesz usunąć połączenie {name}?",
+        "TITLE_EDIT_SECURE": "Edytuj secure.txt",
+        "INFO_SECURE_SAVED_TITLE": "Zapisano",
+        "INFO_SECURE_SAVED_BODY": "Zaktualizowano zawartość pliku secure.txt.",
+        "ERR_SECURE_SAVE_TITLE": "Błąd zapisu",
+        "ERR_SECURE_SAVE_BODY": (
+            "Nie udało się zapisać pliku secure.txt.\n\nSzczegóły techniczne:\n{error}"
+        ),
+        "TITLE_SELECT_SQL": "Wybierz plik SQL",
+        "FILETYPE_SQL": "Pliki SQL",
+        "TITLE_SELECT_TEMPLATE": "Wybierz plik template XLSX",
+        "FILETYPE_EXCEL": "Pliki Excel",
+        "ERR_TEMPLATE_TITLE": "Błąd template",
+        "ERR_TEMPLATE_SHEETS": (
+            "Nie można odczytać arkuszy z pliku template.\n\n"
+            "Szczegóły techniczne:\n{error}"
+        ),
+        "CSV_DEFAULT_PROFILE_LABEL": "Domyślny profil CSV: {name}",
+        "TITLE_EDIT_QUERIES": "Edycja queries.txt",
+        "TITLE_ADD_SQL_FILES": "Dodaj pliki SQL",
+        "WARN_SKIPPED_FILES_TITLE": "Pominięto pliki",
+        "WARN_SKIPPED_FILES_BODY": (
+            "Niektóre wybrane pliki nie mają rozszerzenia .sql i zostały pominięte:\n\n"
+            "{files}{more}"
+        ),
+        "INFO_ALREADY_LISTED": "Wybrane pliki są już na liście.",
+        "TITLE_EDIT_QUERY_PATH": "Edytuj ścieżkę zapytania",
+        "PROMPT_EDIT_QUERY_PATH": "Edytuj ścieżkę zapytania:",
+        "WARN_INVALID_SQL_FILE": "Wpis musi wskazywać plik z rozszerzeniem .sql.",
+        "WARN_FILE_MISSING_TITLE": "Uwaga",
+        "WARN_FILE_MISSING_BODY": (
+            "Plik nie istnieje (lub jest chwilowo niedostępny).\n"
+            "Zapisuję ścieżkę, ale upewnij się, że jest poprawna:\n\n{path}"
+        ),
+        "INFO_SELECT_ENTRY_DELETE": "Zaznacz wpis do usunięcia.",
+        "ERR_QUERIES_SAVE_TITLE": "Błąd zapisu",
+        "ERR_QUERIES_SAVE_BODY": (
+            "Nie można zapisać queries.txt.\n\nSzczegóły techniczne:\n{error}"
+        ),
+        "BTN_ADD_FILES": "Dodaj pliki...",
+        "BTN_REMOVE_SELECTED": "Usuń zaznaczone",
+        "TITLE_SELECT_REPORT": "Wybierz raport z listy",
+        "ERR_NO_REPORTS": "Brak raportów w queries.txt",
+        "WARN_NO_REPORT_SELECTED": "Nie wybrano żadnego raportu.",
+        "ERR_NO_SQL_SELECTED": "Nie wybrano pliku SQL.",
+        "ERR_SQL_NOT_FOUND": "Wybrany plik SQL nie istnieje.",
+        "ERR_NEED_CONNECTION": "Utwórz połączenie z bazą danych przed uruchomieniem raportu.",
+        "ERR_TEMPLATE_ONLY_XLSX": "Template można użyć tylko dla formatu XLSX.",
+        "ERR_TEMPLATE_NOT_SELECTED": "Nie wybrano pliku template.",
+        "ERR_TEMPLATE_SHEET_NOT_SELECTED": "Nie wybrano arkusza z pliku template.",
+        "MSG_RUNNING": "Trwa wykonywanie zapytania i eksport. Proszę czekać...",
+        "MSG_SAVED_DETAILS": (
+            "Zapisano: {path}\n"
+            "Wiersze: {rows}\n"
+            "Czas SQL: {sql_time:.2f} s\n"
+            "Czas eksportu: {export_time:.2f} s\n"
+            "Czas łączny: {total_time:.2f} s"
+        ),
+        "MSG_SAVED_DETAILS_CSV": "Profil CSV: {profile}",
+        "MSG_NO_ROWS": "Zapytanie nie zwróciło wierszy.\nCzas SQL: {sql_time:.2f} s",
+        "ERR_EXPORT": "Błąd eksportu. Pełne szczegóły w logu.",
+        "FRAME_DB_CONNECTION": "Połączenie z bazą danych",
+        "LBL_CONNECTION": "Połączenie:",
+        "BTN_ADD_EDIT_CONNECTION": "Dodaj/edytuj połączenie",
+        "BTN_TEST_CONNECTION": "Testuj połączenie",
+        "BTN_DELETE_CONNECTION": "Usuń połączenie",
+        "BTN_EDIT_SECURE": "Edytuj secure.txt",
+        "FRAME_SQL_SOURCE": "Źródło zapytania SQL",
+        "FRAME_OUTPUT_FORMAT": "Format wyjściowy",
+        "FRAME_TEMPLATE_OPTIONS": "Opcje template XLSX (GUI)",
+        "FRAME_RESULTS": "Wynik i akcje",
+        "LBL_SELECTED_SQL": "Wybrany plik SQL:",
+        "BTN_SELECT_SQL": "Wybierz plik SQL",
+        "BTN_SELECT_FROM_LIST": "Wybierz z listy raportów",
+        "BTN_EDIT_QUERIES": "Edytuj queries.txt",
+        "LBL_CSV_PROFILE": "Profil CSV:",
+        "BTN_MANAGE_CSV_PROFILES": "Zarządzaj profilami CSV",
+        "CHK_USE_TEMPLATE": "Użyj pliku template (tylko dla XLSX, tylko w GUI)",
+        "LBL_TEMPLATE_FILE": "Plik template:",
+        "BTN_SELECT_TEMPLATE": "Wybierz template",
+        "LBL_TEMPLATE_SHEET": "Arkusz:",
+        "LBL_TEMPLATE_START_CELL": "Startowa komórka:",
+        "CHK_INCLUDE_HEADERS": "Zapisz nagłówki (nazwy kolumn) w arkuszu",
+        "BTN_START": "Start",
+        "BTN_REPORT_ISSUE": "Zgłoś problem / sugestię",
+        "LBL_EXPORT_INFO": "Informacje o eksporcie:",
+        "BTN_OPEN_FILE": "Otwórz plik",
+        "BTN_OPEN_FOLDER": "Otwórz katalog",
+        "LBL_ERRORS_SHORT": "Błędy (skrót):",
+        "STATUS_NO_CONNECTION": "Brak połączenia. Utwórz nowe połączenie.",
+        "STATUS_CONNECTION_ERROR": "Błąd połączenia. Utwórz nowe połączenie.",
+        "ERR_CONNECTION_TITLE": "Błąd połączenia",
+        "ERR_CONNECTION_BODY": (
+            "Nie udało się nawiązać połączenia.\n\nSzczegóły techniczne:\n{error}"
+        ),
+        "STATUS_CONNECTED": "Połączono z {name} ({type}).",
+        "INFO_CONNECTION_OK_TITLE": "Połączenie działa",
+        "INFO_CONNECTION_OK_BODY": "Połączenie {name} powiodło się.",
+        "ERR_NO_SECURE_CONFIG": "Brak konfiguracji połączenia",
+        "ERR_SELECT_TEMPLATE": "Wybierz plik template",
+        "ERR_GENERIC": "Błąd",
+        "ERR_TEMPLATE_MISSING_SHEET": "Arkusz '{sheet}' nie istnieje w pliku template.",
+        "CLI_DESC": "Uruchamiaj pliki SQL i eksportuj wyniki do XLSX/CSV.",
+        "CLI_LANG_HELP": "Język interfejsu (en/pl).",
+        "CLI_CONSOLE_HELP": "Uruchom w trybie konsolowym.",
+        "CLI_NO_CONNECTIONS": (
+            "Brak zapisanych połączeń. Utwórz połączenie w trybie GUI, aby uruchomić konsolę."
+        ),
+        "CLI_CONNECTION_FAIL": "Nie udało się utworzyć połączenia. Pełne szczegóły w logu.",
+        "MENU_LANGUAGE": "Język",
+        "ERR_FILE_PATH": "Ścieżka: {path}",
+        "ERR_FILE_LOCKED": (
+            "Plik docelowy już istnieje i może być otwarty w innej aplikacji "
+            "(np. Excel). Zamknij go i spróbuj ponownie.{path}"
+        ),
+        "ERR_NO_WRITE_PERMISSION": (
+            "Brak uprawnień do zapisu pliku docelowego lub ścieżka jest niedostępna. "
+            "Sprawdź lokalizację pliku."
+        ),
+        "ERR_DB_MESSAGE": "Komunikat bazy (fragment):",
+        "ERR_SQL_PREVIEW": "SQL (początek):",
+        "ERR_FULL_LOG": "Pełny błąd zapisany w pliku kkr_query2sheet.log",
+        "ERR_HINT_LABEL": "Podpowiedź:",
+        "DB_TYPE_MSSQL": "SQL Server (ODBC)",
+        "DB_TYPE_PG": "PostgreSQL",
+        "DB_TYPE_MYSQL": "MySQL",
+        "DB_TYPE_SQLITE": "SQLite (plik .db)",
+        "TITLE_CONN_DIALOG": "Dodaj lub zaktualizuj połączenie",
+        "CONN_DIALOG_HINT": (
+            "Aby utworzyć nowe połączenie, wpisz nową nazwę.\n"
+            "Aby edytować istniejące połączenie, zostaw nazwę i popraw szczegóły."
+        ),
+        "INFO_CONN_SAVED_NO_TEST": (
+            "Połączenie zapisane bez testu.\n"
+            "Użyj przycisku „Testuj połączenie”, aby je sprawdzić."
+        ),
+        "INFO_ICON": "i",
+        "BTN_OK": "OK",
+        "FORMAT_XLSX": "XLSX",
+        "FORMAT_CSV": "CSV",
+        "CSV_PROFILE_DIALOG_TITLE": "Profile CSV",
+        "CSV_PROFILE_DEFAULT_SUFFIX": "(domyślny)",
+        "CSV_PROFILE_BUILTIN_SUFFIX": "[wbudowany]",
+        "CSV_PROFILE_INVALID_DATE": (
+            "Podany format daty jest nieprawidłowy. Skorzystaj ze składni strftime."
+        ),
+        "CSV_PROFILE_DATE_DEFAULT": "Domyślny format Pandas (przykład: {example})",
+        "CSV_PROFILE_DATE_INVALID": (
+            "Nieprawidłowy wzorzec daty (użyj składni strftime, np. %Y-%m-%d)."
+        ),
+        "CSV_PROFILE_DATE_PREVIEW": "Bieżący czas w tym formacie: {example}",
+        "CSV_PROFILE_BUILTIN_NOTICE": (
+            "Profil wbudowany: nie można zapisać zmian ani usuwać. "
+            "Użyj Zapisz jako nowy, aby stworzyć własny wariant."
+        ),
+        "CSV_PROFILE_NAME_RESERVED": (
+            "Ta nazwa jest zarezerwowana dla wbudowanego profilu. Wybierz inną nazwę."
+        ),
+        "CSV_PROFILE_NO_SELECTION_TITLE": "Brak profilu",
+        "CSV_PROFILE_BUILTIN_OVERWRITE": (
+            "Nie możesz nadpisać wbudowanego profilu. Zmień nazwę i zapisz jako nowy profil."
+        ),
+        "CSV_PROFILE_UNSAVED_TITLE": "Niezapisane zmiany",
+        "CSV_PROFILE_UNSAVED_BODY": (
+            "Masz niezapisane zmiany profili CSV. Zapisać przed zamknięciem?"
+        ),
+        "WARN_SKIPPED_FILES_MORE": "\n\n(+ {count} kolejnych)",
+        "CSV_HELP_NAME_TITLE": "Nazwa profilu",
+        "CSV_HELP_NAME_BODY": (
+            "Dowolna, unikalna nazwa ułatwiająca wybór profilu, np. "
+            "\"UTF-8 (przecinek)\" lub \"Windows-1250 (średnik)\"."
+        ),
+        "CSV_HELP_ENCODING_TITLE": "Kodowanie",
+        "CSV_HELP_ENCODING_BODY": (
+            "Sposób kodowania znaków w pliku CSV. Domyślnie UTF-8; dla "
+            "starszych arkuszy Excel można użyć windows-1250."
+        ),
+        "CSV_HELP_DELIMITER_TITLE": "Separator pól",
+        "CSV_HELP_DELIMITER_BODY": (
+            "Znak oddzielający kolumny. Najczęściej przecinek (,) lub "
+            "średnik (;), zgodnie z ustawieniami regionalnymi arkusza."
+        ),
+        "CSV_HELP_DELIM_REPLACE_TITLE": "Zastąp separator w wartościach",
+        "CSV_HELP_DELIM_REPLACE_BODY": (
+            "Opcjonalnie zamienia znak separatora w wartościach na inny (np. "
+            "średnik na przecinek). Przydatne, gdy system importujący nie "
+            "obsługuje poprawnego eskapowania separatorów w polach. "
+            "Uwaga: zamiana jest globalna dla wszystkich pól tekstowych "
+            "(również JSON/ID w formie tekstu)."
+        ),
+        "CSV_HELP_DECIMAL_TITLE": "Separator dziesiętny",
+        "CSV_HELP_DECIMAL_BODY": (
+            "Znak rozdzielający część całkowitą od ułamkowej. Kropka (.) "
+            "dla układu angielskiego, przecinek (,) dla polskiego."
+        ),
+        "CSV_HELP_LINETERM_TITLE": "Znak końca linii",
+        "CSV_HELP_LINETERM_BODY": (
+            "Domyślnie \\n. Dla pełnej zgodności z Windows można użyć "
+            "\\r\\n. Zmień tylko gdy import wymaga konkretnego formatu."
+        ),
+        "CSV_HELP_QUOTECHAR_TITLE": "Znak cudzysłowu",
+        "CSV_HELP_QUOTECHAR_BODY": (
+            "Najczęściej \". Używany do otaczania pól wymagających "
+            "cytowania (np. zawierających separator)."
+        ),
+        "CSV_HELP_QUOTING_TITLE": "Strategia cudzysłowów",
+        "CSV_HELP_QUOTING_BODY": (
+            "minimal – tylko gdy potrzebne (zalecane), all – zawsze, "
+            "nonnumeric – dla tekstu, none – bez cytowania (wymaga "
+            "escapechar)."
+        ),
+        "CSV_HELP_ESCAPECHAR_TITLE": "Znak ucieczki",
+        "CSV_HELP_ESCAPECHAR_BODY": (
+            "Znak ucieczki używany, gdy quoting=none lub pola mogą "
+            "zawierać separator. Zostaw pusty, jeżeli stosujesz "
+            "standardowe cytowanie."
+        ),
+        "CSV_HELP_DOUBLEQUOTE_TITLE": "Podwajanie cudzysłowów",
+        "CSV_HELP_DOUBLEQUOTE_BODY": (
+            "Gdy zaznaczone, wewnętrzny \" w polu staje się \"\". "
+            "Zostaw włączone, chyba że system importujący wymaga inaczej."
+        ),
+        "CSV_HELP_DATE_FORMAT_TITLE": "Format daty",
+        "CSV_HELP_DATE_FORMAT_BODY": (
+            "Opcjonalny wzorzec strftime, np. %Y-%m-%d lub %d.%m.%Y. "
+            "Pozostaw puste, aby użyć domyślnego formatowania Pandas."
+        ),
+    },
+}
+
+
+def _detect_lang() -> str:
+    # prosto i bezpiecznie: PL jeśli systemowa zaczyna się od 'pl', inaczej EN
+    try:
+        loc = locale.getdefaultlocale()[0] or ""
+    except Exception:
+        loc = ""
+    loc = loc.lower()
+    return "pl" if loc.startswith("pl") else "en"
+
+
+_CURRENT_LANG = _detect_lang()
+
+
+def set_lang(lang: str) -> None:
+    global _CURRENT_LANG
+    lang = (lang or "").lower()
+    _CURRENT_LANG = lang if lang in I18N else "en"
+
+
+def t(key: str, **kwargs) -> str:
+    # fallback: en -> key
+    s = I18N.get(_CURRENT_LANG, {}).get(key) or I18N["en"].get(key) or key
+    return s.format(**kwargs) if kwargs else s
 
 
 def _build_path(name: str) -> str:
@@ -64,9 +850,37 @@ def _center_window(win, parent=None):
     win.geometry(f"+{x}+{y}")
 
 
+def open_github_issue_chooser(parent=None) -> None:
+    try:
+        ok = webbrowser.open_new_tab(GITHUB_NEW_ISSUE_CHOOSE_URL)
+        if not ok and parent is not None:
+            messagebox.showwarning(
+                t("BROWSER_OPEN_FAIL_TITLE"),
+                t(
+                    "BROWSER_OPEN_FAIL_BODY",
+                    url=GITHUB_NEW_ISSUE_CHOOSE_URL,
+                ),
+                parent=parent,
+            )
+    except Exception as exc:  # noqa: BLE001
+        if parent is not None:
+            messagebox.showerror(
+                t("ERR_TITLE"),
+                t(
+                    "BROWSER_OPEN_FAIL_ERROR_BODY",
+                    error=exc,
+                    url=GITHUB_NEW_ISSUE_CHOOSE_URL,
+                ),
+                parent=parent,
+            )
+
+
 SECURE_PATH = _build_path("secure.txt")
 QUERIES_PATH = _build_path("queries.txt")
 CSV_PROFILES_PATH = _build_path("csv_profiles.json")
+
+SECURE_SAMPLE_PATH = _build_path("secure.sample.json")
+QUERIES_SAMPLE_PATH = _build_path("queries.sample.txt")
 
 
 BUILTIN_CSV_PROFILES = [
@@ -117,6 +931,57 @@ def shorten_path(path, max_len=80):
     return short
 
 
+def resolve_path(path: str) -> str:
+    path = (path or "").strip()
+    path = os.path.expandvars(os.path.expanduser(path))
+    if path and not os.path.isabs(path):
+        path = os.path.join(BASE_DIR, path)
+    return os.path.abspath(os.path.normpath(path))
+
+
+def _normalize_missing_path(path: str) -> str:
+    normalized = os.path.abspath(os.path.normpath(path))
+    if sys.platform == "win32":
+        return os.path.normcase(normalized)
+    return normalized
+
+
+def query_path_key(path: str) -> tuple:
+    resolved = resolve_path(path)
+    try:
+        stat_result = os.stat(resolved)
+    except (FileNotFoundError, OSError):
+        return ("path", _normalize_missing_path(resolved))
+
+    inode = getattr(stat_result, "st_ino", None)
+    if not inode:
+        return ("path", _normalize_missing_path(resolved))
+
+    return ("stat", stat_result.st_dev, stat_result.st_ino)
+
+
+def to_storage_path(path: str) -> str:
+    resolved = resolve_path(path)
+    base_dir = os.path.abspath(BASE_DIR)
+    if sys.platform == "win32":
+        resolved_cmp = os.path.normcase(resolved)
+        base_cmp = os.path.normcase(base_dir)
+    else:
+        resolved_cmp = resolved
+        base_cmp = base_dir
+    try:
+        if os.path.commonpath([resolved_cmp, base_cmp]) == base_cmp:
+            return os.path.relpath(resolved, base_dir)
+    except ValueError:
+        pass
+    return resolved
+
+
+def is_sql_path(path: str) -> bool:
+    # Filtr w oknie wyboru to nie walidacja -> walidujemy w kodzie
+    return (path or "").strip().lower().endswith(".sql")
+
+
 def remove_bom(content: bytes) -> str:
     """
     Decode text from bytes, handling UTF-8/16/32 BOM if present.
@@ -163,13 +1028,13 @@ def _normalize_connections(data):
     """Return normalized structure for saved connections with legacy support."""
 
     def _default_store():
-        return {"connections": [], "last_selected": None}
+        return {"connections": [], "last_selected": None, "ui_lang": None}
 
     if isinstance(data, str):
         legacy_str = data.strip()
         if not legacy_str:
             return _default_store()
-        name = "Domyślne MSSQL"
+        name = t("DEFAULT_MSSQL_NAME")
         return {
             "connections": [
                 {
@@ -184,9 +1049,11 @@ def _normalize_connections(data):
 
     connections = []
     last_selected = None
+    ui_lang = None
 
     if isinstance(data, dict):
         last_selected = data.get("last_selected")
+        ui_lang = data.get("ui_lang")
         for item in data.get("connections", []):
             name = str(item.get("name") or "").strip()
             url = str(item.get("url") or "").strip()
@@ -210,7 +1077,11 @@ def _normalize_connections(data):
     if last_selected not in names:
         last_selected = connections[0]["name"]
 
-    return {"connections": connections, "last_selected": last_selected}
+    return {
+        "connections": connections,
+        "last_selected": last_selected,
+        "ui_lang": ui_lang,
+    }
 
 
 def load_connections(path=SECURE_PATH):
@@ -254,6 +1125,47 @@ def save_query_paths(paths, queries_file=QUERIES_PATH):
     with open(queries_file, "w", encoding="utf-8") as f:
         for path in paths:
             f.write(f"{path}\n")
+
+
+def bootstrap_local_files():
+    """Create local config files from *.sample.* on first run.
+
+    The app will copy (only if missing):
+    - secure.sample.json  -> secure.txt
+    - queries.sample.txt  -> queries.txt
+
+    Existing files are never overwritten.
+    """
+
+    created = []
+
+    if not os.path.exists(SECURE_PATH) and os.path.exists(SECURE_SAMPLE_PATH):
+        try:
+            shutil.copyfile(SECURE_SAMPLE_PATH, SECURE_PATH)
+            created.append(os.path.basename(SECURE_PATH))
+        except Exception as exc:  # noqa: BLE001
+            try:
+                LOGGER.exception(
+                    "Failed to create secure.txt from secure.sample.json",
+                    exc_info=exc,
+                )
+            except Exception:
+                pass
+
+    if not os.path.exists(QUERIES_PATH) and os.path.exists(QUERIES_SAMPLE_PATH):
+        try:
+            shutil.copyfile(QUERIES_SAMPLE_PATH, QUERIES_PATH)
+            created.append(os.path.basename(QUERIES_PATH))
+        except Exception as exc:  # noqa: BLE001
+            try:
+                LOGGER.exception(
+                    "Failed to create queries.txt from queries.sample.txt",
+                    exc_info=exc,
+                )
+            except Exception:
+                pass
+
+    return created
 
 
 DEFAULT_CSV_PROFILE = {
@@ -376,12 +1288,8 @@ def handle_db_driver_error(exc, db_type, profile_name=None, show_message=None):
             missing_pyodbc = True
 
         if missing_pyodbc or missing_driver:
-            msg = (
-                "Nie można połączyć z SQL Server. Wymagany sterownik ODBC "
-                "('ODBC Driver 17 for SQL Server' lub zgodny) lub biblioteka pyodbc "
-                "nie jest zainstalowana. Zainstaluj sterownik i spróbuj ponownie."
-            )
-            _notify("Brak sterownika ODBC", msg)
+            msg = t("ERR_ODBC_MISSING_BODY")
+            _notify(t("ERR_ODBC_MISSING_TITLE"), msg)
             return True
 
     if db_type == "postgresql":
@@ -392,12 +1300,20 @@ def handle_db_driver_error(exc, db_type, profile_name=None, show_message=None):
             missing_psycopg2 = True
 
         if missing_psycopg2:
-            msg = (
-                "Nie można połączyć z PostgreSQL. Wymagana biblioteka Pythona (np. "
-                "psycopg2) nie jest zainstalowana. Zainstaluj brakującą bibliotekę i "
-                "spróbuj ponownie."
-            )
-            _notify("Brak biblioteki PostgreSQL", msg)
+            msg = t("ERR_PG_MISSING_BODY")
+            _notify(t("ERR_PG_MISSING_TITLE"), msg)
+            return True
+
+    if db_type == "mysql":
+        missing_pymysql = isinstance(exc, (ImportError, ModuleNotFoundError)) and (
+            getattr(exc, "name", "") == "pymysql" or "pymysql" in exc_text
+        )
+        if isinstance(exc, NoSuchModuleError) and "pymysql" in exc_text:
+            missing_pymysql = True
+
+        if missing_pymysql:
+            msg = t("ERR_MYSQL_MISSING_BODY")
+            _notify(t("ERR_MYSQL_MISSING_TITLE"), msg)
             return True
 
     return False
@@ -550,6 +1466,55 @@ def save_csv_profiles(config, path=CSV_PROFILES_PATH):
         json.dump(data_to_save, f, ensure_ascii=False, indent=2)
 
 
+def remember_last_used_csv_profile(
+    profile_name: str,
+    current_config: dict,
+    path: str = CSV_PROFILES_PATH,
+) -> dict:
+    """
+    Ustawia profile_name jako default_profile i zapisuje do csv_profiles.json.
+    Zwraca odświeżoną konfigurację (load_csv_profiles).
+    Ma być bezpieczna: jeśli zapis się nie uda, nie przerywa działania eksportu.
+    """
+    if not profile_name:
+        return current_config or {}
+
+    config = current_config or {}
+    profiles = config.get("profiles") or []
+    names = {p.get("name") for p in profiles if p.get("name")}
+
+    if profile_name not in names:
+        return config
+
+    if config.get("default_profile") == profile_name:
+        return config
+
+    new_config = dict(config)
+    new_config["default_profile"] = profile_name
+
+    try:
+        save_csv_profiles(new_config, path=path)
+    except OSError as exc:
+        try:
+            LOGGER.warning(
+                "Nie udało się zapisać domyślnego profilu CSV (%s): %s",
+                profile_name,
+                exc,
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        return config
+
+    try:
+        return load_csv_profiles(path=path)
+    except Exception as exc:  # noqa: BLE001
+        try:
+            LOGGER.warning("Nie udało się ponownie wczytać csv_profiles.json: %s", exc)
+        except Exception:  # noqa: BLE001
+            pass
+        return new_config
+
+
 def ensure_directories(paths):
     for path in paths:
         os.makedirs(path, exist_ok=True)
@@ -635,6 +1600,10 @@ def _run_query_to_rows(engine, sql_query):
                 # PostgreSQL messages for deadlocks/serialization failures
                 "deadlock detected",
                 "could not serialize access due to",
+                # MySQL messages for deadlocks/lock timeouts
+                "1213",
+                "deadlock found when trying to get lock",
+                "lock wait timeout exceeded",
             )
 
             if any(signature in msg_lower for signature in retryable_error_signatures) and attempt < max_retries:
@@ -669,11 +1638,9 @@ def _run_query_to_rows(engine, sql_query):
 
 
 def format_error_for_ui(exc: Exception, sql_query: str, max_chars: int = 2000) -> str:
-    """
-    Zapisuje pełny błąd do loga i zwraca skrócony komunikat do pokazania w UI.
-    """
+    """Log full error and return a shortened message for UI display."""
     # pełny traceback + SQL tylko do loga
-    logger.exception("Błąd podczas wykonywania zapytania SQL. Query:\n%s", sql_query)
+    LOGGER.exception("Błąd podczas wykonywania zapytania SQL. Query:\n%s", sql_query)
 
     full_tb = traceback.format_exc()
     first_line = full_tb.strip().splitlines()[0] if full_tb else str(exc)
@@ -692,29 +1659,27 @@ def format_error_for_ui(exc: Exception, sql_query: str, max_chars: int = 2000) -
         exists = os.path.exists(blocked_file) if blocked_file else False
 
         if exists:
+            path_note = (
+                f"\n{t('ERR_FILE_PATH', path=shortened)}" if shortened else ""
+            )
             hints.append(
-                "Plik docelowy już istnieje i może być otwarty w innej aplikacji "
-                "(np. Excel). Zamknij go i spróbuj ponownie."
-                + (f"\nŚcieżka: {shortened}" if shortened else "")
+                t("ERR_FILE_LOCKED", path=path_note)
             )
         else:
-            hints.append(
-                "Brak uprawnień do zapisu pliku docelowego lub ścieżka jest "
-                "niedostępna. Sprawdź lokalizację pliku."
-            )
+            hints.append(t("ERR_NO_WRITE_PERMISSION"))
 
     msg = (
         f"{first_line}\n\n"
-        f"Komunikat bazy (fragment):\n{db_msg_first_line}\n\n"
-        f"SQL (początek):\n{sql_preview}\n\n"
-        f"Pełny błąd zapisany w pliku kkr_query2sheet.log"
+        f"{t('ERR_DB_MESSAGE')}\n{db_msg_first_line}\n\n"
+        f"{t('ERR_SQL_PREVIEW')}\n{sql_preview}\n\n"
+        f"{t('ERR_FULL_LOG')}"
     )
 
     if hints:
-        msg += "\n\nPodpowiedź:\n" + "\n".join(hints)
+        msg += "\n\n" + t("ERR_HINT_LABEL") + "\n" + "\n".join(hints)
 
     if len(msg) > max_chars:
-        msg = msg[:max_chars] + "\n...\n(Przycięto w UI, pełna treść w kkr_query2sheet.log)"
+        msg = msg[:max_chars] + "\n" + t("MSG_UI_TRUNCATED")
 
     return msg
 
@@ -783,7 +1748,9 @@ def run_export_to_template(
         wb = load_workbook(output_file_path)
         if sheet_name not in wb.sheetnames:
             wb.close()
-            raise ValueError(f"Arkusz '{sheet_name}' nie istnieje w pliku template.")
+            raise ValueError(
+                t("ERR_TEMPLATE_MISSING_SHEET", sheet=sheet_name)
+            )
 
         ws = wb[sheet_name]
 
@@ -819,8 +1786,8 @@ def run_console(engine, output_directory, selected_connection):
 
     sql_query_file_path = None
     if sql_query_file_paths:
-        print("Available SQL query files:")
-        print("0: [Custom path]")
+        print(t("CONSOLE_AVAILABLE_FILES"))
+        print(t("CONSOLE_CUSTOM_PATH"))
         for idx, path in enumerate(sql_query_file_paths, start=1):
             print(f"{idx}: {path}")
 
@@ -828,37 +1795,48 @@ def run_console(engine, output_directory, selected_connection):
             try:
                 selection = int(
                     input(
-                        "Please enter the number of the SQL query file to execute "
-                        f"(0 for custom path, 1-{len(sql_query_file_paths)}): "
+                        t(
+                            "CONSOLE_PROMPT_SELECT",
+                            max_idx=len(sql_query_file_paths),
+                        )
                     )
                 )
                 if selection == 0:
-                    custom_path = input("Please enter full path to the .sql file: ").strip()
-                    if not os.path.isfile(custom_path):
-                        print("File does not exist. Please try again.")
+                    custom_path = input(t("CONSOLE_PROMPT_CUSTOM_PATH")).strip()
+                    resolved = resolve_path(custom_path)
+                    if not os.path.isfile(resolved):
+                        print(t("CONSOLE_FILE_NOT_FOUND"))
                         continue
-                    sql_query_file_path = custom_path
+                    sql_query_file_path = resolved
                     break
                 if 1 <= selection <= len(sql_query_file_paths):
-                    sql_query_file_path = sql_query_file_paths[selection - 1]
+                    sql_query_file_path = resolve_path(sql_query_file_paths[selection - 1])
                     break
-                print(f"Please enter a number between 0 and {len(sql_query_file_paths)}.")
+                print(
+                    t(
+                        "CONSOLE_SELECT_RANGE",
+                        max_idx=len(sql_query_file_paths),
+                    )
+                )
             except ValueError:
-                print("Invalid input. Please enter a number.")
+                print(t("CONSOLE_INVALID_INPUT"))
     else:
-        print("No SQL query file paths found in queries.txt")
+        print(t("CONSOLE_NO_QUERIES"))
         while True:
-            custom_path = input("Please enter full path to the .sql file: ").strip()
-            if os.path.isfile(custom_path):
-                sql_query_file_path = custom_path
+            custom_path = input(t("CONSOLE_PROMPT_CUSTOM_PATH")).strip()
+            resolved = resolve_path(custom_path)
+            if os.path.isfile(resolved):
+                sql_query_file_path = resolved
                 break
-            print("File does not exist. Please try again.")
+            print(t("CONSOLE_FILE_NOT_FOUND"))
 
     while True:
-        output_format = input("Please enter the desired output format (xlsx or csv): ").strip().lower()
+        output_format = (
+            input(t("CONSOLE_PROMPT_FORMAT")).strip().lower()
+        )
         if output_format in ["xlsx", "csv"]:
             break
-        print("Invalid input. Please enter 'xlsx' or 'csv'.")
+        print(t("CONSOLE_INVALID_FORMAT"))
 
     selected_csv_profile = get_csv_profile(csv_config, csv_config.get("default_profile"))
     if output_format == "csv":
@@ -866,14 +1844,16 @@ def run_console(engine, output_directory, selected_connection):
         profile_names = [p.get("name") for p in profiles]
         default_profile_name = csv_config.get("default_profile") or profile_names[0]
 
-        print("Available CSV profiles:")
+        print(t("CONSOLE_AVAILABLE_CSV_PROFILES"))
         for idx, name in enumerate(profile_names, start=1):
-            default_marker = " (default)" if name == default_profile_name else ""
+            default_marker = (
+                t("CONSOLE_DEFAULT_MARKER") if name == default_profile_name else ""
+            )
             print(f"{idx}: {name}{default_marker}")
 
         while True:
             selection = input(
-                "Enter CSV profile number to use or press Enter to use the default: "
+                t("CONSOLE_PROMPT_CSV_PROFILE")
             ).strip()
             if not selection:
                 break
@@ -882,7 +1862,7 @@ def run_console(engine, output_directory, selected_connection):
                 if 1 <= idx <= len(profile_names):
                     selected_csv_profile = profiles[idx - 1]
                     break
-            print("Invalid selection. Please try again.")
+            print(t("CONSOLE_INVALID_SELECTION"))
 
     with open(sql_query_file_path, "rb") as file:
         content = file.read()
@@ -904,18 +1884,23 @@ def run_console(engine, output_directory, selected_connection):
         engine, sql_query, output_file_path, output_format, csv_profile=selected_csv_profile
     )
 
+    if output_format == "csv" and selected_csv_profile:
+        prof_name = (selected_csv_profile.get("name") or "").strip()
+        if prof_name:
+            csv_config = remember_last_used_csv_profile(prof_name, csv_config)
+
     if rows_count > 0:
-        print(f"Query results have been saved to: {output_file_path}")
+        print(t("CONSOLE_SAVED_PATH", path=output_file_path))
     else:
-        print("The query did not return any rows.")
-    print(f"Data fetch time (SQL): {sql_dur:.2f} seconds")
+        print(t("CONSOLE_NO_ROWS"))
+    print(t("CONSOLE_SQL_TIME", seconds=sql_dur))
     if rows_count > 0:
-        print(f"Export time ({output_format}): {export_dur:.2f} seconds")
-        print(f"Total time: {total_dur:.2f} seconds")
+        print(t("CONSOLE_EXPORT_TIME", fmt=output_format, seconds=export_dur))
+        print(t("CONSOLE_TOTAL_TIME", seconds=total_dur))
 
 
 def _create_mssql_frame(parent):
-    frame = tk.LabelFrame(parent, text="MSSQL (ODBC)")
+    frame = tk.LabelFrame(parent, text=t("FRAME_MSSQL"))
     frame.grid(row=3, column=0, columnspan=4, sticky="we", padx=10, pady=(5, 0))
     for idx in range(4):
         frame.columnconfigure(idx, weight=1)
@@ -929,40 +1914,50 @@ def _create_mssql_frame(parent):
     encrypt_var = tk.BooleanVar(value=True)
     trust_cert_var = tk.BooleanVar(value=True)
 
-    tk.Label(frame, text="Sterownik ODBC").grid(row=0, column=0, sticky="w", padx=5, pady=(5, 0))
+    tk.Label(frame, text=t("LBL_ODBC_DRIVER")).grid(
+        row=0, column=0, sticky="w", padx=5, pady=(5, 0)
+    )
     tk.Entry(frame, textvariable=driver_var, width=30).grid(
         row=0, column=1, columnspan=3, sticky="we", padx=5, pady=(5, 0)
     )
 
-    tk.Label(frame, text="Serwer").grid(row=1, column=0, sticky="w", padx=5, pady=(5, 0))
+    tk.Label(frame, text=t("LBL_SERVER")).grid(
+        row=1, column=0, sticky="w", padx=5, pady=(5, 0)
+    )
     tk.Entry(frame, textvariable=server_var, width=30).grid(
         row=1, column=1, columnspan=3, sticky="we", padx=5, pady=(5, 0)
     )
 
-    tk.Label(frame, text="Nazwa bazy").grid(row=2, column=0, sticky="w", padx=5, pady=(5, 0))
+    tk.Label(frame, text=t("LBL_DATABASE_NAME")).grid(
+        row=2, column=0, sticky="w", padx=5, pady=(5, 0)
+    )
     tk.Entry(frame, textvariable=database_var, width=30).grid(
         row=2, column=1, columnspan=3, sticky="we", padx=5, pady=(5, 0)
     )
 
-    tk.Label(frame, text="Login").grid(row=3, column=0, sticky="w", padx=5, pady=(5, 0))
+    tk.Label(frame, text=t("LBL_LOGIN")).grid(
+        row=3, column=0, sticky="w", padx=5, pady=(5, 0)
+    )
     tk.Entry(frame, textvariable=username_var, width=25).grid(
         row=3, column=1, sticky="we", padx=5, pady=(5, 0)
     )
 
-    tk.Label(frame, text="Hasło").grid(row=3, column=2, sticky="w", padx=5, pady=(5, 0))
+    tk.Label(frame, text=t("LBL_PASSWORD")).grid(
+        row=3, column=2, sticky="w", padx=5, pady=(5, 0)
+    )
     tk.Entry(frame, textvariable=password_var, show="*", width=25).grid(
         row=3, column=3, sticky="we", padx=5, pady=(5, 0)
     )
 
     tk.Checkbutton(
-        frame, text="Logowanie Windows (Trusted_Connection)", variable=trusted_var
+        frame, text=t("CHK_TRUSTED"), variable=trusted_var
     ).grid(
         row=4, column=1, sticky="w", padx=5, pady=(5, 0)
     )
-    tk.Checkbutton(frame, text="Encrypt", variable=encrypt_var).grid(
+    tk.Checkbutton(frame, text=t("CHK_ENCRYPT"), variable=encrypt_var).grid(
         row=4, column=2, sticky="w", padx=5, pady=(5, 0)
     )
-    tk.Checkbutton(frame, text="TrustServerCertificate", variable=trust_cert_var).grid(
+    tk.Checkbutton(frame, text=t("CHK_TRUST_CERT"), variable=trust_cert_var).grid(
         row=4, column=3, sticky="w", padx=5, pady=(5, 0)
     )
 
@@ -979,7 +1974,7 @@ def _create_mssql_frame(parent):
 
 
 def _create_pg_frame(parent):
-    frame = tk.LabelFrame(parent, text="PostgreSQL")
+    frame = tk.LabelFrame(parent, text=t("FRAME_POSTGRES"))
     frame.grid(row=4, column=0, columnspan=4, sticky="we", padx=10, pady=(5, 0))
     for idx in range(4):
         frame.columnconfigure(idx, weight=1)
@@ -990,27 +1985,93 @@ def _create_pg_frame(parent):
     user_var = tk.StringVar()
     password_var = tk.StringVar()
 
-    tk.Label(frame, text="Host").grid(row=0, column=0, sticky="w", padx=5, pady=(5, 0))
+    tk.Label(frame, text=t("LBL_HOST")).grid(
+        row=0, column=0, sticky="w", padx=5, pady=(5, 0)
+    )
     tk.Entry(frame, textvariable=host_var).grid(
         row=0, column=1, sticky="we", padx=5, pady=(5, 0)
     )
 
-    tk.Label(frame, text="Port").grid(row=0, column=2, sticky="w", padx=5, pady=(5, 0))
+    tk.Label(frame, text=t("LBL_PORT")).grid(
+        row=0, column=2, sticky="w", padx=5, pady=(5, 0)
+    )
     tk.Entry(frame, textvariable=port_var, width=8).grid(
         row=0, column=3, sticky="we", padx=5, pady=(5, 0)
     )
 
-    tk.Label(frame, text="Database").grid(row=1, column=0, sticky="w", padx=5, pady=(5, 0))
+    tk.Label(frame, text=t("LBL_DATABASE")).grid(
+        row=1, column=0, sticky="w", padx=5, pady=(5, 0)
+    )
     tk.Entry(frame, textvariable=db_var).grid(
         row=1, column=1, sticky="we", padx=5, pady=(5, 0)
     )
 
-    tk.Label(frame, text="User").grid(row=1, column=2, sticky="w", padx=5, pady=(5, 0))
+    tk.Label(frame, text=t("LBL_USER")).grid(
+        row=1, column=2, sticky="w", padx=5, pady=(5, 0)
+    )
     tk.Entry(frame, textvariable=user_var).grid(
         row=1, column=3, sticky="we", padx=5, pady=(5, 0)
     )
 
-    tk.Label(frame, text="Password").grid(row=2, column=0, sticky="w", padx=5, pady=(5, 0))
+    tk.Label(frame, text=t("LBL_PASSWORD")).grid(
+        row=2, column=0, sticky="w", padx=5, pady=(5, 0)
+    )
+    tk.Entry(frame, textvariable=password_var, show="*").grid(
+        row=2, column=1, sticky="we", padx=5, pady=(5, 0)
+    )
+
+    return frame, {
+        "host": host_var,
+        "port": port_var,
+        "database": db_var,
+        "user": user_var,
+        "password": password_var,
+    }
+
+
+def _create_mysql_frame(parent):
+    frame = tk.LabelFrame(parent, text=t("FRAME_MYSQL"))
+    frame.grid(row=6, column=0, columnspan=4, sticky="we", padx=10, pady=(5, 0))
+    for idx in range(4):
+        frame.columnconfigure(idx, weight=1)
+
+    host_var = tk.StringVar(value="localhost")
+    port_var = tk.StringVar(value="3306")
+    db_var = tk.StringVar()
+    user_var = tk.StringVar()
+    password_var = tk.StringVar()
+
+    tk.Label(frame, text=t("LBL_HOST")).grid(
+        row=0, column=0, sticky="w", padx=5, pady=(5, 0)
+    )
+    tk.Entry(frame, textvariable=host_var).grid(
+        row=0, column=1, sticky="we", padx=5, pady=(5, 0)
+    )
+
+    tk.Label(frame, text=t("LBL_PORT")).grid(
+        row=0, column=2, sticky="w", padx=5, pady=(5, 0)
+    )
+    tk.Entry(frame, textvariable=port_var, width=8).grid(
+        row=0, column=3, sticky="we", padx=5, pady=(5, 0)
+    )
+
+    tk.Label(frame, text=t("LBL_DATABASE")).grid(
+        row=1, column=0, sticky="w", padx=5, pady=(5, 0)
+    )
+    tk.Entry(frame, textvariable=db_var).grid(
+        row=1, column=1, sticky="we", padx=5, pady=(5, 0)
+    )
+
+    tk.Label(frame, text=t("LBL_USER")).grid(
+        row=1, column=2, sticky="w", padx=5, pady=(5, 0)
+    )
+    tk.Entry(frame, textvariable=user_var).grid(
+        row=1, column=3, sticky="we", padx=5, pady=(5, 0)
+    )
+
+    tk.Label(frame, text=t("LBL_PASSWORD")).grid(
+        row=2, column=0, sticky="w", padx=5, pady=(5, 0)
+    )
     tk.Entry(frame, textvariable=password_var, show="*").grid(
         row=2, column=1, sticky="we", padx=5, pady=(5, 0)
     )
@@ -1025,13 +2086,36 @@ def _create_pg_frame(parent):
 
 
 def _create_sqlite_frame(parent):
-    frame = tk.LabelFrame(parent, text="SQLite")
+    frame = tk.LabelFrame(parent, text=t("FRAME_SQLITE"))
     frame.grid(row=5, column=0, columnspan=4, sticky="we", padx=10, pady=(5, 0))
     frame.columnconfigure(1, weight=1)
 
     path_var = tk.StringVar()
+    sqlite_filetypes = [
+        (t("FILETYPE_SQLITE"), "*.db *.sqlite *.sqlite3"),
+        (t("FILETYPE_ALL"), "*.*"),
+    ]
 
-    tk.Label(frame, text="Ścieżka do pliku").grid(
+    def _choose_sqlite_path():
+        chosen_path = filedialog.askopenfilename(
+            title=t("TITLE_SELECT_SQLITE"),
+            filetypes=sqlite_filetypes,
+        )
+        if not chosen_path:
+            if not messagebox.askyesno(
+                t("ASK_CREATE_SQLITE"),
+                t("ASK_CREATE_SQLITE_BODY"),
+            ):
+                return
+            chosen_path = filedialog.asksaveasfilename(
+                title=t("TITLE_CREATE_SQLITE"),
+                defaultextension=".sqlite",
+                filetypes=sqlite_filetypes,
+            )
+        if chosen_path:
+            path_var.set(os.path.abspath(chosen_path))
+
+    tk.Label(frame, text=t("LBL_SQLITE_PATH")).grid(
         row=0, column=0, sticky="w", padx=5, pady=(5, 0)
     )
     tk.Entry(frame, textvariable=path_var).grid(
@@ -1039,14 +2123,8 @@ def _create_sqlite_frame(parent):
     )
     tk.Button(
         frame,
-        text="Wybierz",
-        command=lambda: path_var.set(
-            filedialog.asksaveasfilename(
-                title="Wybierz lub utwórz plik SQLite",
-                defaultextension=".db",
-                filetypes=[("SQLite", "*.db"), ("All files", "*.*")],
-            )
-        ),
+        text=t("BTN_SELECT"),
+        command=_choose_sqlite_path,
     ).grid(row=0, column=2, padx=5, pady=(5, 0))
 
     return frame, {"path": path_var}
@@ -1069,6 +2147,12 @@ def _load_connection_details(conn_type, vars_by_type, details):
         vars_by_type["database"].set(details.get("database", ""))
         vars_by_type["user"].set(details.get("user", ""))
         vars_by_type["password"].set(details.get("password", ""))
+    elif conn_type == "mysql":
+        vars_by_type["host"].set(details.get("host", "localhost"))
+        vars_by_type["port"].set(str(details.get("port", "3306")))
+        vars_by_type["database"].set(details.get("database", ""))
+        vars_by_type["user"].set(details.get("user", ""))
+        vars_by_type["password"].set(details.get("password", ""))
     elif conn_type == "sqlite":
         vars_by_type["path"].set(details.get("path", ""))
 
@@ -1084,8 +2168,8 @@ def _build_connection_entry(conn_type, vars_by_type, name):
 
         if not driver or not server or not database:
             messagebox.showerror(
-                "Błąd danych",
-                "Wypełnij: sterownik, serwer i nazwę bazy danych.",
+                t("ERR_DATA_TITLE"),
+                t("ERR_FILL_ODBC"),
             )
             return None
 
@@ -1100,8 +2184,8 @@ def _build_connection_entry(conn_type, vars_by_type, name):
         else:
             if not username or not password:
                 messagebox.showerror(
-                    "Błąd danych",
-                    "Podaj login i hasło lub zaznacz logowanie Windows (Trusted_Connection).",
+                    t("ERR_DATA_TITLE"),
+                    t("ERR_LOGIN_REQUIRED"),
                 )
                 return None
             parts.extend([f"UID={username}", f"PWD={password}"])
@@ -1134,8 +2218,8 @@ def _build_connection_entry(conn_type, vars_by_type, name):
 
         if not host or not database or not user:
             messagebox.showerror(
-                "Błąd danych",
-                "Wypełnij: host, nazwę bazy i użytkownika.",
+                t("ERR_DATA_TITLE"),
+                t("ERR_FILL_PG"),
             )
             return None
 
@@ -1152,10 +2236,37 @@ def _build_connection_entry(conn_type, vars_by_type, name):
         }
         return base_entry
 
+    if conn_type == "mysql":
+        host = vars_by_type["host"].get().strip()
+        port = vars_by_type["port"].get().strip() or "3306"
+        database = vars_by_type["database"].get().strip()
+        user = vars_by_type["user"].get().strip()
+        password = vars_by_type["password"].get()
+
+        if not host or not database or not user:
+            messagebox.showerror(
+                t("ERR_DATA_TITLE"),
+                t("ERR_FILL_MYSQL"),
+            )
+            return None
+
+        base_entry["url"] = (
+            f"mysql+pymysql://{quote_plus(user)}:{quote_plus(password)}@"
+            f"{host}:{port}/{database}"
+        )
+        base_entry["details"] = {
+            "host": host,
+            "port": port,
+            "database": database,
+            "user": user,
+            "password": password,
+        }
+        return base_entry
+
     db_path = vars_by_type["path"].get().strip()
     if not db_path:
         messagebox.showerror(
-            "Błąd danych", "Wskaż ścieżkę do pliku bazy SQLite."
+            t("ERR_DATA_TITLE"), t("ERR_FILL_SQLITE")
         )
         return None
     base_entry["url"] = f"sqlite:///{os.path.abspath(db_path)}"
@@ -1164,18 +2275,23 @@ def _build_connection_entry(conn_type, vars_by_type, name):
 
 
 # Map internal DB types to user-friendly labels (UI-only)
-DB_TYPE_LABELS = {
-    "mssql_odbc": "SQL Server (ODBC)",
-    "postgresql": "PostgreSQL",
-    "sqlite": "SQLite (plik .db)",
-}
+def _db_type_labels():
+    return {
+        "mssql_odbc": t("DB_TYPE_MSSQL"),
+        "postgresql": t("DB_TYPE_PG"),
+        "mysql": t("DB_TYPE_MYSQL"),
+        "sqlite": t("DB_TYPE_SQLITE"),
+    }
 
-DB_TYPE_BY_LABEL = {label: key for key, label in DB_TYPE_LABELS.items()}
+
+def _db_type_by_label():
+    labels = _db_type_labels()
+    return {label: key for key, label in labels.items()}
 
 
 def _build_connection_dialog_ui(root, selected_connection_var):
     dlg = tk.Toplevel(root)
-    dlg.title("Dodaj lub zaktualizuj połączenie")
+    dlg.title(t("TITLE_CONN_DIALOG"))
     dlg.transient(root)
     dlg.grab_set()
 
@@ -1185,13 +2301,12 @@ def _build_connection_dialog_ui(root, selected_connection_var):
     tk.Label(
         dlg,
         text=(
-            "Aby utworzyć nowe połączenie, wpisz nową nazwę.\n"
-            "Aby edytować istniejące połączenie, zostaw nazwę i popraw szczegóły."
+            t("CONN_DIALOG_HINT")
         ),
         justify="left",
     ).grid(row=0, column=0, columnspan=4, sticky="w", padx=10, pady=(10, 0))
 
-    tk.Label(dlg, text="Nazwa połączenia").grid(
+    tk.Label(dlg, text=t("LBL_CONN_NAME")).grid(
         row=1, column=0, sticky="w", padx=10, pady=(10, 0)
     )
     name_var = tk.StringVar(value=selected_connection_var.get())
@@ -1199,24 +2314,29 @@ def _build_connection_dialog_ui(root, selected_connection_var):
         row=1, column=1, columnspan=3, sticky="we", padx=10, pady=(10, 0)
     )
 
-    tk.Label(dlg, text="Typ bazy").grid(row=2, column=0, sticky="w", padx=10, pady=(5, 0))
+    tk.Label(dlg, text=t("LBL_DB_TYPE")).grid(
+        row=2, column=0, sticky="w", padx=10, pady=(5, 0)
+    )
     type_var = tk.StringVar(value="mssql_odbc")
-    type_label_var = tk.StringVar(value=DB_TYPE_LABELS["mssql_odbc"])
+    db_type_labels = _db_type_labels()
+    type_label_var = tk.StringVar(value=db_type_labels["mssql_odbc"])
     type_combo = ttk.Combobox(
         dlg,
         textvariable=type_label_var,
-        values=list(DB_TYPE_LABELS.values()),
+        values=list(db_type_labels.values()),
         state="readonly",
     )
     type_combo.grid(row=2, column=1, sticky="w", padx=10, pady=(5, 0))
 
     mssql_frame, mssql_vars = _create_mssql_frame(dlg)
     pg_frame, pg_vars = _create_pg_frame(dlg)
+    mysql_frame, mysql_vars = _create_mysql_frame(dlg)
     sqlite_frame, sqlite_vars = _create_sqlite_frame(dlg)
 
     type_sections = {
         "mssql_odbc": (mssql_frame, mssql_vars),
         "postgresql": (pg_frame, pg_vars),
+        "mysql": (mysql_frame, mysql_vars),
         "sqlite": (sqlite_frame, sqlite_vars),
     }
 
@@ -1227,7 +2347,7 @@ def _build_connection_dialog_ui(root, selected_connection_var):
         frame.grid()
 
     def update_type_from_label(*_):  # noqa: ANN001
-        type_var.set(DB_TYPE_BY_LABEL.get(type_label_var.get(), "mssql_odbc"))
+        type_var.set(_db_type_by_label().get(type_label_var.get(), "mssql_odbc"))
         show_type_frame()
 
     show_type_frame()
@@ -1252,7 +2372,8 @@ def _load_existing_connection(
     name_var.set(existing.get("name", ""))
     conn_type = existing.get("type", "mssql_odbc")
     type_var.set(conn_type)
-    type_label_var.set(DB_TYPE_LABELS.get(conn_type, DB_TYPE_LABELS["mssql_odbc"]))
+    db_type_labels = _db_type_labels()
+    type_label_var.set(db_type_labels.get(conn_type, db_type_labels["mssql_odbc"]))
     section = type_sections.get(conn_type)
     if section:
         show_type_frame()
@@ -1264,7 +2385,7 @@ def _build_and_test_connection_entry(
 ):
     section = type_sections.get(conn_type)
     if not section:
-        messagebox.showerror("Błąd danych", "Nieprawidłowy typ połączenia.")
+        messagebox.showerror(t("ERR_DATA_TITLE"), t("ERR_INVALID_CONN_TYPE"))
         return None
 
     new_entry = _build_connection_entry(conn_type, section[1], name)
@@ -1285,9 +2406,8 @@ def _build_and_test_connection_entry(
             exc_info=exc,
         )
         messagebox.showerror(
-            "Błąd połączenia",
-            "Nie udało się połączyć przy użyciu podanych danych.\n\n"
-            f"Szczegóły techniczne:\n{exc}",
+            t("ERR_CONNECTION_TITLE"),
+            t("ERR_CONNECTION_BODY", error=exc),
         )
         return None
 
@@ -1317,13 +2437,13 @@ def _save_connection_without_test(
 ):
     name = name_var.get().strip()
     if not name:
-        messagebox.showerror("Błąd danych", "Nazwa połączenia nie może być pusta.")
+        messagebox.showerror(t("ERR_DATA_TITLE"), t("ERR_CONN_NAME_REQUIRED"))
         return False
 
     conn_type = type_var.get()
     section = type_sections.get(conn_type)
     if not section:
-        messagebox.showerror("Błąd danych", "Nieprawidłowy typ połączenia.")
+        messagebox.showerror(t("ERR_DATA_TITLE"), t("ERR_INVALID_CONN_TYPE"))
         return False
 
     new_entry = _build_connection_entry(conn_type, section[1], name)
@@ -1337,8 +2457,8 @@ def _save_connection_without_test(
     refresh_connection_combobox()
 
     messagebox.showinfo(
-        "Zapisano",
-        "Połączenie zapisane bez testu.\nUżyj przycisku „Testuj połączenie”, aby je sprawdzić.",
+        t("INFO_CONN_SAVED_TITLE"),
+        t("INFO_CONN_SAVED_NO_TEST"),
     )
     return True
 
@@ -1357,7 +2477,7 @@ def _save_connection_from_dialog(
 ):
     name = name_var.get().strip()
     if not name:
-        messagebox.showerror("Błąd danych", "Nazwa połączenia nie może być pusta.")
+        messagebox.showerror(t("ERR_DATA_TITLE"), t("ERR_CONN_NAME_REQUIRED"))
         return False
 
     new_entry = _build_and_test_connection_entry(
@@ -1439,15 +2559,20 @@ def open_connection_dialog_gui(
         dlg.destroy()
 
     button_frame = tk.Frame(dlg)
-    button_frame.grid(row=6, column=0, columnspan=4, pady=10)
+    button_frame.grid(row=7, column=0, columnspan=4, pady=10)
 
-    tk.Button(button_frame, text="Zapisz", command=on_save, width=14).pack(
+    tk.Button(button_frame, text=t("BTN_SAVE"), command=on_save, width=14).pack(
         side="left", padx=(0, 5)
     )
     tk.Button(
-        button_frame, text="Zapisz bez testu", command=on_save_without_test, width=18
+        button_frame,
+        text=t("BTN_SAVE_NO_TEST"),
+        command=on_save_without_test,
+        width=18,
     ).pack(side="left", padx=(0, 5))
-    tk.Button(button_frame, text="Anuluj", command=on_cancel, width=12).pack(side="left")
+    tk.Button(
+        button_frame, text=t("BTN_CANCEL"), command=on_cancel, width=12
+    ).pack(side="left")
 
     dlg.bind("<Return>", on_save)
     dlg.bind("<Escape>", on_cancel)
@@ -1477,16 +2602,16 @@ def _validate_date_format(raw):
         example = datetime.now().isoformat(sep=" ", timespec="seconds")
         return (
             True,
-            f"Domyślny format Pandas (przykład: {example})",
+            t("CSV_PROFILE_DATE_DEFAULT", example=example),
         )
     try:
         example = datetime.now().strftime(raw)
     except (ValueError, TypeError):
         return (
             False,
-            "Nieprawidłowy wzorzec daty (użyj składni strftime, np. %Y-%m-%d).",
+            t("CSV_PROFILE_DATE_INVALID"),
         )
-    return True, f"Bieżący czas w tym formacie: {example}"
+    return True, t("CSV_PROFILE_DATE_PREVIEW", example=example)
 
 
 def _load_csv_profile(vars_dict, profile):
@@ -1530,64 +2655,48 @@ def _read_csv_profile(vars_dict):
 def _csv_field_help():
     return {
         "name": (
-            "Nazwa profilu",
-            "Dowolna, unikalna nazwa ułatwiająca wybór profilu, np. "
-            '"UTF-8 (przecinek)" lub "Windows-1250 (średnik)".',
+            t("CSV_HELP_NAME_TITLE"),
+            t("CSV_HELP_NAME_BODY"),
         ),
         "encoding": (
-            "Kodowanie",
-            "Sposób kodowania znaków w pliku CSV. Domyślnie UTF-8; dla "
-            "starszych arkuszy Excel można użyć windows-1250.",
+            t("CSV_HELP_ENCODING_TITLE"),
+            t("CSV_HELP_ENCODING_BODY"),
         ),
         "delimiter": (
-            "Separator pól",
-            "Znak oddzielający kolumny. Najczęściej przecinek (,) lub "
-            "średnik (;), zgodnie z ustawieniami regionalnymi arkusza.",
+            t("CSV_HELP_DELIMITER_TITLE"),
+            t("CSV_HELP_DELIMITER_BODY"),
         ),
         "delimiter_replacement": (
-            "Zastąp separator w wartościach",
-            "Opcjonalnie zamienia znak separatora w wartościach na inny (np. "
-            "średnik na przecinek). Przydatne, gdy system importujący nie "
-            "obsługuje poprawnego eskapowania separatorów w polach. "
-            "Uwaga: zamiana jest globalna dla wszystkich pól tekstowych "
-            "(również JSON/ID w formie tekstu).",
+            t("CSV_HELP_DELIM_REPLACE_TITLE"),
+            t("CSV_HELP_DELIM_REPLACE_BODY"),
         ),
         "decimal": (
-            "Separator dziesiętny",
-            "Znak rozdzielający część całkowitą od ułamkowej. Kropka (.) "
-            "dla układu angielskiego, przecinek (,) dla polskiego.",
+            t("CSV_HELP_DECIMAL_TITLE"),
+            t("CSV_HELP_DECIMAL_BODY"),
         ),
         "lineterminator": (
-            "Znak końca linii",
-            "Domyślnie \n. Dla pełnej zgodności z Windows można użyć "
-            "\r\n. Zmień tylko gdy import wymaga konkretnego formatu.",
+            t("CSV_HELP_LINETERM_TITLE"),
+            t("CSV_HELP_LINETERM_BODY"),
         ),
         "quotechar": (
-            "Znak cudzysłowu",
-            'Najczęściej " . Używany do otaczania pól wymagających '
-            "cytowania (np. zawierających separator).",
+            t("CSV_HELP_QUOTECHAR_TITLE"),
+            t("CSV_HELP_QUOTECHAR_BODY"),
         ),
         "quoting": (
-            "Strategia cudzysłowów",
-            "minimal – tylko gdy potrzebne (zalecane), all – zawsze, "
-            "nonnumeric – dla tekstu, none – bez cytowania (wymaga "
-            "escapechar).",
+            t("CSV_HELP_QUOTING_TITLE"),
+            t("CSV_HELP_QUOTING_BODY"),
         ),
         "escapechar": (
-            "Separator w polu",
-            "Znak ucieczki używany, gdy quoting=none lub pola mogą "
-            "zawierać separator. Zostaw pusty, jeżeli stosujesz "
-            "standardowe cytowanie.",
+            t("CSV_HELP_ESCAPECHAR_TITLE"),
+            t("CSV_HELP_ESCAPECHAR_BODY"),
         ),
         "doublequote": (
-            "Podwajanie cudzysłowów",
-            'Gdy zaznaczone, wewnętrzny " w polu staje się "". '
-            "Zostaw włączone, chyba że system importujący wymaga inaczej.",
+            t("CSV_HELP_DOUBLEQUOTE_TITLE"),
+            t("CSV_HELP_DOUBLEQUOTE_BODY"),
         ),
         "date_format": (
-            "Format daty",
-            "Opcjonalny wzorzec strftime, np. %Y-%m-%d lub %d.%m.%Y. "
-            "Pozostaw puste, aby użyć domyślnego formatowania Pandas.",
+            t("CSV_HELP_DATE_FORMAT_TITLE"),
+            t("CSV_HELP_DATE_FORMAT_BODY"),
         ),
     }
 
@@ -1617,12 +2726,12 @@ def _build_csv_profile_list_ui(dlg):
 
 def _build_csv_profile_form_ui(form_frame, form_vars, field_help):
     def show_field_help(key):
-        title, message = field_help.get(key, ("Informacja", ""))
+        title, message = field_help.get(key, (t("CSV_PROFILE_INFO_SAVED_TITLE"), ""))
         messagebox.showinfo(title, message)
 
     def add_info_button(row, key):
         tk.Button(
-            form_frame, text="i", width=2, command=lambda k=key: show_field_help(k)
+            form_frame, text=t("INFO_ICON"), width=2, command=lambda k=key: show_field_help(k)
         ).grid(row=row, column=2, sticky="w", padx=(5, 0))
 
     date_preview_var = form_vars["date_preview"]
@@ -1634,7 +2743,7 @@ def _build_csv_profile_form_ui(form_frame, form_vars, field_help):
 
     widgets = []
 
-    tk.Label(form_frame, text="Nazwa profilu:").grid(row=0, column=0, sticky="w")
+    tk.Label(form_frame, text=t("CSV_PROFILE_NAME")).grid(row=0, column=0, sticky="w")
     name_entry = tk.Entry(form_frame, textvariable=form_vars["name"])
     name_entry.grid(
         row=0, column=1, sticky="we"
@@ -1642,7 +2751,7 @@ def _build_csv_profile_form_ui(form_frame, form_vars, field_help):
     widgets.append((name_entry, "normal"))
     add_info_button(0, "name")
 
-    tk.Label(form_frame, text="Kodowanie:").grid(row=1, column=0, sticky="w")
+    tk.Label(form_frame, text=t("CSV_PROFILE_ENCODING")).grid(row=1, column=0, sticky="w")
     encoding_entry = tk.Entry(form_frame, textvariable=form_vars["encoding"])
     encoding_entry.grid(
         row=1, column=1, sticky="we"
@@ -1650,7 +2759,7 @@ def _build_csv_profile_form_ui(form_frame, form_vars, field_help):
     widgets.append((encoding_entry, "normal"))
     add_info_button(1, "encoding")
 
-    tk.Label(form_frame, text="Separator pól:").grid(row=2, column=0, sticky="w")
+    tk.Label(form_frame, text=t("CSV_PROFILE_DELIMITER")).grid(row=2, column=0, sticky="w")
     delimiter_entry = tk.Entry(form_frame, textvariable=form_vars["delimiter"], width=5)
     delimiter_entry.grid(
         row=2, column=1, sticky="w"
@@ -1658,7 +2767,7 @@ def _build_csv_profile_form_ui(form_frame, form_vars, field_help):
     widgets.append((delimiter_entry, "normal"))
     add_info_button(2, "delimiter")
 
-    tk.Label(form_frame, text="Zastąp separator w wartościach:").grid(
+    tk.Label(form_frame, text=t("CSV_PROFILE_DELIM_REPLACE")).grid(
         row=3, column=0, sticky="w"
     )
     delimiter_replacement_entry = tk.Entry(
@@ -1670,7 +2779,9 @@ def _build_csv_profile_form_ui(form_frame, form_vars, field_help):
     widgets.append((delimiter_replacement_entry, "normal"))
     add_info_button(3, "delimiter_replacement")
 
-    tk.Label(form_frame, text="Separator dziesiętny:").grid(row=4, column=0, sticky="w")
+    tk.Label(form_frame, text=t("CSV_PROFILE_DECIMAL")).grid(
+        row=4, column=0, sticky="w"
+    )
     decimal_entry = tk.Entry(form_frame, textvariable=form_vars["decimal"], width=5)
     decimal_entry.grid(
         row=4, column=1, sticky="w"
@@ -1678,7 +2789,9 @@ def _build_csv_profile_form_ui(form_frame, form_vars, field_help):
     widgets.append((decimal_entry, "normal"))
     add_info_button(4, "decimal")
 
-    tk.Label(form_frame, text="Znak końca linii:").grid(row=5, column=0, sticky="w")
+    tk.Label(form_frame, text=t("CSV_PROFILE_LINE_END")).grid(
+        row=5, column=0, sticky="w"
+    )
     lineterminator_entry = tk.Entry(
         form_frame, textvariable=form_vars["lineterminator"], width=10
     )
@@ -1688,7 +2801,9 @@ def _build_csv_profile_form_ui(form_frame, form_vars, field_help):
     widgets.append((lineterminator_entry, "normal"))
     add_info_button(5, "lineterminator")
 
-    tk.Label(form_frame, text="Znak cudzysłowu:").grid(row=6, column=0, sticky="w")
+    tk.Label(form_frame, text=t("CSV_PROFILE_QUOTECHAR")).grid(
+        row=6, column=0, sticky="w"
+    )
     quotechar_entry = tk.Entry(form_frame, textvariable=form_vars["quotechar"], width=5)
     quotechar_entry.grid(
         row=6, column=1, sticky="w"
@@ -1696,7 +2811,7 @@ def _build_csv_profile_form_ui(form_frame, form_vars, field_help):
     widgets.append((quotechar_entry, "normal"))
     add_info_button(6, "quotechar")
 
-    tk.Label(form_frame, text="Cudzysłów:").grid(row=7, column=0, sticky="w")
+    tk.Label(form_frame, text=t("CSV_PROFILE_QUOTING")).grid(row=7, column=0, sticky="w")
     quoting_combo = ttk.Combobox(
         form_frame,
         textvariable=form_vars["quoting"],
@@ -1710,7 +2825,7 @@ def _build_csv_profile_form_ui(form_frame, form_vars, field_help):
 
     tk.Label(
         form_frame,
-        text="Separator w polu:",
+        text=t("CSV_PROFILE_ESCAPECHAR"),
     ).grid(row=8, column=0, sticky="w")
     escapechar_entry = tk.Entry(form_frame, textvariable=form_vars["escapechar"], width=5)
     escapechar_entry.grid(
@@ -1720,20 +2835,22 @@ def _build_csv_profile_form_ui(form_frame, form_vars, field_help):
     add_info_button(8, "escapechar")
     tk.Label(
         form_frame,
-        text="(znak ucieczki; puste = cytowanie)",
+        text=t("CSV_PROFILE_ESCAPE_HINT"),
         fg="gray",
     ).grid(row=8, column=3, sticky="w", padx=(5, 0))
 
     doublequote_check = tk.Checkbutton(
         form_frame,
-        text="Podwajaj cudzysłowy w polach",
+        text=t("CSV_PROFILE_DOUBLEQUOTE"),
         variable=form_vars["doublequote"],
     )
     doublequote_check.grid(row=9, column=0, columnspan=2, sticky="w")
     widgets.append((doublequote_check, "normal"))
     add_info_button(9, "doublequote")
 
-    tk.Label(form_frame, text="Format daty:").grid(row=10, column=0, sticky="w")
+    tk.Label(form_frame, text=t("CSV_PROFILE_DATE_FORMAT")).grid(
+        row=10, column=0, sticky="w"
+    )
     date_format_entry = tk.Entry(form_frame, textvariable=form_vars["date_format"])
     date_format_entry.grid(
         row=10, column=1, columnspan=1, sticky="we"
@@ -1753,7 +2870,7 @@ def _build_csv_profile_form_ui(form_frame, form_vars, field_help):
 
 def _create_csv_profiles_dialog(root, csv_profile_state):
     dlg = tk.Toplevel(root)
-    dlg.title("Profile CSV")
+    dlg.title(t("CSV_PROFILE_DIALOG_TITLE"))
     dlg.transient(root)
     dlg.grab_set()
     dlg.resizable(True, True)
@@ -1762,7 +2879,7 @@ def _create_csv_profiles_dialog(root, csv_profile_state):
     _sort_csv_profiles_in_place(working_profiles)
     default_profile_var = tk.StringVar(value=csv_profile_state["config"].get("default_profile"))
     display_default_var = tk.StringVar(
-        value=f"Domyślny profil: {default_profile_var.get() or ''}"
+        value=t("CSV_DEFAULT_PROFILE_LABEL", name=default_profile_var.get() or "")
     )
 
     dlg.columnconfigure(1, weight=1)
@@ -1780,8 +2897,16 @@ def _refresh_csv_profile_list(
 ):
     display = []
     for prof in working_profiles:
-        suffix = " (domyślny)" if prof["name"] == default_profile_var.get() else ""
-        builtin_tag = " [wbudowany]" if is_builtin_csv_profile(prof["name"]) else ""
+        suffix = (
+            f" {t('CSV_PROFILE_DEFAULT_SUFFIX')}"
+            if prof["name"] == default_profile_var.get()
+            else ""
+        )
+        builtin_tag = (
+            f" {t('CSV_PROFILE_BUILTIN_SUFFIX')}"
+            if is_builtin_csv_profile(prof["name"])
+            else ""
+        )
         display.append(f"{prof['name']}{builtin_tag}{suffix}")
     list_var.set(display)
 
@@ -1793,7 +2918,9 @@ def _refresh_csv_profile_list(
         if font_to_use is not None:
             listbox.itemconfig(idx, font=font_to_use)
 
-    display_default_var.set(f"Domyślny profil: {default_profile_var.get() or ''}")
+    display_default_var.set(
+        t("CSV_DEFAULT_PROFILE_LABEL", name=default_profile_var.get() or "")
+    )
 
 
 def _ensure_default_profile(default_profile_var, working_profiles, preferred_name=None):
@@ -1810,11 +2937,11 @@ def _read_profile_from_form_or_warn(form_vars):
     profile = _read_csv_profile(form_vars)
     if profile is None:
         messagebox.showwarning(
-            "Uwaga",
-            "Podany format daty jest nieprawidłowy. Skorzystaj ze składni strftime.",
+            t("WARN_TITLE"),
+            t("CSV_PROFILE_INVALID_DATE"),
         )
     elif not profile.get("name"):
-        messagebox.showwarning("Uwaga", "Nazwa profilu nie może być pusta.")
+        messagebox.showwarning(t("WARN_TITLE"), t("CSV_PROFILE_WARNING_EMPTY"))
         profile = None
     return profile
 
@@ -1846,7 +2973,7 @@ def open_csv_profiles_manager_gui(
 
     listbox, list_var = _build_csv_profile_list_ui(dlg)
 
-    form_frame = tk.LabelFrame(dlg, text="Szczegóły profilu", padx=10, pady=10)
+    form_frame = tk.LabelFrame(dlg, text=t("CSV_PROFILE_TITLE"), padx=10, pady=10)
     form_frame.grid(row=1, column=2, sticky="nsew", padx=(5, 10), pady=10)
     form_frame.columnconfigure(1, weight=1)
     form_frame.columnconfigure(3, weight=1)
@@ -1890,9 +3017,7 @@ def open_csv_profiles_manager_gui(
         if idx is not None and 0 <= idx < len(working_profiles):
             is_builtin = is_builtin_csv_profile(working_profiles[idx].get("name", ""))
         builtin_notice_var.set(
-            "Profil wbudowany: nie można zapisać zmian ani usuwać. Użyj Zapisz jako nowy, aby stworzyć własny wariant."
-            if is_builtin
-            else ""
+            t("CSV_PROFILE_BUILTIN_NOTICE") if is_builtin else ""
         )
         set_editable_state(is_builtin)
         update_button.configure(state=tk.DISABLED if is_builtin else tk.NORMAL)
@@ -1939,12 +3064,12 @@ def open_csv_profiles_manager_gui(
             return
         if is_builtin_csv_profile(prof["name"]):
             messagebox.showerror(
-                "Błąd",
-                "Ta nazwa jest zarezerwowana dla wbudowanego profilu. Wybierz inną nazwę.",
+                t("ERR_TITLE"),
+                t("CSV_PROFILE_NAME_RESERVED"),
             )
             return
         if any(p["name"] == prof["name"] for p in working_profiles):
-            messagebox.showwarning("Uwaga", "Profil o podanej nazwie już istnieje.")
+            messagebox.showwarning(t("WARN_TITLE"), t("CSV_PROFILE_WARNING_EXISTS"))
             return
         working_profiles.append(prof)
         unsaved_changes = True
@@ -1957,7 +3082,10 @@ def open_csv_profiles_manager_gui(
         nonlocal unsaved_changes
         sel = listbox.curselection()
         if not sel:
-            messagebox.showwarning("Brak profilu", "Zaznacz profil na liście.")
+            messagebox.showwarning(
+                t("CSV_PROFILE_NO_SELECTION_TITLE"),
+                t("CSV_PROFILE_WARNING_SELECT"),
+            )
             return
         prof = _read_profile_from_form_or_warn(form_vars)
         if not prof:
@@ -1965,13 +3093,13 @@ def open_csv_profiles_manager_gui(
         selected_profile = working_profiles[sel[0]]
         if is_builtin_csv_profile(prof["name"]):
             messagebox.showerror(
-                "Błąd",
-                "Nie możesz nadpisać wbudowanego profilu. Zmień nazwę i zapisz jako nowy profil.",
+                t("ERR_TITLE"),
+                t("CSV_PROFILE_BUILTIN_OVERWRITE"),
             )
             return
         for idx, existing in enumerate(working_profiles):
             if idx != sel[0] and existing["name"] == prof["name"]:
-                messagebox.showwarning("Uwaga", "Profil o podanej nazwie już istnieje.")
+                messagebox.showwarning(t("WARN_TITLE"), t("CSV_PROFILE_WARNING_EXISTS"))
                 return
         if is_builtin_csv_profile(selected_profile.get("name", "")):
             working_profiles.append(prof)
@@ -1998,11 +3126,17 @@ def open_csv_profiles_manager_gui(
         nonlocal unsaved_changes
         sel = listbox.curselection()
         if not sel:
-            messagebox.showwarning("Brak profilu", "Zaznacz profil na liście.")
+            messagebox.showwarning(
+                t("CSV_PROFILE_NO_SELECTION_TITLE"),
+                t("CSV_PROFILE_WARNING_SELECT"),
+            )
             return
         idx = sel[0]
         if is_builtin_csv_profile(working_profiles[idx].get("name", "")):
-            messagebox.showinfo("Informacja", "Wbudowanych profili nie można usuwać.")
+            messagebox.showinfo(
+                t("CSV_PROFILE_INFO_SAVED_TITLE"),
+                t("CSV_PROFILE_INFO_BUILTIN"),
+            )
             return
         working_profiles.pop(idx)
         if not working_profiles:
@@ -2017,7 +3151,10 @@ def open_csv_profiles_manager_gui(
         nonlocal unsaved_changes
         sel = listbox.curselection()
         if not sel:
-            messagebox.showwarning("Brak profilu", "Zaznacz profil na liście.")
+            messagebox.showwarning(
+                t("CSV_PROFILE_NO_SELECTION_TITLE"),
+                t("CSV_PROFILE_WARNING_SELECT"),
+            )
             return
         selected_name = working_profiles[sel[0]]["name"]
         if default_profile_var.get() != selected_name:
@@ -2028,14 +3165,14 @@ def open_csv_profiles_manager_gui(
     def save_and_close():
         nonlocal unsaved_changes
         if not working_profiles:
-            messagebox.showwarning("Uwaga", "Musi istnieć co najmniej jeden profil CSV.")
+            messagebox.showwarning(t("WARN_TITLE"), t("CSV_PROFILE_WARNING_MIN_ONE"))
             return
         _save_csv_profile_config(
             csv_profile_state, default_profile_var, working_profiles, refresh_csv_profile_controls
         )
         messagebox.showinfo(
-            "Zapisano",
-            "Profile CSV zapisane. Będą używane przy kolejnych eksportach.",
+            t("CSV_PROFILE_INFO_SAVED_TITLE"),
+            t("CSV_PROFILE_INFO_SAVED_BODY"),
         )
         unsaved_changes = False
         dlg.destroy()
@@ -2046,8 +3183,8 @@ def open_csv_profiles_manager_gui(
             return
 
         resp = messagebox.askyesnocancel(
-            "Niezapisane zmiany",
-            "Masz niezapisane zmiany profili CSV. Zapisać przed zamknięciem?",
+            t("CSV_PROFILE_UNSAVED_TITLE"),
+            t("CSV_PROFILE_UNSAVED_BODY"),
         )
         if resp is True:
             save_and_close()
@@ -2057,19 +3194,23 @@ def open_csv_profiles_manager_gui(
     button_frame = tk.Frame(dlg)
     button_frame.grid(row=2, column=0, columnspan=3, pady=(0, 10))
 
-    tk.Button(button_frame, text="Zapisz jako nowy", command=add_profile, width=14).pack(
+    tk.Button(button_frame, text=t("BTN_SAVE_AS_NEW"), command=add_profile, width=14).pack(
         side="left", padx=(0, 5)
     )
     update_button = tk.Button(
-        button_frame, text="Zaktualizuj profil", command=update_profile, width=14
+        button_frame, text=t("BTN_UPDATE_PROFILE"), command=update_profile, width=14
     )
     update_button.pack(side="left", padx=(0, 5))
-    delete_button = tk.Button(button_frame, text="Usuń", command=delete_profile, width=10)
+    delete_button = tk.Button(button_frame, text=t("BTN_DELETE"), command=delete_profile, width=10)
     delete_button.pack(side="left", padx=(0, 5))
-    tk.Button(button_frame, text="Ustaw jako domyślny", command=set_default_profile, width=18).pack(
+    tk.Button(
+        button_frame, text=t("BTN_SET_DEFAULT"), command=set_default_profile, width=18
+    ).pack(
         side="left", padx=(0, 5)
     )
-    tk.Button(button_frame, text="Zamknij i zapisz", command=save_and_close, width=14).pack(side="left")
+    tk.Button(
+        button_frame, text=t("BTN_CLOSE_SAVE"), command=save_and_close, width=14
+    ).pack(side="left")
 
     refresh_list()
     if working_profiles:
@@ -2107,12 +3248,16 @@ def run_gui(connection_store, output_directory):
     query_paths_state = {"paths": load_query_paths()}
     csv_profile_state = {"config": load_csv_profiles(), "combobox": None}
     connections_state = {
-        "store": connection_store or {"connections": [], "last_selected": None},
+        "store": connection_store or {
+            "connections": [],
+            "last_selected": None,
+            "ui_lang": None,
+        },
         "combobox": None,
     }
 
     root = tk.Tk()
-    root.title("KKr SQL to XLSX/CSV")
+    root.title(t("APP_TITLE_FULL"))
 
     selected_sql_path_full = tk.StringVar(value="")
     sql_label_var = tk.StringVar(value="")
@@ -2123,11 +3268,15 @@ def run_gui(connection_store, output_directory):
     last_output_path = {"path": None}
     engine_holder = {"engine": None}
     connection_status_var = tk.StringVar(value="")
+    connection_status_state = {"key": None, "params": {}}
     secure_edit_state = {"button": None}
     start_button_holder = {"widget": None}
     error_display = {"widget": None}
     selected_connection_var = tk.StringVar(
         value=connections_state["store"].get("last_selected") or ""
+    )
+    lang_var = tk.StringVar(
+        value=(connections_state["store"].get("ui_lang") or _CURRENT_LANG).upper()
     )
 
     # Template-related state (GUI only; console mode has no template support)
@@ -2143,13 +3292,23 @@ def run_gui(connection_store, output_directory):
         "start_cell_entry": None,
         "include_header_check": None,
     }
+    i18n_widgets = {}
 
     def _set_sql_path(path):
-        selected_sql_path_full.set(path)
+        resolved = resolve_path(path)
+        selected_sql_path_full.set(resolved)
         sql_label_var.set(shorten_path(path))
 
-    def set_connection_status(message, connected):
-        connection_status_var.set(message)
+    def set_connection_status(message=None, connected=False, key=None, **params):
+        if key:
+            connection_status_state["key"] = key
+            connection_status_state["params"] = params
+            display_params = dict(params)
+            if key == "STATUS_CONNECTED" and "type" in display_params:
+                type_key = (display_params.get("type") or "").strip()
+                display_params["type"] = _db_type_labels().get(type_key, type_key)
+            message = t(key, **display_params)
+        connection_status_var.set(message or "")
         btn = start_button_holder.get("widget")
         if btn is not None:
             btn_state = tk.NORMAL if connected else tk.DISABLED
@@ -2189,7 +3348,7 @@ def run_gui(connection_store, output_directory):
     def on_connection_change(*_):  # noqa: ANN001
         name = selected_connection_var.get()
         if not name:
-            set_connection_status("Brak połączenia. Utwórz nowe połączenie.", False)
+            set_connection_status(connected=False, key="STATUS_NO_CONNECTION")
             apply_engine(None)
             return
         set_selected_connection(name)
@@ -2197,7 +3356,7 @@ def run_gui(connection_store, output_directory):
 
     def create_engine_from_entry(entry):
         if not entry:
-            raise ValueError("Brak konfiguracji połączenia")
+            raise ValueError(t("ERR_NO_SECURE_CONFIG"))
         engine_kwargs = {}
         if entry.get("type") == "mssql_odbc":
             engine_kwargs["isolation_level"] = "AUTOCOMMIT"
@@ -2206,7 +3365,7 @@ def run_gui(connection_store, output_directory):
     def apply_selected_connection(show_success=False):
         conn = get_connection_by_name(selected_connection_var.get())
         if not conn:
-            set_connection_status("Brak połączenia. Utwórz nowe połączenie.", False)
+            set_connection_status(connected=False, key="STATUS_NO_CONNECTION")
             apply_engine(None)
             return
         try:
@@ -2215,7 +3374,7 @@ def run_gui(connection_store, output_directory):
                 connection.execute(text("SELECT 1"))
             apply_engine(engine)
         except Exception as exc:  # noqa: BLE001
-            set_connection_status("Błąd połączenia. Utwórz nowe połączenie.", False)
+            set_connection_status(connected=False, key="STATUS_CONNECTION_ERROR")
             if handle_db_driver_error(exc, conn.get("type"), conn.get("name")):
                 return
             LOGGER.exception(
@@ -2225,21 +3384,21 @@ def run_gui(connection_store, output_directory):
                 exc_info=exc,
             )
             messagebox.showerror(
-                "Błąd połączenia",
-                (
-                    "Nie udało się nawiązać połączenia.\n\n"
-                    f"Szczegóły techniczne:\n{exc}"
-                ),
+                t("ERR_CONNECTION_TITLE"),
+                t("ERR_CONNECTION_BODY", error=exc),
             )
             return
 
         set_connection_status(
-            f"Połączono z {conn.get('name', '')} ({conn.get('type', '')}).",
-            True,
+            connected=True,
+            key="STATUS_CONNECTED",
+            name=conn.get("name", ""),
+            type=conn.get("type", ""),
         )
         if show_success:
             messagebox.showinfo(
-                "Połączenie działa", f"Połączenie {conn.get('name', '')} powiodło się."
+                t("INFO_CONNECTION_OK_TITLE"),
+                t("INFO_CONNECTION_OK_BODY", name=conn.get("name", "")),
             )
 
     def update_error_display(message):
@@ -2255,7 +3414,7 @@ def run_gui(connection_store, output_directory):
 
     def show_error_popup(ui_msg):
         popup = tk.Toplevel(root)
-        popup.title("Błąd zapytania")
+        popup.title(t("ERR_QUERY_TITLE"))
         popup.transient(root)
         popup.attributes("-topmost", True)
         popup.grab_set()
@@ -2279,8 +3438,8 @@ def run_gui(connection_store, output_directory):
             popup.clipboard_clear()
             popup.clipboard_append(ui_msg)
 
-        copy_btn = tk.Button(button_frame, text="Kopiuj", command=copy_error)
-        close_btn = tk.Button(button_frame, text="Zamknij", command=popup.destroy)
+        copy_btn = tk.Button(button_frame, text=t("BTN_COPY"), command=copy_error)
+        close_btn = tk.Button(button_frame, text=t("BTN_CLOSE"), command=popup.destroy)
 
         y_scroll.pack(side="right", fill="y")
         x_scroll.pack(side="bottom", fill="x")
@@ -2303,8 +3462,8 @@ def run_gui(connection_store, output_directory):
     def test_connection_only():
         if not connections_state["store"].get("connections"):
             messagebox.showerror(
-                "Brak połączenia",
-                "Brak zapisanych połączeń. Utwórz i zapisz nowe połączenie.",
+                t("ERR_NO_CONNECTION_TITLE"),
+                t("ERR_NO_CONNECTION_BODY"),
             )
             return
         apply_selected_connection(show_success=True)
@@ -2314,13 +3473,14 @@ def run_gui(connection_store, output_directory):
         name = selected_connection_var.get()
         if not connections or not name:
             messagebox.showerror(
-                "Brak połączenia",
-                "Brak połączenia do usunięcia.",
+                t("ERR_NO_CONNECTION_TITLE"),
+                t("ERR_NO_CONNECTION_DELETE"),
             )
             return
 
         if not messagebox.askyesno(
-            "Usuń połączenie", f"Czy na pewno chcesz usunąć połączenie {name}?"
+            t("ASK_DELETE_CONNECTION_TITLE"),
+            t("ASK_DELETE_CONNECTION_BODY", name=name),
         ):
             return
 
@@ -2340,11 +3500,11 @@ def run_gui(connection_store, output_directory):
             persist_connections()
             refresh_connection_combobox()
             apply_engine(None)
-            set_connection_status("Brak połączenia. Utwórz nowe połączenie.", False)
+            set_connection_status(connected=False, key="STATUS_NO_CONNECTION")
 
     def open_secure_editor():
         dlg = tk.Toplevel(root)
-        dlg.title("Edytuj secure.txt")
+        dlg.title(t("TITLE_EDIT_SECURE"))
         dlg.transient(root)
         dlg.grab_set()
 
@@ -2363,12 +3523,13 @@ def run_gui(connection_store, output_directory):
                 dlg.destroy()
                 apply_selected_connection(show_success=False)
                 messagebox.showinfo(
-                    "Zapisano", "Zaktualizowano zawartość pliku secure.txt."
+                    t("INFO_SECURE_SAVED_TITLE"),
+                    t("INFO_SECURE_SAVED_BODY"),
                 )
             except Exception as exc:  # noqa: BLE001
                 messagebox.showerror(
-                    "Błąd zapisu",
-                    f"Nie udało się zapisać pliku secure.txt.\n\nSzczegóły techniczne:\n{exc}",
+                    t("ERR_SECURE_SAVE_TITLE"),
+                    t("ERR_SECURE_SAVE_BODY", error=exc),
                 )
 
         def cancel(*_):
@@ -2377,10 +3538,10 @@ def run_gui(connection_store, output_directory):
         btn_frame = tk.Frame(dlg)
         btn_frame.pack(pady=(0, 10))
 
-        tk.Button(btn_frame, text="Zapisz", width=12, command=save_and_close).pack(
+        tk.Button(btn_frame, text=t("BTN_SAVE"), width=12, command=save_and_close).pack(
             side="left", padx=(0, 5)
         )
-        tk.Button(btn_frame, text="Anuluj", width=12, command=cancel).pack(
+        tk.Button(btn_frame, text=t("BTN_CANCEL"), width=12, command=cancel).pack(
             side="left"
         )
 
@@ -2391,8 +3552,8 @@ def run_gui(connection_store, output_directory):
 
     def choose_sql_file():
         path = filedialog.askopenfilename(
-            title="Wybierz plik SQL",
-            filetypes=[("SQL files", "*.sql"), ("All files", "*.*")],
+            title=t("TITLE_SELECT_SQL"),
+            filetypes=[(t("FILETYPE_SQL"), "*.sql"), (t("FILETYPE_ALL"), "*.*")],
         )
         if path:
             _set_sql_path(path)
@@ -2451,8 +3612,8 @@ def run_gui(connection_store, output_directory):
 
     def choose_template_file():
         path = filedialog.askopenfilename(
-            title="Wybierz plik template XLSX",
-            filetypes=[("Pliki Excel", "*.xlsx"), ("All files", "*.*")],
+            title=t("TITLE_SELECT_TEMPLATE"),
+            filetypes=[(t("FILETYPE_EXCEL"), "*.xlsx"), (t("FILETYPE_ALL"), "*.*")],
         )
         if not path:
             return
@@ -2468,9 +3629,8 @@ def run_gui(connection_store, output_directory):
             sheetnames = wb.sheetnames
         except Exception as e:  # noqa: BLE001
             messagebox.showerror(
-                "Błąd template",
-                "Nie można odczytać arkuszy z pliku template.\n\n"
-                f"Szczegóły techniczne:\n{e}",
+                t("ERR_TEMPLATE_TITLE"),
+                t("ERR_TEMPLATE_SHEETS", error=e),
             )
             sheetnames = []
         finally:
@@ -2508,19 +3668,29 @@ def run_gui(connection_store, output_directory):
 
         default_name = config.get("default_profile")
         if default_name:
-            default_csv_label_var.set(f"Domyślny profil CSV: {default_name}")
+            default_csv_label_var.set(
+                t("CSV_DEFAULT_PROFILE_LABEL", name=default_name)
+            )
         else:
             default_csv_label_var.set("")
 
     def open_queries_manager():
         dlg = tk.Toplevel(root)
-        dlg.title("Edycja queries.txt")
+        dlg.title(t("TITLE_EDIT_QUERIES"))
         dlg.transient(root)
         dlg.grab_set()
         dlg.resizable(True, True)
 
-        paths = load_query_paths()
-        query_paths_state["paths"] = list(paths)
+        # Uwaga: nie modyfikuj query_paths_state przed udanym zapisem (bez efektów ubocznych).
+        raw_paths = load_query_paths()
+        paths = []
+        seen_keys = set()
+        for raw in raw_paths:
+            key = query_path_key(raw)
+            if key in seen_keys:
+                continue
+            paths.append(raw)
+            seen_keys.add(key)
 
         dlg.columnconfigure(0, weight=1)
         dlg.rowconfigure(0, weight=1)
@@ -2555,24 +3725,64 @@ def run_gui(connection_store, output_directory):
             delete_btn.config(state=delete_state)
 
         def add_from_dialog():
-            path = filedialog.askopenfilename(
-                title="Dodaj plik SQL",
-                filetypes=[("SQL files", "*.sql"), ("All files", "*.*")],
+            selected = filedialog.askopenfilenames(
+                title=t("TITLE_ADD_SQL_FILES"),
+                filetypes=[(t("FILETYPE_SQL"), "*.sql"), (t("FILETYPE_ALL"), "*.*")],
             )
-            if not path:
+            if not selected:
+                return
+            existing_keys = {query_path_key(p) for p in paths}
+
+            added_indices = []
+            skipped_non_sql = []
+            skipped_duplicates = 0
+
+            for p in selected:
+                if not is_sql_path(p):
+                    skipped_non_sql.append(p)
+                    continue
+
+                p_key = query_path_key(p)
+                if p_key in existing_keys:
+                    skipped_duplicates += 1
+                    continue
+
+                paths.append(to_storage_path(p))
+                existing_keys.add(p_key)
+                added_indices.append(len(paths) - 1)
+
+            if skipped_non_sql:
+                messagebox.showwarning(
+                    t("WARN_SKIPPED_FILES_TITLE"),
+                    t(
+                        "WARN_SKIPPED_FILES_BODY",
+                        files="\n".join(skipped_non_sql[:20]),
+                        more=(
+                            t("WARN_SKIPPED_FILES_MORE", count=len(skipped_non_sql) - 20)
+                            if len(skipped_non_sql) > 20
+                            else ""
+                        ),
+                    ),
+                )
+
+            if not added_indices:
+                if skipped_duplicates and not skipped_non_sql:
+                    messagebox.showinfo(
+                        t("CSV_PROFILE_INFO_SAVED_TITLE"),
+                        t("INFO_ALREADY_LISTED"),
+                    )
                 return
 
-            if path in paths:
-                messagebox.showinfo("Informacja", "Ta ścieżka jest już na liście.")
-                return
-
-            paths.append(path)
             refresh_list()
-            new_idx = len(paths) - 1
+
             listbox.selection_clear(0, tk.END)
-            listbox.selection_set(new_idx)
-            listbox.activate(new_idx)
-            listbox.see(new_idx)
+            for idx in added_indices:
+                listbox.selection_set(idx)
+
+            last_idx = added_indices[-1]
+            listbox.activate(last_idx)
+            listbox.see(last_idx)
+            update_delete_state()
 
         def edit_selected(event=None):  # noqa: ANN001
             sel = listbox.curselection()
@@ -2582,8 +3792,8 @@ def run_gui(connection_store, output_directory):
             idx = sel[0]
             current_path = paths[idx]
             new_path = simpledialog.askstring(
-                "Edytuj ścieżkę zapytania",
-                "Edytuj ścieżkę zapytania:",
+                t("TITLE_EDIT_QUERY_PATH"),
+                t("PROMPT_EDIT_QUERY_PATH"),
                 initialvalue=current_path,
                 parent=dlg,
             )
@@ -2593,22 +3803,51 @@ def run_gui(connection_store, output_directory):
             new_path = new_path.strip()
             if not new_path:
                 return
-
-            if new_path in paths and new_path != current_path:
-                messagebox.showinfo("Informacja", "Ta ścieżka jest już na liście.")
+            if not is_sql_path(new_path):
+                messagebox.showwarning(
+                    t("WARN_TITLE"),
+                    t("WARN_INVALID_SQL_FILE"),
+                )
                 return
 
-            paths[idx] = new_path
+            new_key = query_path_key(new_path)
+
+            # Duplikaty sprawdzamy po kluczu pliku (z pominięciem edytowanego indeksu)
+            for j, existing in enumerate(paths):
+                if j == idx:
+                    continue
+                if query_path_key(existing) == new_key:
+                    messagebox.showinfo(
+                        t("CSV_PROFILE_INFO_SAVED_TITLE"),
+                        t("INFO_ALREADY_LISTED"),
+                    )
+                    return
+
+            # Opcjonalna polerka: ostrzeż, ale nie blokuj (sieciówki / dyski zewnętrzne)
+            resolved_new_path = resolve_path(new_path)
+            if not os.path.isfile(resolved_new_path):
+                messagebox.showwarning(
+                    t("WARN_FILE_MISSING_TITLE"),
+                    t("WARN_FILE_MISSING_BODY", path=resolved_new_path),
+                )
+
+            # Zapis „ładnej” wersji ścieżki (bez normcase)
+            paths[idx] = to_storage_path(new_path)
+
             refresh_list()
             listbox.selection_clear(0, tk.END)
             listbox.selection_set(idx)
             listbox.activate(idx)
             listbox.see(idx)
+            update_delete_state()
 
         def delete_selected(event=None):  # noqa: ANN001
             sel = listbox.curselection()
             if not sel:
-                messagebox.showinfo("Informacja", "Zaznacz wpis do usunięcia.")
+                messagebox.showinfo(
+                    t("CSV_PROFILE_INFO_SAVED_TITLE"),
+                    t("INFO_SELECT_ENTRY_DELETE"),
+                )
                 return "break" if event is not None else None
 
             for idx in reversed(sel):
@@ -2621,6 +3860,7 @@ def run_gui(connection_store, output_directory):
                 listbox.selection_set(next_idx)
                 listbox.activate(next_idx)
                 listbox.see(next_idx)
+                update_delete_state()
 
             return "break" if event is not None else None
 
@@ -2629,8 +3869,8 @@ def run_gui(connection_store, output_directory):
                 save_query_paths(paths)
             except OSError as exc:
                 messagebox.showerror(
-                    "Błąd zapisu",
-                    "Nie można zapisać queries.txt.\n\n" f"Szczegóły techniczne:\n{exc}",
+                    t("ERR_QUERIES_SAVE_TITLE"),
+                    t("ERR_QUERIES_SAVE_BODY", error=exc),
                 )
                 return
 
@@ -2643,15 +3883,22 @@ def run_gui(connection_store, output_directory):
         button_frame = tk.Frame(dlg)
         button_frame.grid(row=1, column=0, pady=(0, 10), padx=10, sticky="e")
 
-        add_btn = tk.Button(button_frame, text="Dodaj plik...", command=add_from_dialog, width=15)
+        add_btn = tk.Button(
+            button_frame,
+            text=t("BTN_ADD_FILES"),
+            command=add_from_dialog,
+            width=15,
+        )
         delete_btn = tk.Button(
             button_frame,
-            text="Usuń zaznaczone",
+            text=t("BTN_REMOVE_SELECTED"),
             command=delete_selected,
             width=18,
         )
-        save_btn = tk.Button(button_frame, text="Zapisz", command=save_and_close, width=12)
-        cancel_btn = tk.Button(button_frame, text="Anuluj", command=cancel_dialog, width=12)
+        save_btn = tk.Button(button_frame, text=t("BTN_SAVE"), command=save_and_close, width=12)
+        cancel_btn = tk.Button(
+            button_frame, text=t("BTN_CANCEL"), command=cancel_dialog, width=12
+        )
 
         add_btn.pack(side="left", padx=(0, 5))
         delete_btn.pack(side="left", padx=(0, 20))
@@ -2680,11 +3927,11 @@ def run_gui(connection_store, output_directory):
     def choose_from_list():
         current_paths = query_paths_state["paths"]
         if not current_paths:
-            messagebox.showerror("Error", "Brak raportów w queries.txt")
+            messagebox.showerror(t("ERR_TITLE"), t("ERR_NO_REPORTS"))
             return
 
         dlg = tk.Toplevel(root)
-        dlg.title("Wybierz raport z listy")
+        dlg.title(t("TITLE_SELECT_REPORT"))
 
         dlg.transient(root)
         dlg.resizable(True, True)
@@ -2729,7 +3976,7 @@ def run_gui(connection_store, output_directory):
         def on_ok(*_):
             sel = listbox.curselection()
             if not sel:
-                messagebox.showwarning("Uwaga", "Nie wybrano żadnego raportu.")
+                messagebox.showwarning(t("WARN_TITLE"), t("WARN_NO_REPORT_SELECTED"))
                 return
             idx = sel[0]
             _set_sql_path(current_paths[idx])
@@ -2738,8 +3985,10 @@ def run_gui(connection_store, output_directory):
         def on_cancel(*_):
             dlg.destroy()
 
-        ok_btn = tk.Button(button_frame, text="OK", width=12, command=on_ok)
-        cancel_btn = tk.Button(button_frame, text="Anuluj", width=12, command=on_cancel)
+        ok_btn = tk.Button(button_frame, text=t("BTN_OK"), width=12, command=on_ok)
+        cancel_btn = tk.Button(
+            button_frame, text=t("BTN_CANCEL"), width=12, command=on_cancel
+        )
         ok_btn.pack(side="left", padx=(0, 5))
         cancel_btn.pack(side="left")
 
@@ -2764,18 +4013,18 @@ def run_gui(connection_store, output_directory):
     def _build_export_params():
         path = selected_sql_path_full.get()
         if not path:
-            messagebox.showerror("Error", "Nie wybrano pliku SQL.")
+            messagebox.showerror(t("ERR_TITLE"), t("ERR_NO_SQL_SELECTED"))
             return None
         if not os.path.isfile(path):
-            messagebox.showerror("Error", "Wybrany plik SQL nie istnieje.")
+            messagebox.showerror(t("ERR_TITLE"), t("ERR_SQL_NOT_FOUND"))
             return None
 
         engine = engine_holder.get("engine")
         current_connection = get_connection_by_name(selected_connection_var.get())
         if engine is None or current_connection is None:
             messagebox.showerror(
-                "Brak połączenia",
-                "Utwórz połączenie z bazą danych przed uruchomieniem raportu.",
+                t("ERR_NO_CONNECTION_TITLE"),
+                t("ERR_NEED_CONNECTION"),
             )
             return None
 
@@ -2805,15 +4054,17 @@ def run_gui(connection_store, output_directory):
         if use_template:
             if output_format != "xlsx":
                 messagebox.showerror(
-                    "Błąd",
-                    "Template można użyć tylko dla formatu XLSX.",
+                    t("ERR_TITLE"),
+                    t("ERR_TEMPLATE_ONLY_XLSX"),
                 )
                 return None
             if not template_path_var.get():
-                messagebox.showerror("Błąd", "Nie wybrano pliku template.")
+                messagebox.showerror(t("ERR_TITLE"), t("ERR_TEMPLATE_NOT_SELECTED"))
                 return None
             if not sheet_name_var.get():
-                messagebox.showerror("Błąd", "Nie wybrano arkusza z pliku template.")
+                messagebox.showerror(
+                    t("ERR_TITLE"), t("ERR_TEMPLATE_SHEET_NOT_SELECTED")
+                )
                 return None
 
             output_file_name = os.path.splitext(base_name)[0] + ".xlsx"
@@ -2857,7 +4108,7 @@ def run_gui(connection_store, output_directory):
             if not params:
                 return
 
-            result_info_var.set("Trwa wykonywanie zapytania i eksport. Proszę czekać...")
+            result_info_var.set(t("MSG_RUNNING"))
             btn_start.config(state=tk.DISABLED)
             root.update_idletasks()
 
@@ -2887,30 +4138,46 @@ def run_gui(connection_store, output_directory):
 
             last_output_path["path"] = params["output_file_path"]
 
+            if output_format == "csv" and csv_profile:
+                prof_name = (csv_profile.get("name") or "").strip()
+                if prof_name:
+                    csv_profile_state["config"] = remember_last_used_csv_profile(
+                        prof_name,
+                        csv_profile_state["config"],
+                    )
+                    refresh_csv_profile_controls(prof_name)
+
             if rows_count > 0:
-                msg = (
-                    f"Zapisano: {params['output_file_path']}\n"
-                    f"Wiersze: {rows_count}\n"
-                    f"Czas SQL: {sql_dur:.2f} s\n"
-                    f"Czas eksportu: {export_dur:.2f} s\n"
-                    f"Czas łączny: {total_dur:.2f} s"
+                msg = t(
+                    "MSG_SAVED_DETAILS",
+                    path=params["output_file_path"],
+                    rows=rows_count,
+                    sql_time=sql_dur,
+                    export_time=export_dur,
+                    total_time=total_dur,
                 )
                 if output_format == "csv" and csv_profile:
-                    msg += f"\nProfil CSV: {csv_profile.get('name', '')}"
+                    msg += "\n" + t(
+                        "MSG_SAVED_DETAILS_CSV",
+                        profile=csv_profile.get("name", ""),
+                    )
             else:
-                msg = f"Zapytanie nie zwróciło wierszy.\nCzas SQL: {sql_dur:.2f} s"
+                msg = t("MSG_NO_ROWS", sql_time=sql_dur)
                 if output_format == "csv" and csv_profile:
-                    msg += f"\nProfil CSV: {csv_profile.get('name', '')}"
+                    msg += "\n" + t(
+                        "MSG_SAVED_DETAILS_CSV",
+                        profile=csv_profile.get("name", ""),
+                    )
 
             result_info_var.set(msg)
-            messagebox.showinfo("Gotowe", msg)
+            messagebox.showinfo(t("MSG_DONE"), msg)
             btn_open_file.config(state=tk.NORMAL)
             btn_open_folder.config(state=tk.NORMAL)
             update_error_display("")
 
         except Exception as exc:  # noqa: BLE001
             ui_msg = format_error_for_ui(exc, sql_query)
-            result_info_var.set("Błąd eksportu. Pełne szczegóły w logu.")
+            result_info_var.set(t("ERR_EXPORT"))
             update_error_display(ui_msg)
             show_error_popup(ui_msg)
         finally:
@@ -2927,7 +4194,7 @@ def run_gui(connection_store, output_directory):
             else:
                 subprocess.run(["xdg-open", target], check=False)
         except Exception as err:  # noqa: BLE001
-            messagebox.showerror("Error", str(err))
+            messagebox.showerror(t("ERR_TITLE"), str(err))
 
     def open_file():
         path = last_output_path.get("path")
@@ -2940,9 +4207,10 @@ def run_gui(connection_store, output_directory):
             _open_path(folder)
 
     connection_frame = tk.LabelFrame(
-        root, text="Połączenie z bazą danych", padx=10, pady=10
+        root, text=t("FRAME_DB_CONNECTION"), padx=10, pady=10
     )
     connection_frame.pack(fill=tk.X, padx=10, pady=(10, 5))
+    i18n_widgets["connection_frame"] = connection_frame
 
     status_label = tk.Label(
         connection_frame,
@@ -2965,7 +4233,9 @@ def run_gui(connection_store, output_directory):
     connection_controls.grid(row=1, column=0, sticky="we", pady=(5, 0))
     connection_controls.columnconfigure(1, weight=1)
 
-    tk.Label(connection_controls, text="Połączenie:").grid(row=0, column=0, sticky="w")
+    lbl_connection = tk.Label(connection_controls, text=t("LBL_CONNECTION"))
+    lbl_connection.grid(row=0, column=0, sticky="w")
+    i18n_widgets["lbl_connection"] = lbl_connection
     connection_combo = ttk.Combobox(
         connection_controls,
         textvariable=selected_connection_var,
@@ -2976,9 +4246,22 @@ def run_gui(connection_store, output_directory):
     connections_state["combobox"] = connection_combo
     connection_combo.bind("<<ComboboxSelected>>", on_connection_change)
 
-    tk.Button(
+    lbl_language = tk.Label(connection_controls, text=t("LBL_LANGUAGE"))
+    lbl_language.grid(row=1, column=0, sticky="w", pady=(5, 0))
+    i18n_widgets["lbl_language"] = lbl_language
+    lang_combo = ttk.Combobox(
         connection_controls,
-        text="Dodaj/edytuj połączenie",
+        textvariable=lang_var,
+        values=["EN", "PL"],
+        state="readonly",
+        width=6,
+    )
+    lang_combo.grid(row=1, column=1, sticky="w", padx=(5, 0), pady=(5, 0))
+    i18n_widgets["lang_combo"] = lang_combo
+
+    btn_add_edit = tk.Button(
+        connection_controls,
+        text=t("BTN_ADD_EDIT_CONNECTION"),
         command=lambda: open_connection_dialog_gui(
             root,
             connections_state,
@@ -2991,37 +4274,52 @@ def run_gui(connection_store, output_directory):
             handle_db_driver_error,
             create_engine_from_entry,
         ),
-    ).grid(row=0, column=2, padx=(10, 0), sticky="e")
-    tk.Button(
+    )
+    btn_add_edit.grid(row=0, column=2, padx=(10, 0), sticky="e")
+    i18n_widgets["btn_add_edit"] = btn_add_edit
+
+    btn_test_connection = tk.Button(
         connection_controls,
-        text="Testuj połączenie",
+        text=t("BTN_TEST_CONNECTION"),
         command=test_connection_only,
-    ).grid(row=0, column=3, padx=(10, 0), sticky="e")
-    tk.Button(
+    )
+    btn_test_connection.grid(row=0, column=3, padx=(10, 0), sticky="e")
+    i18n_widgets["btn_test_connection"] = btn_test_connection
+
+    btn_delete_connection = tk.Button(
         connection_controls,
-        text="Usuń połączenie",
+        text=t("BTN_DELETE_CONNECTION"),
         command=delete_selected_connection,
-    ).grid(row=0, column=4, padx=(10, 0), sticky="e")
+    )
+    btn_delete_connection.grid(row=0, column=4, padx=(10, 0), sticky="e")
+    i18n_widgets["btn_delete_connection"] = btn_delete_connection
 
     secure_edit_btn = tk.Button(
         connection_controls,
-        text="Edytuj secure.txt",
+        text=t("BTN_EDIT_SECURE"),
         command=open_secure_editor,
     )
     secure_edit_btn.grid(row=0, column=5, padx=(10, 0), sticky="e")
     secure_edit_state["button"] = secure_edit_btn
+    i18n_widgets["secure_edit_btn"] = secure_edit_btn
 
-    source_frame = tk.LabelFrame(root, text="Źródło zapytania SQL", padx=10, pady=10)
+    source_frame = tk.LabelFrame(root, text=t("FRAME_SQL_SOURCE"), padx=10, pady=10)
     source_frame.pack(fill=tk.X, padx=10, pady=(10, 5))
+    i18n_widgets["source_frame"] = source_frame
 
-    format_frame = tk.LabelFrame(root, text="Format wyjściowy", padx=10, pady=10)
+    format_frame = tk.LabelFrame(root, text=t("FRAME_OUTPUT_FORMAT"), padx=10, pady=10)
     format_frame.pack(fill=tk.X, padx=10, pady=5)
+    i18n_widgets["format_frame"] = format_frame
 
-    template_frame = tk.LabelFrame(root, text="Opcje template XLSX (GUI)", padx=10, pady=10)
+    template_frame = tk.LabelFrame(
+        root, text=t("FRAME_TEMPLATE_OPTIONS"), padx=10, pady=10
+    )
     template_frame.pack(fill=tk.X, padx=10, pady=5)
+    i18n_widgets["template_frame"] = template_frame
 
-    result_frame = tk.LabelFrame(root, text="Wynik i akcje", padx=10, pady=10)
+    result_frame = tk.LabelFrame(root, text=t("FRAME_RESULTS"), padx=10, pady=10)
     result_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(5, 10))
+    i18n_widgets["result_frame"] = result_frame
 
     source_frame.columnconfigure(1, weight=1)
     source_frame.columnconfigure(2, weight=0)
@@ -3029,33 +4327,59 @@ def run_gui(connection_store, output_directory):
     result_frame.columnconfigure(1, weight=1)
     result_frame.rowconfigure(3, weight=1)
 
-    tk.Label(source_frame, text="Wybrany plik SQL:").grid(row=0, column=0, sticky="nw")
+    lbl_selected_sql = tk.Label(source_frame, text=t("LBL_SELECTED_SQL"))
+    lbl_selected_sql.grid(row=0, column=0, sticky="nw")
+    i18n_widgets["lbl_selected_sql"] = lbl_selected_sql
     tk.Label(source_frame, textvariable=sql_label_var, wraplength=600, justify="left").grid(
         row=0, column=1, columnspan=3, sticky="we"
     )
 
-    tk.Button(source_frame, text="Wybierz plik SQL", command=choose_sql_file).grid(
+    btn_select_sql = tk.Button(source_frame, text=t("BTN_SELECT_SQL"), command=choose_sql_file)
+    btn_select_sql.grid(
         row=1, column=0, pady=5, sticky="w"
     )
-    tk.Button(source_frame, text="Wybierz z listy raportów", command=choose_from_list).grid(
+    i18n_widgets["btn_select_sql"] = btn_select_sql
+    btn_select_from_list = tk.Button(
+        source_frame, text=t("BTN_SELECT_FROM_LIST"), command=choose_from_list
+    )
+    btn_select_from_list.grid(
         row=1, column=1, pady=5, sticky="w"
     )
-    tk.Button(source_frame, text="Edytuj queries.txt", command=open_queries_manager).grid(
+    i18n_widgets["btn_select_from_list"] = btn_select_from_list
+    btn_edit_queries = tk.Button(
+        source_frame, text=t("BTN_EDIT_QUERIES"), command=open_queries_manager
+    )
+    btn_edit_queries.grid(
         row=1, column=2, pady=5, sticky="w"
     )
+    i18n_widgets["btn_edit_queries"] = btn_edit_queries
 
-    tk.Radiobutton(
-        format_frame, text="XLSX", variable=format_var, value="xlsx", command=on_format_change
-    ).grid(row=0, column=0, sticky="w")
-    tk.Radiobutton(
-        format_frame, text="CSV", variable=format_var, value="csv", command=on_format_change
-    ).grid(row=0, column=1, sticky="w")
+    radio_xlsx = tk.Radiobutton(
+        format_frame,
+        text=t("FORMAT_XLSX"),
+        variable=format_var,
+        value="xlsx",
+        command=on_format_change,
+    )
+    radio_xlsx.grid(row=0, column=0, sticky="w")
+    i18n_widgets["radio_xlsx"] = radio_xlsx
+    radio_csv = tk.Radiobutton(
+        format_frame,
+        text=t("FORMAT_CSV"),
+        variable=format_var,
+        value="csv",
+        command=on_format_change,
+    )
+    radio_csv.grid(row=0, column=1, sticky="w")
+    i18n_widgets["radio_csv"] = radio_csv
 
     on_format_change()
 
-    tk.Label(format_frame, text="Profil CSV:").grid(
+    lbl_csv_profile = tk.Label(format_frame, text=t("LBL_CSV_PROFILE"))
+    lbl_csv_profile.grid(
         row=1, column=0, sticky="w", pady=(5, 0)
     )
+    i18n_widgets["lbl_csv_profile"] = lbl_csv_profile
     csv_profile_combo = ttk.Combobox(
         format_frame,
         textvariable=selected_csv_profile_var,
@@ -3067,7 +4391,7 @@ def run_gui(connection_store, output_directory):
 
     csv_profile_manage_btn = tk.Button(
         format_frame,
-        text="Zarządzaj profilami CSV",
+        text=t("BTN_MANAGE_CSV_PROFILES"),
         command=lambda: open_csv_profiles_manager_gui(
             root,
             csv_profile_state,
@@ -3077,6 +4401,7 @@ def run_gui(connection_store, output_directory):
     )
     csv_profile_manage_btn.grid(row=1, column=2, padx=(10, 0), pady=(5, 0), sticky="w")
     csv_profile_state["manage_button"] = csv_profile_manage_btn
+    i18n_widgets["csv_profile_manage_btn"] = csv_profile_manage_btn
 
     tk.Label(format_frame, textvariable=default_csv_label_var, justify="left", wraplength=600).grid(
         row=2, column=0, columnspan=3, sticky="w", pady=(5, 0)
@@ -3084,21 +4409,24 @@ def run_gui(connection_store, output_directory):
 
     refresh_csv_profile_controls(csv_profile_state["config"].get("default_profile"))
 
-    tk.Checkbutton(
+    chk_use_template = tk.Checkbutton(
         template_frame,
-        text="Użyj pliku template (tylko dla XLSX, tylko w GUI)",
+        text=t("CHK_USE_TEMPLATE"),
         variable=use_template_var,
         command=on_toggle_template,
-    ).grid(row=0, column=0, columnspan=2, sticky="w")
-
-    tk.Label(template_frame, text="Plik template:").grid(
-        row=1, column=0, sticky="w", pady=(5, 0)
     )
+    chk_use_template.grid(row=0, column=0, columnspan=2, sticky="w")
+    i18n_widgets["chk_use_template"] = chk_use_template
+
+    lbl_template_file = tk.Label(template_frame, text=t("LBL_TEMPLATE_FILE"))
+    lbl_template_file.grid(row=1, column=0, sticky="w", pady=(5, 0))
+    i18n_widgets["lbl_template_file"] = lbl_template_file
     choose_template_btn = tk.Button(
-        template_frame, text="Wybierz template", command=choose_template_file
+        template_frame, text=t("BTN_SELECT_TEMPLATE"), command=choose_template_file
     )
     choose_template_btn.grid(row=1, column=1, sticky="w", pady=(5, 0))
     template_state["choose_button"] = choose_template_btn
+    i18n_widgets["choose_template_btn"] = choose_template_btn
     tk.Label(
         template_frame,
         textvariable=template_label_var,
@@ -3106,9 +4434,9 @@ def run_gui(connection_store, output_directory):
         justify="left",
     ).grid(row=2, column=0, columnspan=2, sticky="we")
 
-    tk.Label(template_frame, text="Arkusz:").grid(
-        row=3, column=0, sticky="w", pady=(5, 0)
-    )
+    lbl_template_sheet = tk.Label(template_frame, text=t("LBL_TEMPLATE_SHEET"))
+    lbl_template_sheet.grid(row=3, column=0, sticky="w", pady=(5, 0))
+    i18n_widgets["lbl_template_sheet"] = lbl_template_sheet
     sheet_combobox = ttk.Combobox(
         template_frame,
         textvariable=sheet_name_var,
@@ -3118,48 +4446,63 @@ def run_gui(connection_store, output_directory):
     sheet_combobox.grid(row=3, column=1, sticky="w", pady=(5, 0))
     template_state["sheet_combobox"] = sheet_combobox
 
-    tk.Label(template_frame, text="Startowa komórka:").grid(
-        row=4, column=0, sticky="w", pady=(5, 0)
-    )
+    lbl_template_start_cell = tk.Label(template_frame, text=t("LBL_TEMPLATE_START_CELL"))
+    lbl_template_start_cell.grid(row=4, column=0, sticky="w", pady=(5, 0))
+    i18n_widgets["lbl_template_start_cell"] = lbl_template_start_cell
     start_cell_entry = tk.Entry(template_frame, textvariable=start_cell_var, width=10)
     start_cell_entry.grid(row=4, column=1, sticky="w", pady=(5, 0))
     template_state["start_cell_entry"] = start_cell_entry
 
     include_header_check = tk.Checkbutton(
         template_frame,
-        text="Zapisz nagłówki (nazwy kolumn) w arkuszu",
+        text=t("CHK_INCLUDE_HEADERS"),
         variable=include_header_var,
     )
     include_header_check.grid(row=5, column=0, columnspan=2, sticky="w", pady=(5, 0))
     template_state["include_header_check"] = include_header_check
+    i18n_widgets["include_header_check"] = include_header_check
 
     update_template_controls_state()
     update_csv_profile_controls_state()
 
-    btn_start = tk.Button(result_frame, text="Start", command=run_export_gui)
+    btn_start = tk.Button(result_frame, text=t("BTN_START"), command=run_export_gui)
     btn_start.grid(row=0, column=0, pady=(0, 10), sticky="w")
     start_button_holder["widget"] = btn_start
+    i18n_widgets["btn_start"] = btn_start
+    btn_report_issue = tk.Button(
+        result_frame,
+        text=t("BTN_REPORT_ISSUE"),
+        command=lambda: open_github_issue_chooser(parent=root),
+    )
+    btn_report_issue.grid(row=0, column=1, padx=(10, 0), pady=(0, 10), sticky="w")
+    i18n_widgets["btn_report_issue"] = btn_report_issue
 
     refresh_connection_combobox()
     refresh_secure_edit_button()
     if selected_connection_var.get():
         apply_selected_connection(show_success=False)
     else:
-        set_connection_status("Brak połączenia. Utwórz nowe połączenie.", False)
+        set_connection_status(connected=False, key="STATUS_NO_CONNECTION")
 
-    tk.Label(result_frame, text="Informacje o eksporcie:").grid(row=1, column=0, sticky="nw")
+    lbl_export_info = tk.Label(result_frame, text=t("LBL_EXPORT_INFO"))
+    lbl_export_info.grid(row=1, column=0, sticky="nw")
+    i18n_widgets["lbl_export_info"] = lbl_export_info
     tk.Label(result_frame, textvariable=result_info_var, justify="left", wraplength=600).grid(
         row=1, column=1, columnspan=3, sticky="w"
     )
 
-    btn_open_file = tk.Button(result_frame, text="Otwórz plik", command=open_file)
+    btn_open_file = tk.Button(result_frame, text=t("BTN_OPEN_FILE"), command=open_file)
     btn_open_file.grid(row=2, column=0, pady=5, sticky="w")
-    btn_open_folder = tk.Button(result_frame, text="Otwórz katalog", command=open_folder)
-    btn_open_folder.grid(row=2, column=1, pady=5, sticky="w")
-
-    tk.Label(result_frame, text="Błędy (skrót):").grid(
-        row=3, column=0, sticky="nw", pady=(10, 0)
+    i18n_widgets["btn_open_file"] = btn_open_file
+    btn_open_folder = tk.Button(
+        result_frame, text=t("BTN_OPEN_FOLDER"), command=open_folder
     )
+    btn_open_folder.grid(row=2, column=1, pady=5, sticky="w")
+    i18n_widgets["btn_open_folder"] = btn_open_folder
+
+    lbl_errors_short = tk.Label(result_frame, text=t("LBL_ERRORS_SHORT"))
+    lbl_errors_short.grid(row=3, column=0, sticky="nw", pady=(10, 0))
+    i18n_widgets["lbl_errors_short"] = lbl_errors_short
     error_frame = tk.Frame(result_frame)
     error_frame.grid(row=3, column=1, columnspan=3, sticky="nsew", pady=(10, 0))
 
@@ -3184,13 +4527,104 @@ def run_gui(connection_store, output_directory):
     btn_open_file.config(state=tk.DISABLED)
     btn_open_folder.config(state=tk.DISABLED)
 
+    def apply_i18n():
+        root.title(t("APP_TITLE_FULL"))
+        connection_frame.config(text=t("FRAME_DB_CONNECTION"))
+        source_frame.config(text=t("FRAME_SQL_SOURCE"))
+        format_frame.config(text=t("FRAME_OUTPUT_FORMAT"))
+        template_frame.config(text=t("FRAME_TEMPLATE_OPTIONS"))
+        result_frame.config(text=t("FRAME_RESULTS"))
+        lbl_connection.config(text=t("LBL_CONNECTION"))
+        lbl_language.config(text=t("LBL_LANGUAGE"))
+        btn_add_edit.config(text=t("BTN_ADD_EDIT_CONNECTION"))
+        btn_test_connection.config(text=t("BTN_TEST_CONNECTION"))
+        btn_delete_connection.config(text=t("BTN_DELETE_CONNECTION"))
+        secure_edit_btn.config(text=t("BTN_EDIT_SECURE"))
+        lbl_selected_sql.config(text=t("LBL_SELECTED_SQL"))
+        btn_select_sql.config(text=t("BTN_SELECT_SQL"))
+        btn_select_from_list.config(text=t("BTN_SELECT_FROM_LIST"))
+        btn_edit_queries.config(text=t("BTN_EDIT_QUERIES"))
+        radio_xlsx.config(text=t("FORMAT_XLSX"))
+        radio_csv.config(text=t("FORMAT_CSV"))
+        lbl_csv_profile.config(text=t("LBL_CSV_PROFILE"))
+        csv_profile_manage_btn.config(text=t("BTN_MANAGE_CSV_PROFILES"))
+        chk_use_template.config(text=t("CHK_USE_TEMPLATE"))
+        lbl_template_file.config(text=t("LBL_TEMPLATE_FILE"))
+        choose_template_btn.config(text=t("BTN_SELECT_TEMPLATE"))
+        lbl_template_sheet.config(text=t("LBL_TEMPLATE_SHEET"))
+        lbl_template_start_cell.config(text=t("LBL_TEMPLATE_START_CELL"))
+        include_header_check.config(text=t("CHK_INCLUDE_HEADERS"))
+        btn_start.config(text=t("BTN_START"))
+        btn_report_issue.config(text=t("BTN_REPORT_ISSUE"))
+        lbl_export_info.config(text=t("LBL_EXPORT_INFO"))
+        btn_open_file.config(text=t("BTN_OPEN_FILE"))
+        btn_open_folder.config(text=t("BTN_OPEN_FOLDER"))
+        lbl_errors_short.config(text=t("LBL_ERRORS_SHORT"))
+        refresh_csv_profile_controls(csv_profile_state["config"].get("default_profile"))
+        if connection_status_state["key"]:
+            is_connected = False
+            status_btn = start_button_holder.get("widget")
+            if status_btn is not None:
+                is_connected = status_btn.cget("state") == tk.NORMAL
+            set_connection_status(
+                connected=is_connected,
+                key=connection_status_state["key"],
+                **connection_status_state["params"],
+            )
+
+    def on_lang_change(_event=None):  # noqa: ANN001
+        selected = (lang_var.get() or "").lower()
+        set_lang(selected)
+        connections_state["store"]["ui_lang"] = selected
+        apply_i18n()
+        if os.path.exists(SECURE_PATH):
+            persist_connections()
+
+    lang_combo.bind("<<ComboboxSelected>>", on_lang_change)
+
     _center_window(root)
 
     root.mainloop()
 
 
 if __name__ == "__main__":
+    output_directory = r"generated_reports"
+    ensure_directories([output_directory, "templates", "queries"])
+
+    pre_parser = argparse.ArgumentParser(add_help=False)
+    pre_parser.add_argument("--lang", choices=["en", "pl"])
+    pre_args, _ = pre_parser.parse_known_args()
+    lang_for_cli = pre_args.lang
+    if lang_for_cli:
+        set_lang(lang_for_cli)
+    elif os.path.exists(SECURE_PATH):
+        stored_lang = load_connections().get("ui_lang")
+        if stored_lang:
+            set_lang(stored_lang)
+
+    parser = argparse.ArgumentParser(description=t("CLI_DESC"))
+    parser.add_argument("-c", "--console", action="store_true", help=t("CLI_CONSOLE_HELP"))
+    parser.add_argument("--lang", choices=["en", "pl"], help=t("CLI_LANG_HELP"))
+    args = parser.parse_args()
+
+    created_files = bootstrap_local_files()
+    if created_files:
+        try:
+            LOGGER.info(
+                "Bootstrapped local files from samples: %s",
+                ", ".join(created_files),
+            )
+        except Exception:
+            pass
+
     connection_store = load_connections()
+    if args.lang:
+        set_lang(args.lang)
+        connection_store["ui_lang"] = args.lang
+    else:
+        stored_lang = connection_store.get("ui_lang")
+        if stored_lang:
+            set_lang(stored_lang)
     selected_name = connection_store.get("last_selected")
     selected_connection = None
     for conn in connection_store.get("connections", []):
@@ -3200,14 +4634,9 @@ if __name__ == "__main__":
     if selected_connection is None and connection_store.get("connections"):
         selected_connection = connection_store["connections"][0]
 
-    output_directory = r"generated_reports"
-    ensure_directories([output_directory, "templates", "queries"])
-
-    if len(sys.argv) > 1 and sys.argv[1] == "-c":
+    if args.console:
         if not selected_connection:
-            print(
-                "Brak zapisanych połączeń. Utwórz połączenie w trybie GUI, aby uruchomić konsolę."
-            )
+            print(t("CLI_NO_CONNECTIONS"))
             sys.exit(1)
 
         engine_kwargs = {}
@@ -3229,7 +4658,7 @@ if __name__ == "__main__":
                     selected_connection.get("type"),
                     exc_info=exc,
                 )
-                print("Nie udało się utworzyć połączenia. Pełne szczegóły w logu.")
+                print(t("CLI_CONNECTION_FAIL"))
             sys.exit(1)
 
         run_console(engine, output_directory, selected_connection)

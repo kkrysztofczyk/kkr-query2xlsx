@@ -1,0 +1,76 @@
+name: Bug report
+description: Report a bug in the app (no sensitive data)
+title: "[BUG] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Describe the problem so it can be reproduced on test data.
+        ⚠️ Do not paste passwords, tokens, connection strings, hostnames, personal data, or production SQL.
+        If English is hard, write in your language - we'll translate.
+
+  - type: dropdown
+    id: mode
+    attributes:
+      label: Mode
+      options:
+        - GUI
+        - CLI
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - Windows
+        - macOS
+        - Linux
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: Short and specific.
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1.
+        2.
+        3.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: false
+
+  - type: input
+    id: version
+    attributes:
+      label: App version (optional)
+      description: e.g. tag, commit SHA, or release version
+      placeholder: "v0.3.1 / 1a2b3c4"
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Data safety
+      options:
+        - label: I confirm that I did not paste any secrets or sensitive data.
+          required: true

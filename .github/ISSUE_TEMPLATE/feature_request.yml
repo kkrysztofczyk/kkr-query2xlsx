@@ -1,0 +1,33 @@
+name: Feature request
+description: Propose an improvement or new feature (no sensitive data)
+title: "[IDEA] "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ⚠️ Do not paste passwords, tokens, connection strings, hostnames, personal data, or production SQL.
+        Describe the use case and the expected outcome.
+        If English is hard, write in your language - we'll translate.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem do you want to solve?
+    validations:
+      required: true
+
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed solution
+      description: How should it work in the GUI/CLI? What options?
+    validations:
+      required: true
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Context (optional)
+    validations:
+      required: false
