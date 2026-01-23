@@ -59,7 +59,7 @@ body:
       required: false
 
   - type: input
-    id: version
+    id: app_version
     attributes:
       label: App version (optional)
       description: e.g. tag, commit SHA, or release version

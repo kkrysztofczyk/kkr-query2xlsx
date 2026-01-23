@@ -1,271 +1,225 @@
 # kkr-query2xlsx
 
-Run SQL queries from files against multiple databases and export results to **Excel (XLSX)** or **CSV**.  
-Includes **GUI and CLI modes**, retry handling, CSV profiles, XLSX templates, and a ready-to-use **SQLite demo**.
+Run **SQL queries from `.sql` files** and export results to **Excel (XLSX)** or **CSV** — either with a simple **GUI (Tkinter)** or from the **CLI**.
+
+If you ever:
+- copy/pasted query results into Excel,
+- ran the same report again and again,
+- needed a small “run this SQL → save a spreadsheet” tool,
+
+…this project is for you.
+
+![GUI](docs/gui.png)
 
 ---
 
-## Screenshot
+## What is it?
 
-> Recommended file location in the repo: `docs/gui.png`
+**kkr-query2xlsx** is a lightweight SQL runner that:
+1. takes a `.sql` file,
+2. runs it against a chosen database connection,
+3. exports the result to **XLSX** or **CSV**,
+4. writes it into a predictable output folder (`generated_reports/`).
 
-![KKr SQL to XLSX/CSV GUI](docs/gui.png)
+It also includes quality-of-life features like:
+- retry handling for deadlocks,
+- CSV profiles (delimiter/encoding/quoting/date format, etc.),
+- exporting into an existing XLSX template (GUI),
+- a demo SQLite database + example queries (so you can try it immediately).
 
----
-
-## What this tool is for
-
-- Running SQL queries stored in `.sql` files
-- Exporting query results to XLSX or CSV
-- Reusing the same queries across different databases
-- Non-developers running reports without touching SQL editors
-- Lightweight, local alternative to BI tools for ad-hoc reporting
-
----
-
-## Features
-
-- GUI (Tkinter) and CLI modes
-- Supports **SQLite**, **SQL Server (ODBC)**, **PostgreSQL**
-- File-based SQL queries
-- Excel (XLSX) and CSV export
-- CSV profiles (delimiter, encoding, decimal separator, date format)
-- XLSX template support (paste results into existing sheets) — **GUI only**
-- Retry logic for deadlocks / serialization errors
-- Rotating logs
-- Demo SQLite database + example queries included
+> Note on naming: the Windows executable is currently called **`kkr-query2sheet.exe`** (legacy name),
+> while the repo is **kkr-query2xlsx**. Functionality is the same.
 
 ---
 
-## Requirements
+## When is it a good fit?
 
-- Python **3.9+** recommended
-- Dependencies are listed in `requirements.txt`
-- Notes:
-  - **SQL Server (ODBC)** requires Microsoft ODBC Driver (e.g. *ODBC Driver 17/18 for SQL Server*) and `pyodbc`
-  - **PostgreSQL** requires a PostgreSQL driver (e.g. `psycopg2-binary`)
-  - SQLite works out-of-the-box (file-based)
+✅ Great for:
+- analysts & ops who need repeatable exports,
+- small internal reporting workflows,
+- “one query = one spreadsheet” patterns,
+- sharing SQL reports with non‑technical teammates.
 
----
-
-## Repository structure
-
-```text
-.
-├─ main.pyw
-├─ secure.sample.json
-├─ queries.sample.txt
-├─ examples/
-│  ├─ db/
-│  │  └─ demo.sqlite
-│  └─ queries/
-│     ├─ 01_simple_select.sql
-│     ├─ 02_join.sql
-│     └─ 03_aggregation.sql
-├─ docs/
-│  └─ gui.png
-├─ templates/
-├─ generated_reports/   (created at runtime)
-├─ logs/                (created at runtime)
-├─ requirements.txt
-├─ LICENSE
-└─ README.md
-```
+🚫 Not a BI platform:
+- no dashboards,
+- no semantic model,
+- no multi-step ETL pipelines.
 
 ---
 
-## Quickstart (Demo – no setup required)
+## Choose how you want to run it
 
-### 1. Install dependencies
+You have **two options**:
+
+### Option 1 — Windows app (recommended for most users)
+- ✅ **No Python needed**
+- ✅ **No installation** (download + unzip + run)
+- ✅ Auto-creates local config on first run (no manual copying)
+- ✅ Best for non-developers
+
+### Option 2 — Run from source (developers / non-Windows)
+- Requires Python + dependencies
+- Best if you want to modify the code, contribute, or run on Linux/macOS
+
+---
+
+## Option 1 — Download the Windows app (no Python)
+
+1. Open **Releases**: https://github.com/kkrysztofczyk/kkr-query2xlsx/releases  
+2. Download the latest file: `kkr-query2sheet-vX.Y.Z-windows.zip`
+3. **Unzip** it (important: don’t run the exe from inside the zip)
+4. Run: `kkr-query2sheet\kkr-query2sheet.exe`
+
+That’s it — no Python installation required.
+
+### First run = zero manual setup
+On first run the app creates local files automatically (only if missing):
+- `secure.sample.json` → `secure.txt` (connections)
+- `queries.sample.txt` → `queries.txt` (optional list for “choose from list”)
+
+Existing files are never overwritten.
+
+> Note: The Windows app bundles Python libraries, but some database types still require system drivers
+> (e.g. SQL Server requires an installed ODBC driver).
+
+---
+
+## Quickstart (Demo — try it in 60 seconds)
+
+This repo includes:
+- `examples/db/demo.sqlite` (demo database)
+- `examples/queries/` (sample SQL files)
+
+### Run a demo query (GUI)
+1. Start the app
+2. Select connection: **Demo SQLite**
+3. Choose a query from `examples/queries`
+4. Choose output format: **XLSX** or **CSV**
+5. Click **Start**
+6. Your file will appear in: `generated_reports/`
+
+---
+
+## How to use (GUI)
+
+### Run your own query
+1. Create or select a connection
+2. Pick a `.sql` file (or pick from the list in `queries.txt`)
+3. Choose export format (XLSX/CSV)
+4. Click **Start**
+5. Use **Open file** / **Open folder** buttons after export
+
+### Export into an existing Excel template (GUI only)
+If enabled, the app:
+- copies your template to the output file
+- pastes data into the chosen sheet starting at a cell (e.g. `A2`)
+- optionally writes headers
+
+---
+
+## Where are my files?
+
+- Exports: `generated_reports/`
+- Logs: `logs/kkr_query2sheet.log` (rotating)
+
+---
+
+## Supported databases
+
+- SQLite
+- SQL Server (ODBC)
+- PostgreSQL
+- MySQL
+
+Driver notes (when running from source):
+- SQL Server: `pyodbc` + installed ODBC driver (e.g. Microsoft ODBC Driver 17/18 for SQL Server)
+- PostgreSQL: `psycopg2` or `psycopg`
+- MySQL: `pymysql`
+
+---
+
+## Configuration files (created automatically)
+
+### `secure.txt` (connections)
+Local JSON file with connection settings (may include credentials). **Never commit it.**
+
+### `queries.txt` (optional “choose from list”)
+Optional text file listing paths to `.sql` files (one per line).
+
+### `kkr-query2xlsx.json` (CSV profiles)
+CSV profiles (delimiter, encoding, decimals, quoting, date format, etc.).
+
+Important:
+- `delimiter_replacement` replaces delimiter characters in **all** string fields (global replacement).
+  Use only if your import system cannot handle escaping.
+
+---
+
+## Recommended repo/workspace layout (examples vs private files)
+
+Public examples (safe to commit):
+- `examples/db/` — demo SQLite database
+- `examples/queries/` — sample SQL files
+- `examples/templates/` — optional sample XLSX templates
+
+Your private workspace (keep local, not in public git):
+- `queries/` — your `.sql` files
+- `templates/` — your XLSX templates
+- `data/` or `db/` — your databases
+
+---
+
+## Option 2 — Run from source (developers)
+
+Install dependencies:
 
 ```bash
 python -m pip install -r requirements.txt
 ```
 
-### 2. Prepare local config
-
-Copy the sample connection file:
-
-**macOS / Linux**
-```bash
-cp secure.sample.json secure.txt
-```
-
-**Windows (PowerShell)**
-```powershell
-Copy-Item secure.sample.json secure.txt
-```
-
-**Windows (CMD)**
-```bat
-copy secure.sample.json secure.txt
-```
-
-(Optional) Copy example query list:
-
-**macOS / Linux**
-```bash
-cp queries.sample.txt queries.txt
-```
-
-**Windows (PowerShell)**
-```powershell
-Copy-Item queries.sample.txt queries.txt
-```
-
-**Windows (CMD)**
-```bat
-copy queries.sample.txt queries.txt
-```
-
-> `secure.txt` is **gitignored** and must never be committed.
-
----
-
-### 3. Run the app
-
-GUI mode (default):
+Run GUI:
 
 ```bash
 python main.pyw
 ```
 
-Console mode:
+Run CLI:
 
 ```bash
 python main.pyw -c
 ```
 
----
-
-### 4. Run a demo query (GUI)
-
-1. Select connection: **Demo SQLite**
-2. Choose a query from `examples/queries`
-3. Select output format: XLSX or CSV
-4. Click **Start**
-
-Results are saved to:
-
-```text
-generated_reports/
-```
-
----
-
-## Usage
-
-### GUI usage
-
-- Configure a connection (or use **Demo SQLite**)
-- Pick a `.sql` file (or use `queries.txt` list)
-- Choose export format (XLSX/CSV)
-- Click **Start**
-- Use “Open file” / “Open folder” buttons after export
-
-### CLI usage (`-c`)
+Language (GUI/CLI):
 
 ```bash
-python main.pyw -c
+python main.pyw --lang en
+python main.pyw --lang pl
 ```
 
-Notes:
-- CLI mode requires at least one saved connection in `secure.txt`
-- You will be prompted to choose a query file and output format
-- Output is written to `generated_reports/`
+---
+
+## Troubleshooting (Windows)
+
+- **Always unzip first** (don’t run the exe inside the zip)
+- If Windows blocks the download: right-click the `.zip` → Properties → **Unblock**
+- If antivirus/EDR blocks the app, whitelist the extracted folder (common with packed apps)
 
 ---
 
-## Configuration
+## Security
 
-### Connections (`secure.txt`)
-
-Connections are stored locally in `secure.txt` (JSON).
-
-Supported types:
-- SQLite (file-based)
-- SQL Server (ODBC)
-- PostgreSQL
-
-Use `secure.sample.json` as a template and rename it to `secure.txt`.
-
-### Query list (`queries.txt`)
-
-Optional file listing paths to `.sql` files, one per line.
-
-Example:
-
-```text
-examples/queries/01_simple_select.sql
-examples/queries/02_join.sql
-```
-
-You can also pick any `.sql` file manually from the GUI.
-
-### CSV profiles
-
-CSV export can be customized via profiles:
-- encoding (UTF-8, windows-1250, etc.)
-- delimiter and decimal separator
-- quoting strategy
-- date formatting
-
-Profiles can be managed directly from the GUI.
-
-⚠️ Note: `delimiter_replacement` intentionally **modifies string values** to avoid escaping issues. Use with care.
-
-### XLSX templates (GUI only)
-
-You can export query results directly into an existing Excel file:
-- select template `.xlsx`
-- choose target sheet
-- define start cell
-- optionally include column headers
-
-The template file is copied before writing.
+- `secure.txt` may contain credentials — never commit it.
+- Logs may contain SQL fragments and driver errors — treat logs as sensitive.
+- This tool executes arbitrary SQL — run only queries you trust.
 
 ---
 
-## Output & logs
+## Maintainers (build & release)
 
-- Exports are written to: `generated_reports/`
-- Logs are written to: `logs/kkr_query2sheet.log`
-  - Rotating log files (max ~1 MB, 3 backups)
-  - Logs may include SQL text and error details
-
----
-
-## Troubleshooting
-
-- **SQL Server: ODBC driver missing / pyodbc missing**
-  - Install Microsoft ODBC Driver 17/18 and ensure `pyodbc` is installed.
-- **PostgreSQL: psycopg2 missing**
-  - Install `psycopg2-binary` (or another PostgreSQL driver).
-- **PermissionError when exporting**
-  - The output file may be open in Excel. Close it and retry.
-- **Nothing happens / no rows returned**
-  - The query executed but returned 0 rows — check your SQL and filters.
-- **Where are details of an error?**
-  - See `logs/kkr_query2sheet.log`
-
----
-
-## Security notes
-
-- This tool executes **arbitrary SQL** — run only queries you trust.
-- `secure.txt` may contain database credentials — **never commit it**.
-- Logs can contain SQL fragments and connection/driver error details — treat logs as sensitive.
+Build/release instructions for the Windows EXE are documented in: `docs/BUILD_WINDOWS.md`
 
 ---
 
 ## License
 
-MIT License (see `LICENSE`)
-
----
-
-## Disclaimer
-
-This tool is provided as-is.  
-Use at your own risk, especially when connecting to production databases.  
-This project uses third-party libraries licensed under their respective licenses (MIT, BSD, LGPL).
+MIT

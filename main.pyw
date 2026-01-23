@@ -2,7 +2,6 @@ import argparse
 import csv
 import json
 import logging
-import locale
 import textwrap
 import traceback
 import os
@@ -14,9 +13,10 @@ import tkinter as tk
 import tkinter.font as tkfont
 import webbrowser
 from datetime import datetime
+from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog
 from tkinter import ttk
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, urlencode
 
 from logging.handlers import RotatingFileHandler
 
@@ -28,9 +28,46 @@ from openpyxl.utils import coordinate_to_tuple
 
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-GITHUB_NEW_ISSUE_CHOOSE_URL = (
-    "https://github.com/kkrysztofczyk/kkr-query2xlsx/issues/new/choose"
-)
+
+# --- App version -------------------------------------------------------------
+
+APP_VERSION = "0.3.2"  # bump manually for releases
+
+
+def _get_git_short_sha() -> str | None:
+    """Best-effort git short SHA for local/dev runs. Returns None when unavailable."""
+    try:
+        here = Path(__file__).resolve().parent
+        p = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=str(here),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=0.8,
+            check=False,
+        )
+        sha = (p.stdout or "").strip()
+        return sha if sha else None
+    except Exception:
+        return None
+
+
+def get_app_version_label() -> str:
+    sha = _get_git_short_sha()
+    if sha:
+        return f"v{APP_VERSION} / {sha}"
+    return f"v{APP_VERSION}"
+
+
+def build_bug_report_url() -> str:
+    base = "https://github.com/kkrysztofczyk/kkr-query2xlsx/issues/new"
+    params = {
+        "template": "bug_report.yml",
+        "title": "[BUG] ",
+        "app_version": get_app_version_label(),
+    }
+    return f"{base}?{urlencode(params)}"
 
 
 # =========================
@@ -147,6 +184,7 @@ I18N: dict[str, dict[str, str]] = {
         "LBL_DB_TYPE": "Database type",
         "ERR_INVALID_CONN_TYPE": "Invalid connection type.",
         "ERR_CONN_NAME_REQUIRED": "Connection name cannot be empty.",
+        "ERR_CONN_NAME_EXISTS": "Connection name already exists. Choose another name.",
         "INFO_CONN_SAVED_TITLE": "Saved",
         "INFO_CONN_SAVED_BODY": "Connection has been saved.",
         "BTN_SAVE": "Save",
@@ -250,7 +288,9 @@ I18N: dict[str, dict[str, str]] = {
         "ERR_EXPORT": "Export error. Full details in log.",
         "FRAME_DB_CONNECTION": "Database connection",
         "LBL_CONNECTION": "Connection:",
-        "BTN_ADD_EDIT_CONNECTION": "Add/edit connection",
+        "BTN_EDIT_CONNECTION": "Edit connection",
+        "BTN_NEW_CONNECTION": "New connection",
+        "BTN_DUPLICATE_CONNECTION": "Duplicate",
         "BTN_TEST_CONNECTION": "Test connection",
         "BTN_DELETE_CONNECTION": "Delete connection",
         "BTN_EDIT_SECURE": "Edit secure.txt",
@@ -314,11 +354,13 @@ I18N: dict[str, dict[str, str]] = {
         "DB_TYPE_PG": "PostgreSQL",
         "DB_TYPE_MYSQL": "MySQL",
         "DB_TYPE_SQLITE": "SQLite (.db file)",
-        "TITLE_CONN_DIALOG": "Add or update connection",
-        "CONN_DIALOG_HINT": (
-            "To create a new connection, enter a new name.\n"
-            "To edit an existing connection, keep the name and adjust details."
-        ),
+        "TITLE_CONN_DIALOG_EDIT": "Editing: {name}",
+        "TITLE_CONN_DIALOG_NEW": "New connection",
+        "TITLE_CONN_DIALOG_DUPLICATE": "Duplicating: {name}",
+        "CONN_DIALOG_HINT_EDIT": "Editing connection: {name}",
+        "CONN_DIALOG_HINT_NEW": "Create a new connection by entering its details.",
+        "CONN_DIALOG_HINT_DUPLICATE": "Duplicating connection: {name}",
+        "CONN_DUPLICATE_SUFFIX": "(copy)",
         "INFO_CONN_SAVED_NO_TEST": (
             "Connection saved without testing.\n"
             "Use the \"Test connection\" button to verify it."
@@ -518,6 +560,7 @@ I18N: dict[str, dict[str, str]] = {
         "LBL_DB_TYPE": "Typ bazy",
         "ERR_INVALID_CONN_TYPE": "Nieprawidłowy typ połączenia.",
         "ERR_CONN_NAME_REQUIRED": "Nazwa połączenia nie może być pusta.",
+        "ERR_CONN_NAME_EXISTS": "Nazwa połączenia już istnieje. Wybierz inną nazwę.",
         "INFO_CONN_SAVED_TITLE": "Zapisano",
         "INFO_CONN_SAVED_BODY": "Połączenie zostało zapisane.",
         "BTN_SAVE": "Zapisz",
@@ -620,7 +663,9 @@ I18N: dict[str, dict[str, str]] = {
         "ERR_EXPORT": "Błąd eksportu. Pełne szczegóły w logu.",
         "FRAME_DB_CONNECTION": "Połączenie z bazą danych",
         "LBL_CONNECTION": "Połączenie:",
-        "BTN_ADD_EDIT_CONNECTION": "Dodaj/edytuj połączenie",
+        "BTN_EDIT_CONNECTION": "Edytuj połączenie",
+        "BTN_NEW_CONNECTION": "Nowe połączenie",
+        "BTN_DUPLICATE_CONNECTION": "Duplikuj",
         "BTN_TEST_CONNECTION": "Testuj połączenie",
         "BTN_DELETE_CONNECTION": "Usuń połączenie",
         "BTN_EDIT_SECURE": "Edytuj secure.txt",
@@ -684,11 +729,13 @@ I18N: dict[str, dict[str, str]] = {
         "DB_TYPE_PG": "PostgreSQL",
         "DB_TYPE_MYSQL": "MySQL",
         "DB_TYPE_SQLITE": "SQLite (plik .db)",
-        "TITLE_CONN_DIALOG": "Dodaj lub zaktualizuj połączenie",
-        "CONN_DIALOG_HINT": (
-            "Aby utworzyć nowe połączenie, wpisz nową nazwę.\n"
-            "Aby edytować istniejące połączenie, zostaw nazwę i popraw szczegóły."
-        ),
+        "TITLE_CONN_DIALOG_EDIT": "Edycja: {name}",
+        "TITLE_CONN_DIALOG_NEW": "Nowe połączenie",
+        "TITLE_CONN_DIALOG_DUPLICATE": "Duplikowanie: {name}",
+        "CONN_DIALOG_HINT_EDIT": "Edycja połączenia: {name}",
+        "CONN_DIALOG_HINT_NEW": "Utwórz nowe połączenie, wpisując jego szczegóły.",
+        "CONN_DIALOG_HINT_DUPLICATE": "Duplikowanie połączenia: {name}",
+        "CONN_DUPLICATE_SUFFIX": "(kopia)",
         "INFO_CONN_SAVED_NO_TEST": (
             "Połączenie zapisane bez testu.\n"
             "Użyj przycisku „Testuj połączenie”, aby je sprawdzić."
@@ -789,22 +836,22 @@ I18N: dict[str, dict[str, str]] = {
 
 
 def _detect_lang() -> str:
-    # prosto i bezpiecznie: PL jeśli systemowa zaczyna się od 'pl', inaczej EN
-    try:
-        loc = locale.getdefaultlocale()[0] or ""
-    except Exception:
-        loc = ""
-    loc = loc.lower()
-    return "pl" if loc.startswith("pl") else "en"
+    # Default language is English.
+    return "en"
 
 
 _CURRENT_LANG = _detect_lang()
 
 
+def _normalize_ui_lang(lang: str | None) -> str | None:
+    normalized = (lang or "").lower()
+    return normalized if normalized in I18N else None
+
+
 def set_lang(lang: str) -> None:
     global _CURRENT_LANG
-    lang = (lang or "").lower()
-    _CURRENT_LANG = lang if lang in I18N else "en"
+    normalized = _normalize_ui_lang(lang)
+    _CURRENT_LANG = normalized or "en"
 
 
 def t(key: str, **kwargs) -> str:
@@ -851,14 +898,15 @@ def _center_window(win, parent=None):
 
 
 def open_github_issue_chooser(parent=None) -> None:
+    url = build_bug_report_url()
     try:
-        ok = webbrowser.open_new_tab(GITHUB_NEW_ISSUE_CHOOSE_URL)
+        ok = webbrowser.open_new_tab(url)
         if not ok and parent is not None:
             messagebox.showwarning(
                 t("BROWSER_OPEN_FAIL_TITLE"),
                 t(
                     "BROWSER_OPEN_FAIL_BODY",
-                    url=GITHUB_NEW_ISSUE_CHOOSE_URL,
+                    url=url,
                 ),
                 parent=parent,
             )
@@ -869,7 +917,7 @@ def open_github_issue_chooser(parent=None) -> None:
                 t(
                     "BROWSER_OPEN_FAIL_ERROR_BODY",
                     error=exc,
-                    url=GITHUB_NEW_ISSUE_CHOOSE_URL,
+                    url=url,
                 ),
                 parent=parent,
             )
@@ -877,7 +925,8 @@ def open_github_issue_chooser(parent=None) -> None:
 
 SECURE_PATH = _build_path("secure.txt")
 QUERIES_PATH = _build_path("queries.txt")
-CSV_PROFILES_PATH = _build_path("csv_profiles.json")
+APP_CONFIG_PATH = _build_path("kkr-query2xlsx.json")
+LEGACY_CSV_PROFILES_PATH = _build_path("csv_profiles.json")
 
 SECURE_SAMPLE_PATH = _build_path("secure.sample.json")
 QUERIES_SAMPLE_PATH = _build_path("queries.sample.txt")
@@ -917,6 +966,93 @@ BUILTIN_CSV_PROFILE_NAMES = {p["name"] for p in BUILTIN_CSV_PROFILES}
 
 def is_builtin_csv_profile(name: str) -> bool:
     return name in BUILTIN_CSV_PROFILE_NAMES
+
+
+def load_app_config():
+    def _load_legacy_csv_profiles():
+        if not os.path.exists(LEGACY_CSV_PROFILES_PATH):
+            return None
+
+        try:
+            with open(LEGACY_CSV_PROFILES_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return data or None
+            if isinstance(data, list):
+                return {"profiles": data} if data else None
+        except Exception:  # noqa: BLE001
+            logging.exception("Nie udało się odczytać csv_profiles.json")
+        return None
+
+    if os.path.exists(APP_CONFIG_PATH):
+        try:
+            with open(APP_CONFIG_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            cfg = data if isinstance(data, dict) else {}
+        except Exception:  # noqa: BLE001
+            logging.exception("Nie udało się odczytać kkr-query2xlsx.json")
+            return {}
+
+        csv_section = cfg.get("csv")
+        if not isinstance(csv_section, dict) or not csv_section:
+            legacy_csv = _load_legacy_csv_profiles()
+            if legacy_csv:
+                cfg["csv"] = legacy_csv
+        return cfg
+
+    legacy_csv = _load_legacy_csv_profiles()
+    if legacy_csv:
+        return {"csv": legacy_csv}
+
+    return {}
+
+
+def save_app_config(cfg: dict) -> None:
+    if not isinstance(cfg, dict):
+        cfg = {}
+
+    path = APP_CONFIG_PATH
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    tmp_path = f"{path}.tmp"
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, path)
+    finally:
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+
+
+def load_persisted_ui_lang() -> str | None:
+    app_config = load_app_config()
+    ui_lang = _normalize_ui_lang(app_config.get("ui_lang"))
+    if ui_lang:
+        return ui_lang
+
+    legacy_lang = None
+    if os.path.exists(SECURE_PATH):
+        legacy_lang = _normalize_ui_lang(load_connections().get("ui_lang"))
+
+    if legacy_lang:
+        app_config["ui_lang"] = legacy_lang
+        save_app_config(app_config)
+        return legacy_lang
+
+    return None
+
+
+def persist_ui_lang(ui_lang: str) -> None:
+    normalized = _normalize_ui_lang(ui_lang)
+    if not normalized:
+        return
+    app_config = load_app_config()
+    app_config["ui_lang"] = normalized
+    save_app_config(app_config)
 
 
 def shorten_path(path, max_len=80):
@@ -1104,6 +1240,7 @@ def load_connections(path=SECURE_PATH):
 
 def save_connections(store, path=SECURE_PATH):
     normalized = _normalize_connections(store)
+    normalized.pop("ui_lang", None)
     with open(path, "w", encoding="utf-8") as file:
         json.dump(normalized, file, ensure_ascii=False, indent=2)
 
@@ -1391,17 +1528,7 @@ def _sort_csv_profiles_in_place(profiles):
     )
 
 
-def _read_csv_profiles_from_file(path=CSV_PROFILES_PATH):
-    if not os.path.exists(path):
-        return []
-
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except Exception:  # noqa: BLE001
-        logging.exception("Nie udało się odczytać csv_profiles.json")
-        return []
-
+def _read_csv_profiles_from_data(data):
     if isinstance(data, dict) and "profiles" in data:
         profiles = data.get("profiles") or []
     else:
@@ -1410,8 +1537,8 @@ def _read_csv_profiles_from_file(path=CSV_PROFILES_PATH):
     return [p for p in profiles if p.get("name") not in BUILTIN_CSV_PROFILE_NAMES]
 
 
-def get_all_csv_profiles(path=CSV_PROFILES_PATH):
-    user_profiles = _normalize_user_csv_profiles(_read_csv_profiles_from_file(path))
+def get_all_csv_profiles(data):
+    user_profiles = _normalize_user_csv_profiles(_read_csv_profiles_from_data(data))
     return _merge_builtin_and_user_profiles(user_profiles)
 
 
@@ -1437,24 +1564,18 @@ def _normalize_csv_config(data):
     return {"default_profile": default_profile, "profiles": merged_profiles}
 
 
-def load_csv_profiles(path=CSV_PROFILES_PATH):
-    data = {}
-    if os.path.exists(path):
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-        except Exception:  # noqa: BLE001
-            logging.exception("Nie udało się odczytać csv_profiles.json")
-
-    config = _normalize_csv_config(data)
-    config["profiles"] = get_all_csv_profiles(path)
+def load_csv_profiles():
+    app_config = load_app_config()
+    csv_config = app_config.get("csv", {})
+    config = _normalize_csv_config(csv_config)
+    config["profiles"] = get_all_csv_profiles(csv_config)
     if config["default_profile"] not in {p["name"] for p in config["profiles"]}:
         config["default_profile"] = config["profiles"][0]["name"]
 
     return config
 
 
-def save_csv_profiles(config, path=CSV_PROFILES_PATH):
+def save_csv_profiles(config):
     normalized = _normalize_csv_config(config)
     data_to_save = {
         "default_profile": normalized.get("default_profile"),
@@ -1462,17 +1583,17 @@ def save_csv_profiles(config, path=CSV_PROFILES_PATH):
             p for p in normalized.get("profiles", []) if not is_builtin_csv_profile(p.get("name", ""))
         ],
     }
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data_to_save, f, ensure_ascii=False, indent=2)
+    app_config = load_app_config()
+    app_config["csv"] = data_to_save
+    save_app_config(app_config)
 
 
 def remember_last_used_csv_profile(
     profile_name: str,
     current_config: dict,
-    path: str = CSV_PROFILES_PATH,
 ) -> dict:
     """
-    Ustawia profile_name jako default_profile i zapisuje do csv_profiles.json.
+    Ustawia profile_name jako default_profile i zapisuje do kkr-query2xlsx.json.
     Zwraca odświeżoną konfigurację (load_csv_profiles).
     Ma być bezpieczna: jeśli zapis się nie uda, nie przerywa działania eksportu.
     """
@@ -1493,7 +1614,7 @@ def remember_last_used_csv_profile(
     new_config["default_profile"] = profile_name
 
     try:
-        save_csv_profiles(new_config, path=path)
+        save_csv_profiles(new_config)
     except OSError as exc:
         try:
             LOGGER.warning(
@@ -1506,10 +1627,13 @@ def remember_last_used_csv_profile(
         return config
 
     try:
-        return load_csv_profiles(path=path)
+        return load_csv_profiles()
     except Exception as exc:  # noqa: BLE001
         try:
-            LOGGER.warning("Nie udało się ponownie wczytać csv_profiles.json: %s", exc)
+            LOGGER.warning(
+                "Nie udało się ponownie wczytać kkr-query2xlsx.json: %s",
+                exc,
+            )
         except Exception:  # noqa: BLE001
             pass
         return new_config
@@ -2289,27 +2413,69 @@ def _db_type_by_label():
     return {label: key for key, label in labels.items()}
 
 
-def _build_connection_dialog_ui(root, selected_connection_var):
+def connection_name_exists(store, name):
+    return any(conn.get("name") == name for conn in store.get("connections", []))
+
+
+def generate_unique_connection_name(store, base):
+    if not base:
+        return ""
+    if not connection_name_exists(store, base):
+        return base
+    counter = 2
+    while True:
+        candidate = f"{base} {counter}"
+        if not connection_name_exists(store, candidate):
+            return candidate
+        counter += 1
+
+
+def _reset_connection_details(conn_type, vars_by_type):
+    if conn_type == "mssql_odbc":
+        vars_by_type["driver"].set("ODBC Driver 17 for SQL Server")
+        vars_by_type["server"].set("")
+        vars_by_type["database"].set("")
+        vars_by_type["username"].set("")
+        vars_by_type["password"].set("")
+        vars_by_type["trusted"].set(False)
+        vars_by_type["encrypt"].set(True)
+        vars_by_type["trust_cert"].set(True)
+    elif conn_type == "postgresql":
+        vars_by_type["host"].set("localhost")
+        vars_by_type["port"].set("5432")
+        vars_by_type["database"].set("")
+        vars_by_type["user"].set("")
+        vars_by_type["password"].set("")
+    elif conn_type == "mysql":
+        vars_by_type["host"].set("localhost")
+        vars_by_type["port"].set("3306")
+        vars_by_type["database"].set("")
+        vars_by_type["user"].set("")
+        vars_by_type["password"].set("")
+    elif conn_type == "sqlite":
+        vars_by_type["path"].set("")
+
+
+def _build_connection_dialog_ui(root):
     dlg = tk.Toplevel(root)
-    dlg.title(t("TITLE_CONN_DIALOG"))
+    dlg.title("")
     dlg.transient(root)
     dlg.grab_set()
 
     for idx in range(4):
         dlg.columnconfigure(idx, weight=1)
 
-    tk.Label(
+    hint_label = tk.Label(
         dlg,
-        text=(
-            t("CONN_DIALOG_HINT")
-        ),
+        text="",
         justify="left",
-    ).grid(row=0, column=0, columnspan=4, sticky="w", padx=10, pady=(10, 0))
+    )
+    hint_label.grid(row=0, column=0, columnspan=4, sticky="w", padx=10, pady=(10, 0))
 
     tk.Label(dlg, text=t("LBL_CONN_NAME")).grid(
         row=1, column=0, sticky="w", padx=10, pady=(10, 0)
     )
-    name_var = tk.StringVar(value=selected_connection_var.get())
+    name_var = tk.StringVar(value="")
     tk.Entry(dlg, textvariable=name_var, width=40).grid(
         row=1, column=1, columnspan=3, sticky="we", padx=10, pady=(10, 0)
     )
@@ -2354,7 +2520,7 @@ def _build_connection_dialog_ui(root, selected_connection_var):
     type_var.trace_add("write", show_type_frame)
     type_label_var.trace_add("write", update_type_from_label)
 
-    return dlg, name_var, type_var, type_label_var, type_sections, show_type_frame
+    return dlg, name_var, type_var, type_label_var, type_sections, show_type_frame, hint_label
 
 
 def _load_existing_connection(
@@ -2363,10 +2529,10 @@ def _load_existing_connection(
     type_label_var,
     type_sections,
     show_type_frame,
-    selected_connection_var,
+    connection_name,
     get_connection_by_name,
 ):
-    existing = get_connection_by_name(selected_connection_var.get())
+    existing = get_connection_by_name(connection_name)
     if not existing:
         return
     name_var.set(existing.get("name", ""))
@@ -2414,16 +2580,40 @@ def _build_and_test_connection_entry(
     return new_entry
 
 
-def _replace_or_append_connection(connections_state, new_entry):
+def _validate_connection_name(name, mode, store, original_name=None):
+    if not name:
+        messagebox.showerror(t("ERR_DATA_TITLE"), t("ERR_CONN_NAME_REQUIRED"))
+        return False
+    if mode == "edit":
+        if name != (original_name or "") and connection_name_exists(store, name):
+            messagebox.showerror(t("ERR_DATA_TITLE"), t("ERR_CONN_NAME_EXISTS"))
+            return False
+    elif connection_name_exists(store, name):
+        messagebox.showerror(t("ERR_DATA_TITLE"), t("ERR_CONN_NAME_EXISTS"))
+        return False
+    return True
+
+
+def _replace_or_append_connection(connections_state, new_entry, original_name=None, allow_replace=True):
     replaced = False
-    for idx, c in enumerate(connections_state["store"].get("connections", [])):
-        if c.get("name") == new_entry.get("name"):
-            connections_state["store"]["connections"][idx] = new_entry
-            replaced = True
-            break
+    connections = connections_state["store"].setdefault("connections", [])
+    if allow_replace:
+        target_name = original_name or new_entry.get("name")
+        for idx, c in enumerate(connections):
+            if c.get("name") == target_name:
+                connections[idx] = new_entry
+                replaced = True
+                break
+
+    if allow_replace and not replaced:
+        for idx, c in enumerate(connections):
+            if c.get("name") == new_entry.get("name"):
+                connections[idx] = new_entry
+                replaced = True
+                break
 
     if not replaced:
-        connections_state["store"].setdefault("connections", []).append(new_entry)
+        connections.append(new_entry)
 
 
 def _save_connection_without_test(
@@ -2431,13 +2621,14 @@ def _save_connection_without_test(
     type_var,
     type_sections,
     connections_state,
+    mode,
+    original_name,
     set_selected_connection,
     persist_connections,
     refresh_connection_combobox,
 ):
     name = name_var.get().strip()
-    if not name:
-        messagebox.showerror(t("ERR_DATA_TITLE"), t("ERR_CONN_NAME_REQUIRED"))
+    if not _validate_connection_name(name, mode, connections_state["store"], original_name):
         return False
 
     conn_type = type_var.get()
@@ -2450,7 +2641,12 @@ def _save_connection_without_test(
     if not new_entry:
         return False
 
-    _replace_or_append_connection(connections_state, new_entry)
+    _replace_or_append_connection(
+        connections_state,
+        new_entry,
+        original_name=original_name,
+        allow_replace=(mode == "edit"),
+    )
 
     set_selected_connection(name)
     persist_connections()
@@ -2468,6 +2664,8 @@ def _save_connection_from_dialog(
     type_var,
     type_sections,
     connections_state,
+    mode,
+    original_name,
     set_selected_connection,
     persist_connections,
     refresh_connection_combobox,
@@ -2476,8 +2674,7 @@ def _save_connection_from_dialog(
     create_engine_from_entry,
 ):
     name = name_var.get().strip()
-    if not name:
-        messagebox.showerror(t("ERR_DATA_TITLE"), t("ERR_CONN_NAME_REQUIRED"))
+    if not _validate_connection_name(name, mode, connections_state["store"], original_name):
         return False
 
     new_entry = _build_and_test_connection_entry(
@@ -2486,7 +2683,12 @@ def _save_connection_from_dialog(
     if not new_entry:
         return False
 
-    _replace_or_append_connection(connections_state, new_entry)
+    _replace_or_append_connection(
+        connections_state,
+        new_entry,
+        original_name=original_name,
+        allow_replace=(mode == "edit"),
+    )
 
     set_selected_connection(name)
     persist_connections()
@@ -2506,7 +2708,13 @@ def open_connection_dialog_gui(
     apply_selected_connection,
     handle_db_driver_error,
     create_engine_from_entry,
+    mode="edit",
+    source_name=None,
 ):
+    if mode in ("edit", "duplicate") and not (source_name or selected_connection_var.get()):
+        messagebox.showerror(t("ERR_NO_CONNECTION_TITLE"), t("ERR_NO_CONNECTION_BODY"))
+        return
+
     (
         dlg,
         name_var,
@@ -2514,17 +2722,71 @@ def open_connection_dialog_gui(
         type_label_var,
         type_sections,
         show_type_frame,
-    ) = _build_connection_dialog_ui(root, selected_connection_var)
+        hint_label,
+    ) = _build_connection_dialog_ui(root)
 
-    _load_existing_connection(
-        name_var,
-        type_var,
-        type_label_var,
-        type_sections,
-        show_type_frame,
-        selected_connection_var,
-        get_connection_by_name,
-    )
+    original_name = None
+    active_name = source_name or selected_connection_var.get()
+    if mode in ("edit", "duplicate") and active_name:
+        _load_existing_connection(
+            name_var,
+            type_var,
+            type_label_var,
+            type_sections,
+            show_type_frame,
+            active_name,
+            get_connection_by_name,
+        )
+        original_name = active_name
+
+    name_edit_tracking = {"enabled": True}
+    name_edited = {"value": False}
+
+    def set_name_value(value):
+        name_edit_tracking["enabled"] = False
+        name_var.set(value)
+        name_edit_tracking["enabled"] = True
+
+    def update_dialog_copy():
+        if mode == "edit":
+            current_name = name_var.get().strip() or (original_name or "")
+            dlg.title(t("TITLE_CONN_DIALOG_EDIT", name=current_name))
+            hint_label.config(text=t("CONN_DIALOG_HINT_EDIT", name=current_name))
+        elif mode == "duplicate":
+            dlg.title(t("TITLE_CONN_DIALOG_DUPLICATE", name=original_name or ""))
+            hint_label.config(text=t("CONN_DIALOG_HINT_DUPLICATE", name=original_name or ""))
+        else:
+            dlg.title(t("TITLE_CONN_DIALOG_NEW"))
+            hint_label.config(text=t("CONN_DIALOG_HINT_NEW"))
+
+    def on_name_change(*_):  # noqa: ANN001
+        if name_edit_tracking["enabled"]:
+            name_edited["value"] = True
+            if mode == "edit":
+                update_dialog_copy()
+
+    name_var.trace_add("write", on_name_change)
+
+    if mode == "duplicate" and original_name:
+        duplicate_base = f"{original_name} {t('CONN_DUPLICATE_SUFFIX')}"
+        set_name_value(generate_unique_connection_name(connections_state["store"], duplicate_base))
+
+    if mode == "new":
+        name_edited["value"] = False
+
+    update_dialog_copy()
+
+    if mode == "new":
+        def on_type_change(*_):  # noqa: ANN001
+            conn_type = type_var.get()
+            section = type_sections.get(conn_type)
+            if section:
+                _reset_connection_details(conn_type, section[1])
+            if not name_edited["value"]:
+                set_name_value("")
+
+        type_var.trace_add("write", on_type_change)
+        on_type_change()
 
     def on_save(*_):
         saved = _save_connection_from_dialog(
@@ -2532,6 +2794,8 @@ def open_connection_dialog_gui(
             type_var,
             type_sections,
             connections_state,
+            mode,
+            original_name,
             set_selected_connection,
             persist_connections,
             refresh_connection_combobox,
@@ -2548,6 +2812,8 @@ def open_connection_dialog_gui(
             type_var,
             type_sections,
             connections_state,
+            mode,
+            original_name,
             set_selected_connection,
             persist_connections,
             refresh_connection_combobox,
@@ -2560,6 +2826,31 @@ def open_connection_dialog_gui(
 
     button_frame = tk.Frame(dlg)
     button_frame.grid(row=7, column=0, columnspan=4, pady=10)
+
+    if mode == "edit":
+        def on_duplicate(*_):  # noqa: ANN001
+            dlg.destroy()
+            open_connection_dialog_gui(
+                root,
+                connections_state,
+                selected_connection_var,
+                get_connection_by_name,
+                set_selected_connection,
+                persist_connections,
+                refresh_connection_combobox,
+                apply_selected_connection,
+                handle_db_driver_error,
+                create_engine_from_entry,
+                mode="duplicate",
+                source_name=original_name,
+            )
+
+        tk.Button(
+            button_frame,
+            text=t("BTN_DUPLICATE_CONNECTION"),
+            command=on_duplicate,
+            width=14,
+        ).pack(side="left", padx=(0, 5))
 
     tk.Button(button_frame, text=t("BTN_SAVE"), command=on_save, width=14).pack(
         side="left", padx=(0, 5)
@@ -3251,13 +3542,12 @@ def run_gui(connection_store, output_directory):
         "store": connection_store or {
             "connections": [],
             "last_selected": None,
-            "ui_lang": None,
         },
         "combobox": None,
     }
 
     root = tk.Tk()
-    root.title(t("APP_TITLE_FULL"))
+    root.title(f"{t('APP_TITLE_FULL')} {get_app_version_label()}")
 
     selected_sql_path_full = tk.StringVar(value="")
     sql_label_var = tk.StringVar(value="")
@@ -3276,7 +3566,7 @@ def run_gui(connection_store, output_directory):
         value=connections_state["store"].get("last_selected") or ""
     )
     lang_var = tk.StringVar(
-        value=(connections_state["store"].get("ui_lang") or _CURRENT_LANG).upper()
+        value=_CURRENT_LANG.upper()
     )
 
     # Template-related state (GUI only; console mode has no template support)
@@ -4259,9 +4549,9 @@ def run_gui(connection_store, output_directory):
     lang_combo.grid(row=1, column=1, sticky="w", padx=(5, 0), pady=(5, 0))
     i18n_widgets["lang_combo"] = lang_combo
 
-    btn_add_edit = tk.Button(
+    btn_edit_connection = tk.Button(
         connection_controls,
-        text=t("BTN_ADD_EDIT_CONNECTION"),
+        text=t("BTN_EDIT_CONNECTION"),
         command=lambda: open_connection_dialog_gui(
             root,
             connections_state,
@@ -4273,17 +4563,38 @@ def run_gui(connection_store, output_directory):
             apply_selected_connection,
             handle_db_driver_error,
             create_engine_from_entry,
+            mode="edit",
         ),
     )
-    btn_add_edit.grid(row=0, column=2, padx=(10, 0), sticky="e")
-    i18n_widgets["btn_add_edit"] = btn_add_edit
+    btn_edit_connection.grid(row=0, column=2, padx=(10, 0), sticky="e")
+    i18n_widgets["btn_edit_connection"] = btn_edit_connection
+
+    btn_new_connection = tk.Button(
+        connection_controls,
+        text=t("BTN_NEW_CONNECTION"),
+        command=lambda: open_connection_dialog_gui(
+            root,
+            connections_state,
+            selected_connection_var,
+            get_connection_by_name,
+            set_selected_connection,
+            persist_connections,
+            refresh_connection_combobox,
+            apply_selected_connection,
+            handle_db_driver_error,
+            create_engine_from_entry,
+            mode="new",
+        ),
+    )
+    btn_new_connection.grid(row=0, column=3, padx=(10, 0), sticky="e")
+    i18n_widgets["btn_new_connection"] = btn_new_connection
 
     btn_test_connection = tk.Button(
         connection_controls,
         text=t("BTN_TEST_CONNECTION"),
         command=test_connection_only,
     )
-    btn_test_connection.grid(row=0, column=3, padx=(10, 0), sticky="e")
+    btn_test_connection.grid(row=0, column=4, padx=(10, 0), sticky="e")
     i18n_widgets["btn_test_connection"] = btn_test_connection
 
     btn_delete_connection = tk.Button(
@@ -4291,7 +4602,7 @@ def run_gui(connection_store, output_directory):
         text=t("BTN_DELETE_CONNECTION"),
         command=delete_selected_connection,
     )
-    btn_delete_connection.grid(row=0, column=4, padx=(10, 0), sticky="e")
+    btn_delete_connection.grid(row=0, column=5, padx=(10, 0), sticky="e")
     i18n_widgets["btn_delete_connection"] = btn_delete_connection
 
     secure_edit_btn = tk.Button(
@@ -4299,7 +4610,7 @@ def run_gui(connection_store, output_directory):
         text=t("BTN_EDIT_SECURE"),
         command=open_secure_editor,
     )
-    secure_edit_btn.grid(row=0, column=5, padx=(10, 0), sticky="e")
+    secure_edit_btn.grid(row=0, column=6, padx=(10, 0), sticky="e")
     secure_edit_state["button"] = secure_edit_btn
     i18n_widgets["secure_edit_btn"] = secure_edit_btn
 
@@ -4528,7 +4839,7 @@ def run_gui(connection_store, output_directory):
     btn_open_folder.config(state=tk.DISABLED)
 
     def apply_i18n():
-        root.title(t("APP_TITLE_FULL"))
+        root.title(f"{t('APP_TITLE_FULL')} {get_app_version_label()}")
         connection_frame.config(text=t("FRAME_DB_CONNECTION"))
         source_frame.config(text=t("FRAME_SQL_SOURCE"))
         format_frame.config(text=t("FRAME_OUTPUT_FORMAT"))
@@ -4536,7 +4847,8 @@ def run_gui(connection_store, output_directory):
         result_frame.config(text=t("FRAME_RESULTS"))
         lbl_connection.config(text=t("LBL_CONNECTION"))
         lbl_language.config(text=t("LBL_LANGUAGE"))
-        btn_add_edit.config(text=t("BTN_ADD_EDIT_CONNECTION"))
+        btn_edit_connection.config(text=t("BTN_EDIT_CONNECTION"))
+        btn_new_connection.config(text=t("BTN_NEW_CONNECTION"))
         btn_test_connection.config(text=t("BTN_TEST_CONNECTION"))
         btn_delete_connection.config(text=t("BTN_DELETE_CONNECTION"))
         secure_edit_btn.config(text=t("BTN_EDIT_SECURE"))
@@ -4575,10 +4887,8 @@ def run_gui(connection_store, output_directory):
     def on_lang_change(_event=None):  # noqa: ANN001
         selected = (lang_var.get() or "").lower()
         set_lang(selected)
-        connections_state["store"]["ui_lang"] = selected
+        persist_ui_lang(selected)
         apply_i18n()
-        if os.path.exists(SECURE_PATH):
-            persist_connections()
 
     lang_combo.bind("<<ComboboxSelected>>", on_lang_change)
 
@@ -4597,8 +4907,9 @@ if __name__ == "__main__":
     lang_for_cli = pre_args.lang
     if lang_for_cli:
         set_lang(lang_for_cli)
-    elif os.path.exists(SECURE_PATH):
-        stored_lang = load_connections().get("ui_lang")
+        persist_ui_lang(lang_for_cli)
+    else:
+        stored_lang = load_persisted_ui_lang()
         if stored_lang:
             set_lang(stored_lang)
 
@@ -4618,11 +4929,12 @@ if __name__ == "__main__":
             pass
 
     connection_store = load_connections()
+    connection_store.pop("ui_lang", None)
     if args.lang:
         set_lang(args.lang)
-        connection_store["ui_lang"] = args.lang
+        persist_ui_lang(args.lang)
     else:
-        stored_lang = connection_store.get("ui_lang")
+        stored_lang = load_persisted_ui_lang()
         if stored_lang:
             set_lang(stored_lang)
     selected_name = connection_store.get("last_selected")

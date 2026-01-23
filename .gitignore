@@ -1,22 +1,37 @@
-# --- Secrets & local config ---
+# --- Secrets & local config (never commit) ---
 secure.txt
 queries.txt
 csv_profiles.json
+kkr-query2xlsx.json
+
+# --- User workspace (never commit) ---
+queries/*
+!queries/.gitkeep
+
+templates/*
+!templates/.gitkeep
+
+data/
+db/
 
 # --- Generated output ---
 generated_reports/
 logs/
 
-# --- Databases ---
+# --- PyInstaller ---
+build/
+dist/
+*.spec
+
+# --- Databases (user), but keep demo in repo ---
 *.db
 *.sqlite
 *.sqlite3
+!examples/db/demo.sqlite
 
 # --- Python ---
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
+*.py[cod]
 .env
 .venv
 venv/
@@ -26,6 +41,3 @@ venv/
 Thumbs.db
 .idea/
 .vscode/
-
-# Keep the demo database in the repo
-!examples/db/demo.sqlite
