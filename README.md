@@ -1,3 +1,7 @@
+<p align="center">
+  <img src=".github/assets/logo.png" width="800" alt="kkr-query2xlsx logo">
+</p>
+
 # kkr-query2xlsx
 
 Run **SQL queries from `.sql` files** and export results to **Excel (XLSX)** or **CSV** — either with a simple **GUI (Tkinter)** or from the **CLI**.
@@ -10,6 +14,15 @@ If you ever:
 …this project is for you.
 
 ![GUI](docs/gui.png)
+
+---
+
+## Beta testers wanted (20-30 people)
+
+- I’m looking for 20-30 beta testers (active: bugs + questions + UX feedback)
+- Try the demo SQLite + export XLSX/CSV on your OS
+- Report issues/ideas here: https://github.com/kkrysztofczyk/kkr-query2xlsx/issues/new/choose
+- Reminder: don’t paste secrets/PII/production SQL
 
 ---
 
@@ -66,9 +79,10 @@ You have **two options**:
 ## Option 1 — Download the Windows app (no Python)
 
 1. Open **Releases**: https://github.com/kkrysztofczyk/kkr-query2xlsx/releases  
-2. Download the latest file: `kkr-query2sheet-vX.Y.Z-windows.zip`
+2. Download the latest file: `kkr-query2xlsx-vX.Y.Z-windows.zip`
 3. **Unzip** it (important: don’t run the exe from inside the zip)
-4. Run: `kkr-query2sheet\kkr-query2sheet.exe`
+4. Run: `kkr-query2xlsx\kkr-query2xlsx.exe`
+5. If Releases page is empty (no assets yet), use Option 2 (run from source).
 
 That’s it — no Python installation required.
 
