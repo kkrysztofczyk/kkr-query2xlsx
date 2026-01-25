@@ -28,13 +28,57 @@ from openpyxl.utils import coordinate_to_tuple
 
 
 def _get_base_dir() -> str:
-    # When frozen (PyInstaller), keep local files next to the .exe
+    """Return the directory that should be treated as the app "home".
+
+    - source run: folder with main.pyw
+    - PyInstaller (onedir/onefile): folder with the .exe
+    """
     if getattr(sys, "frozen", False):
         return os.path.dirname(sys.executable)
     return os.path.dirname(os.path.abspath(__file__))
 
 
 BASE_DIR = _get_base_dir()
+
+
+_APP_ICON_PHOTO = None  # keep a reference to avoid GC in Tk
+
+
+def apply_app_icon(win) -> None:
+    """Best-effort: set window icon from docs/ (no crash if missing)."""
+    global _APP_ICON_PHOTO
+    docs_dir = Path(BASE_DIR) / "docs"
+
+    ico_candidates = [
+        docs_dir / "kkr-query2xlsx.ico",
+        docs_dir / "icon.ico",
+        docs_dir / "app.ico",
+    ]
+    png_candidates = [
+        docs_dir / "kkr-query2xlsx-icon-256.png",
+        docs_dir / "kkr-query2xlsx-icon-512.png",
+        docs_dir / "icon.png",
+        docs_dir / "app.png",
+    ]
+
+    ico_path = next((p for p in ico_candidates if p.exists()), None)
+    png_path = next((p for p in png_candidates if p.exists()), None)
+
+    # Windows: .ico is the most reliable
+    try:
+        if sys.platform == "win32" and ico_path:
+            win.iconbitmap(str(ico_path))
+    except Exception:
+        pass
+
+    # Cross-platform fallback: .png via iconphoto
+    try:
+        if png_path:
+            if _APP_ICON_PHOTO is None:
+                _APP_ICON_PHOTO = tk.PhotoImage(file=str(png_path))
+            win.iconphoto(True, _APP_ICON_PHOTO)
+    except Exception:
+        pass
 
 # --- App version -------------------------------------------------------------
 
@@ -2459,6 +2503,7 @@ def _reset_connection_details(conn_type, vars_by_type):
 
 def _build_connection_dialog_ui(root):
     dlg = tk.Toplevel(root)
+    apply_app_icon(dlg)
     dlg.title("")
     dlg.transient(root)
     dlg.grab_set()
@@ -3162,6 +3207,7 @@ def _build_csv_profile_form_ui(form_frame, form_vars, field_help):
 
 def _create_csv_profiles_dialog(root, csv_profile_state):
     dlg = tk.Toplevel(root)
+    apply_app_icon(dlg)
     dlg.title(t("CSV_PROFILE_DIALOG_TITLE"))
     dlg.transient(root)
     dlg.grab_set()
@@ -3549,6 +3595,7 @@ def run_gui(connection_store, output_directory):
 
     root = tk.Tk()
     root.title(f"{t('APP_TITLE_FULL')} {get_app_version_label()}")
+    apply_app_icon(root)
 
     selected_sql_path_full = tk.StringVar(value="")
     sql_label_var = tk.StringVar(value="")
@@ -3705,6 +3752,7 @@ def run_gui(connection_store, output_directory):
 
     def show_error_popup(ui_msg):
         popup = tk.Toplevel(root)
+        apply_app_icon(popup)
         popup.title(t("ERR_QUERY_TITLE"))
         popup.transient(root)
         popup.attributes("-topmost", True)
@@ -3795,6 +3843,7 @@ def run_gui(connection_store, output_directory):
 
     def open_secure_editor():
         dlg = tk.Toplevel(root)
+        apply_app_icon(dlg)
         dlg.title(t("TITLE_EDIT_SECURE"))
         dlg.transient(root)
         dlg.grab_set()
@@ -3967,6 +4016,7 @@ def run_gui(connection_store, output_directory):
 
     def open_queries_manager():
         dlg = tk.Toplevel(root)
+        apply_app_icon(dlg)
         dlg.title(t("TITLE_EDIT_QUERIES"))
         dlg.transient(root)
         dlg.grab_set()
@@ -4222,6 +4272,7 @@ def run_gui(connection_store, output_directory):
             return
 
         dlg = tk.Toplevel(root)
+        apply_app_icon(dlg)
         dlg.title(t("TITLE_SELECT_REPORT"))
 
         dlg.transient(root)
@@ -4899,8 +4950,14 @@ def run_gui(connection_store, output_directory):
 
 
 if __name__ == "__main__":
-    output_directory = r"generated_reports"
-    ensure_directories([output_directory, "templates", "queries"])
+    output_directory = _build_path("generated_reports")
+    ensure_directories(
+        [
+            output_directory,
+            _build_path("templates"),
+            _build_path("queries"),
+        ]
+    )
 
     pre_parser = argparse.ArgumentParser(add_help=False)
     pre_parser.add_argument("--lang", choices=["en", "pl"])

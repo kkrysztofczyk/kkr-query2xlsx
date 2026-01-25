@@ -6,7 +6,7 @@ body:
   - type: markdown
     attributes:
       value: |
-        ⚠️ Do not paste passwords, tokens, connection strings, hostnames, personal data, or production SQL.
+        ⚠️ Do not paste passwords, tokens, connection strings, hostnames, PII, or production SQL.
         Describe the use case and the expected outcome.
         If English is hard, write in your language - we'll translate.
 
@@ -31,3 +31,11 @@ body:
       label: Context (optional)
     validations:
       required: false
+
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Data safety
+      options:
+        - label: I confirm that I did not paste any secrets or sensitive data.
+          required: true
