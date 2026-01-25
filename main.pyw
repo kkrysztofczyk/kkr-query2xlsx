@@ -16,7 +16,7 @@ from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog
 from tkinter import ttk
-from urllib.parse import quote_plus, urlencode
+from urllib.parse import quote_plus
 
 from logging.handlers import RotatingFileHandler
 
@@ -32,6 +32,10 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # --- App version -------------------------------------------------------------
 
 APP_VERSION = "0.3.2"  # bump manually for releases
+
+GITHUB_ISSUE_CHOOSER_URL = (
+    "https://github.com/kkrysztofczyk/kkr-query2xlsx/issues/new/choose"
+)
 
 
 def _get_git_short_sha() -> str | None:
@@ -58,16 +62,6 @@ def get_app_version_label() -> str:
     if sha:
         return f"v{APP_VERSION} / {sha}"
     return f"v{APP_VERSION}"
-
-
-def build_bug_report_url() -> str:
-    base = "https://github.com/kkrysztofczyk/kkr-query2xlsx/issues/new"
-    params = {
-        "template": "bug_report.yml",
-        "title": "[BUG] ",
-        "app_version": get_app_version_label(),
-    }
-    return f"{base}?{urlencode(params)}"
 
 
 # =========================
@@ -118,7 +112,7 @@ I18N: dict[str, dict[str, str]] = {
             "is not installed. Install the missing library and try again."
         ),
         "MSG_UI_TRUNCATED": (
-            "...\n(Trimmed in UI, full details in kkr_query2sheet.log)"
+            "...\n(Trimmed in UI, full details in kkr-query2xlsx.log)"
         ),
         "CONSOLE_AVAILABLE_FILES": "Available SQL query files:",
         "CONSOLE_CUSTOM_PATH": "0: [Custom path]",
@@ -348,7 +342,7 @@ I18N: dict[str, dict[str, str]] = {
         ),
         "ERR_DB_MESSAGE": "Database message (excerpt):",
         "ERR_SQL_PREVIEW": "SQL (start):",
-        "ERR_FULL_LOG": "Full error saved in kkr_query2sheet.log",
+        "ERR_FULL_LOG": "Full error saved in kkr-query2xlsx.log",
         "ERR_HINT_LABEL": "Hint:",
         "DB_TYPE_MSSQL": "SQL Server (ODBC)",
         "DB_TYPE_PG": "PostgreSQL",
@@ -495,7 +489,7 @@ I18N: dict[str, dict[str, str]] = {
             "nie jest zainstalowana. Zainstaluj brakującą bibliotekę i spróbuj ponownie."
         ),
         "MSG_UI_TRUNCATED": (
-            "...\n(Przycięto w UI, pełna treść w kkr_query2sheet.log)"
+            "...\n(Przycięto w UI, pełna treść w kkr-query2xlsx.log)"
         ),
         "CONSOLE_AVAILABLE_FILES": "Dostępne pliki zapytań SQL:",
         "CONSOLE_CUSTOM_PATH": "0: [Własna ścieżka]",
@@ -723,7 +717,7 @@ I18N: dict[str, dict[str, str]] = {
         ),
         "ERR_DB_MESSAGE": "Komunikat bazy (fragment):",
         "ERR_SQL_PREVIEW": "SQL (początek):",
-        "ERR_FULL_LOG": "Pełny błąd zapisany w pliku kkr_query2sheet.log",
+        "ERR_FULL_LOG": "Pełny błąd zapisany w pliku kkr-query2xlsx.log",
         "ERR_HINT_LABEL": "Podpowiedź:",
         "DB_TYPE_MSSQL": "SQL Server (ODBC)",
         "DB_TYPE_PG": "PostgreSQL",
@@ -898,7 +892,7 @@ def _center_window(win, parent=None):
 
 
 def open_github_issue_chooser(parent=None) -> None:
-    url = build_bug_report_url()
+    url = GITHUB_ISSUE_CHOOSER_URL
     try:
         ok = webbrowser.open_new_tab(url)
         if not ok and parent is not None:
@@ -1325,18 +1319,18 @@ DEFAULT_CSV_PROFILE = {
 
 def _setup_logger():
     """
-    Prosty globalny logger zapisujący błędy do pliku logs/kkr_query2sheet.log.
+    Prosty globalny logger zapisujący błędy do pliku logs/kkr-query2xlsx.log.
     Log ma rotację (ok. 1 MB na plik, 3 backupy).
     """
     log_dir = os.path.join(BASE_DIR, "logs")
     os.makedirs(log_dir, exist_ok=True)
 
-    logger = logging.getLogger("kkr_query2sheet")
+    logger = logging.getLogger("kkr-query2xlsx")
     logger.setLevel(logging.INFO)
 
     # Nie dodawaj handlerów ponownie przy imporcie
     if not logger.handlers:
-        log_path = os.path.join(log_dir, "kkr_query2sheet.log")
+        log_path = os.path.join(log_dir, "kkr-query2xlsx.log")
         handler = RotatingFileHandler(
             log_path,
             maxBytes=1_000_000,

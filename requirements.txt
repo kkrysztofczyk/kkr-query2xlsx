@@ -1,7 +1,10 @@
-pandas>=2.0
+# Core
+pandas>=2.0,<3.0
 SQLAlchemy>=2.0
 openpyxl>=3.1
 
-# Optional drivers (install if you need them):
+# DB drivers (so MySQL/Postgres/MSSQL work after single install)
 pyodbc>=5.0
 psycopg2-binary>=2.9
+PyMySQL>=1.1
+cryptography>=41.0.0

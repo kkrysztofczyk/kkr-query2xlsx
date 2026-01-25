@@ -40,9 +40,6 @@ It also includes quality-of-life features like:
 - exporting into an existing XLSX template (GUI),
 - a demo SQLite database + example queries (so you can try it immediately).
 
-> Note on naming: the Windows executable is currently called **`kkr-query2sheet.exe`** (legacy name),
-> while the repo is **kkr-query2xlsx**. Functionality is the same.
-
 ---
 
 ## When is it a good fit?
