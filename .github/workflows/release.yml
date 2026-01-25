@@ -30,9 +30,27 @@ jobs:
         run: |
           pyinstaller --onedir --windowed --name kkr-query2xlsx --noupx main.pyw
 
-      - name: Package
+      - name: Package (portable bundle with examples + samples)
         run: |
-          powershell Compress-Archive -Path dist\kkr-query2xlsx -DestinationPath kkr-query2xlsx-${{ github.ref_name }}-windows.zip
+          $bundleRoot = "bundle\\kkr-query2xlsx"
+          New-Item -ItemType Directory -Force -Path $bundleRoot | Out-Null
+
+          # App binaries (PyInstaller onedir output)
+          Copy-Item -Recurse -Force "dist\\kkr-query2xlsx\\*" $bundleRoot
+
+          # Starter files described in README (first run bootstrap)
+          $extraFiles = @("README.md","LICENSE","secure.sample.json","queries.sample.txt")
+          foreach ($f in $extraFiles) {
+            if (Test-Path $f) { Copy-Item -Force $f $bundleRoot }
+          }
+
+          # Demo + examples (so Quickstart works)
+          $extraDirs = @("examples","templates","queries","docs")
+          foreach ($d in $extraDirs) {
+            if (Test-Path $d) { Copy-Item -Recurse -Force $d $bundleRoot }
+          }
+
+          Compress-Archive -Path "bundle\\kkr-query2xlsx" -DestinationPath "kkr-query2xlsx-${{ github.ref_name }}-windows.zip"
 
       - name: Upload to GitHub Release
         uses: softprops/action-gh-release@v2

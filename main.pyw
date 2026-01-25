@@ -27,7 +27,14 @@ from openpyxl import load_workbook
 from openpyxl.utils import coordinate_to_tuple
 
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+def _get_base_dir() -> str:
+    # When frozen (PyInstaller), keep local files next to the .exe
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+BASE_DIR = _get_base_dir()
 
 # --- App version -------------------------------------------------------------
 

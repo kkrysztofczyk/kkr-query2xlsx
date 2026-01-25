@@ -131,7 +131,7 @@ If enabled, the app:
 ## Where are my files?
 
 - Exports: `generated_reports/`
-- Logs: `logs/kkr_query2sheet.log` (rotating)
+- Logs: `logs/kkr-query2xlsx.log` (rotating)
 
 ---
 
