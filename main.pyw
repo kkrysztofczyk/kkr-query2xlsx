@@ -82,7 +82,7 @@ def apply_app_icon(win) -> None:
 
 # --- App version -------------------------------------------------------------
 
-APP_VERSION = "0.3.3"  # bump manually for releases
+APP_VERSION = "0.3.4"  # bump manually for releases
 
 GITHUB_ISSUE_CHOOSER_URL = (
     "https://github.com/kkrysztofczyk/kkr-query2xlsx/issues/new/choose"
