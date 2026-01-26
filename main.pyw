@@ -115,6 +115,29 @@ def get_app_version_label() -> str:
     return f"v{APP_VERSION}"
 
 
+def odbc_diagnostics_text() -> str:
+    bits = "64-bit" if sys.maxsize > 2**32 else "32-bit"
+    lines = [
+        f"exe={sys.executable}",
+        f"python={sys.version.split()[0]} ({bits})",
+        f"platform={sys.platform}",
+    ]
+    try:
+        import pyodbc  # type: ignore
+
+        lines.append("pyodbc=OK")
+        try:
+            drivers = pyodbc.drivers()
+            lines.append(
+                "pyodbc.drivers()=" + (", ".join(drivers) if drivers else "<none>")
+            )
+        except Exception as exc:  # noqa: BLE001
+            lines.append(f"pyodbc.drivers()=FAILED ({type(exc).__name__}: {exc})")
+    except Exception as exc:  # noqa: BLE001
+        lines.append(f"pyodbc=FAILED ({type(exc).__name__}: {exc})")
+    return "\n".join(lines)
+
+
 # =========================
 # I18N (EN as source)
 # =========================
@@ -125,6 +148,7 @@ I18N: dict[str, dict[str, str]] = {
         "BTN_RUN": "Run",
         "BTN_EXPORT": "Export",
         "BTN_BROWSE": "Browse...",
+        "BTN_ODBC_DIAGNOSTICS": "ODBC diagnostics",
         "LBL_SQL_FILE": "SQL file",
         "LBL_DB": "Database",
         "LBL_OUTPUT": "Output",
@@ -143,10 +167,15 @@ I18N: dict[str, dict[str, str]] = {
         ),
         "ERR_ODBC_MISSING_TITLE": "Missing ODBC driver",
         "ERR_ODBC_MISSING_BODY": (
-            "Cannot connect to SQL Server. Required ODBC driver "
-            "('ODBC Driver 17 for SQL Server' or compatible) or the pyodbc "
-            "library is not installed. Install the driver and try again."
+            "Cannot connect to SQL Server.\n\n"
+            "Most common causes:\n"
+            "- ODBC driver is not installed for this app bitness (32/64-bit mismatch)\n"
+            "- pyodbc is missing or failed to load inside the packaged EXE\n\n"
+            "Install Microsoft 'ODBC Driver 17/18 for SQL Server' and try again.\n\n"
+            "Diagnostics:\n{diag}"
         ),
+        "ODBC_DIAGNOSTICS_TITLE": "ODBC diagnostics",
+        "ODBC_DIAGNOSTICS_LABEL": "ODBC diagnostics:",
         "ERR_PG_MISSING_TITLE": "Missing PostgreSQL library",
         "ERR_PG_MISSING_BODY": (
             "Cannot connect to PostgreSQL. Required Python library (e.g. psycopg2) "
@@ -189,6 +218,7 @@ I18N: dict[str, dict[str, str]] = {
         "CONSOLE_SQL_TIME": "Data fetch time (SQL): {seconds:.2f} seconds",
         "CONSOLE_EXPORT_TIME": "Export time ({fmt}): {seconds:.2f} seconds",
         "CONSOLE_TOTAL_TIME": "Total time: {seconds:.2f} seconds",
+        "CLI_DIAG_ODBC_HELP": "Print ODBC diagnostics and exit.",
         "DEFAULT_MSSQL_NAME": "Default MSSQL",
         "FRAME_MSSQL": "MSSQL (ODBC)",
         "LBL_ODBC_DRIVER": "ODBC driver",
@@ -231,6 +261,8 @@ I18N: dict[str, dict[str, str]] = {
         "ERR_CONN_NAME_REQUIRED": "Connection name cannot be empty.",
         "ERR_CONN_NAME_EXISTS": "Connection name already exists. Choose another name.",
         "INFO_CONN_SAVED_TITLE": "Saved",
+        "INFO_CONN_TEST_OK_TITLE": "Connection works",
+        "INFO_CONN_TEST_OK_BODY": "Connection test succeeded.",
         "INFO_CONN_SAVED_BODY": "Connection has been saved.",
         "BTN_SAVE": "Save",
         "BTN_SAVE_NO_TEST": "Save without test",
@@ -502,6 +534,7 @@ I18N: dict[str, dict[str, str]] = {
         "BTN_RUN": "Uruchom",
         "BTN_EXPORT": "Eksportuj",
         "BTN_BROWSE": "Wybierz...",
+        "BTN_ODBC_DIAGNOSTICS": "Diagnostyka ODBC",
         "LBL_SQL_FILE": "Plik SQL",
         "LBL_DB": "Baza danych",
         "LBL_OUTPUT": "Wyjście",
@@ -520,10 +553,15 @@ I18N: dict[str, dict[str, str]] = {
         ),
         "ERR_ODBC_MISSING_TITLE": "Brak sterownika ODBC",
         "ERR_ODBC_MISSING_BODY": (
-            "Nie można połączyć z SQL Server. Wymagany sterownik ODBC "
-            "('ODBC Driver 17 for SQL Server' lub zgodny) lub biblioteka pyodbc "
-            "nie jest zainstalowana. Zainstaluj sterownik i spróbuj ponownie."
+            "Nie można połączyć z SQL Server.\n\n"
+            "Najczęstsze przyczyny:\n"
+            "- sterownik ODBC nie jest zainstalowany dla tej architektury (32/64-bit)\n"
+            "- brak pyodbc albo pyodbc nie może się załadować w EXE\n\n"
+            "Zainstaluj Microsoft 'ODBC Driver 17/18 for SQL Server' i spróbuj ponownie.\n\n"
+            "Diagnostyka:\n{diag}"
         ),
+        "ODBC_DIAGNOSTICS_TITLE": "Diagnostyka ODBC",
+        "ODBC_DIAGNOSTICS_LABEL": "Diagnostyka ODBC:",
         "ERR_PG_MISSING_TITLE": "Brak biblioteki PostgreSQL",
         "ERR_PG_MISSING_BODY": (
             "Nie można połączyć z PostgreSQL. Wymagana biblioteka Pythona (np. psycopg2) "
@@ -566,6 +604,7 @@ I18N: dict[str, dict[str, str]] = {
         "CONSOLE_SQL_TIME": "Czas pobrania danych (SQL): {seconds:.2f} s",
         "CONSOLE_EXPORT_TIME": "Czas eksportu ({fmt}): {seconds:.2f} s",
         "CONSOLE_TOTAL_TIME": "Czas łączny: {seconds:.2f} s",
+        "CLI_DIAG_ODBC_HELP": "Wypisz diagnostykę ODBC i zakończ.",
         "DEFAULT_MSSQL_NAME": "Domyślne MSSQL",
         "FRAME_MSSQL": "MSSQL (ODBC)",
         "LBL_ODBC_DRIVER": "Sterownik ODBC",
@@ -607,6 +646,8 @@ I18N: dict[str, dict[str, str]] = {
         "ERR_CONN_NAME_REQUIRED": "Nazwa połączenia nie może być pusta.",
         "ERR_CONN_NAME_EXISTS": "Nazwa połączenia już istnieje. Wybierz inną nazwę.",
         "INFO_CONN_SAVED_TITLE": "Zapisano",
+        "INFO_CONN_TEST_OK_TITLE": "Połączenie działa",
+        "INFO_CONN_TEST_OK_BODY": "Test połączenia zakończony sukcesem.",
         "INFO_CONN_SAVED_BODY": "Połączenie zostało zapisane.",
         "BTN_SAVE": "Zapisz",
         "BTN_SAVE_NO_TEST": "Zapisz bez testu",
@@ -1470,7 +1511,7 @@ def handle_db_driver_error(exc, db_type, profile_name=None, show_message=None):
             missing_pyodbc = True
 
         if missing_pyodbc or missing_driver:
-            msg = t("ERR_ODBC_MISSING_BODY")
+            msg = t("ERR_ODBC_MISSING_BODY", diag=odbc_diagnostics_text())
             _notify(t("ERR_ODBC_MISSING_TITLE"), msg)
             return True
 
@@ -2298,18 +2339,94 @@ def _create_sqlite_frame(parent):
 
     return frame, {"path": path_var}
 
+def _parse_odbc_connect_string(conn_str: str) -> dict:
+    """
+    Best-effort parser for ODBC connection strings like:
+    DRIVER={ODBC Driver 17 for SQL Server};SERVER=...;DATABASE=...;UID=...;PWD=...;Encrypt=yes;TrustServerCertificate=yes;Trusted_Connection=yes
+    Returns normalized details keys used by the GUI.
+    """
+    raw = (conn_str or "").strip()
+    if not raw:
+        return {}
+
+    parts: dict[str, str] = {}
+    for chunk in raw.split(";"):
+        chunk = chunk.strip()
+        if not chunk or "=" not in chunk:
+            continue
+        k, v = chunk.split("=", 1)
+        k = k.strip().lower()
+        v = v.strip()
+        parts[k] = v
+
+    def _strip_braces(v: str) -> str:
+        v = (v or "").strip()
+        if len(v) >= 2 and v.startswith("{") and v.endswith("}"):
+            return v[1:-1].strip()
+        return v
+
+    def _as_bool(v: str, default: bool) -> bool:
+        if v is None:
+            return default
+        s = str(v).strip().lower()
+        if s in ("yes", "true", "1", "y"):
+            return True
+        if s in ("no", "false", "0", "n"):
+            return False
+        return default
+
+    driver = _strip_braces(parts.get("driver", ""))
+    server = parts.get("server", "") or parts.get("data source", "")
+    database = parts.get("database", "") or parts.get("initial catalog", "")
+    username = parts.get("uid", "") or parts.get("user id", "")
+    password = parts.get("pwd", "") or parts.get("password", "")
+
+    trusted = _as_bool(parts.get("trusted_connection"), False) or _as_bool(
+        parts.get("trusted_connection".replace("_", "")), False
+    )
+    # Some users may have "Integrated Security=SSPI"
+    trusted = trusted or (
+        str(parts.get("integrated security", "")).strip().lower()
+        in ("sspi", "true", "yes", "1")
+    )
+
+    encrypt = _as_bool(parts.get("encrypt"), True)
+    trust_cert = _as_bool(parts.get("trustservercertificate"), True)
+
+    return {
+        "driver": driver,
+        "server": server,
+        "database": database,
+        "username": username,
+        "password": password,
+        "trusted": trusted,
+        "encrypt": encrypt,
+        "trust_server_certificate": trust_cert,
+        "odbc_connect": raw,
+    }
+
 
 def _load_connection_details(conn_type, vars_by_type, details):
     details = details or {}
     if conn_type == "mssql_odbc":
+        # Legacy support: some saved connections only have {"odbc_connect": "..."}
+        if (
+            "odbc_connect" in details
+            and not any(
+                details.get(k)
+                for k in ("driver", "server", "database", "username", "password")
+            )
+        ):
+            details = _parse_odbc_connect_string(details.get("odbc_connect", "")) or details
+
         vars_by_type["driver"].set(details.get("driver", ""))
         vars_by_type["server"].set(details.get("server", ""))
         vars_by_type["database"].set(details.get("database", ""))
         vars_by_type["username"].set(details.get("username", ""))
         vars_by_type["password"].set(details.get("password", ""))
-        vars_by_type["trusted"].set(details.get("trusted", False))
-        vars_by_type["encrypt"].set(details.get("encrypt", True))
-        vars_by_type["trust_cert"].set(details.get("trust_server_certificate", True))
+        vars_by_type["trusted"].set(bool(details.get("trusted", False)))
+        vars_by_type["encrypt"].set(bool(details.get("encrypt", True)))
+        vars_by_type["trust_cert"].set(bool(details.get("trust_server_certificate", True)))
     elif conn_type == "postgresql":
         vars_by_type["host"].set(details.get("host", ""))
         vars_by_type["port"].set(str(details.get("port", "5432")))
@@ -2870,6 +2987,22 @@ def open_connection_dialog_gui(
     def on_cancel(*_):
         dlg.destroy()
 
+    def on_test(*_):
+        name = name_var.get().strip()
+        if not name:
+            messagebox.showerror(t("ERR_DATA_TITLE"), t("ERR_CONN_NAME_REQUIRED"))
+            return
+        conn_type = type_var.get()
+        tested = _build_and_test_connection_entry(
+            name,
+            conn_type,
+            type_sections,
+            create_engine_from_entry,
+            handle_db_driver_error,
+        )
+        if tested:
+            messagebox.showinfo(t("INFO_CONN_TEST_OK_TITLE"), t("INFO_CONN_TEST_OK_BODY"))
+
     button_frame = tk.Frame(dlg)
     button_frame.grid(row=7, column=0, columnspan=4, pady=10)
 
@@ -2897,6 +3030,13 @@ def open_connection_dialog_gui(
             command=on_duplicate,
             width=14,
         ).pack(side="left", padx=(0, 5))
+
+    tk.Button(
+        button_frame,
+        text=t("BTN_TEST_CONNECTION"),
+        command=on_test,
+        width=14,
+    ).pack(side="left", padx=(0, 5))
 
     tk.Button(button_frame, text=t("BTN_SAVE"), command=on_save, width=14).pack(
         side="left", padx=(0, 5)
@@ -3751,44 +3891,252 @@ def run_gui(connection_store, output_directory):
         widget.config(state="disabled")
 
     def show_error_popup(ui_msg):
+        # --- helper: split the rendered error into nicer sections (best-effort) ---
+        def _split_error_ui_msg(msg: str) -> dict:
+            db_lbl = t("ERR_DB_MESSAGE")
+            sql_lbl = t("ERR_SQL_PREVIEW")
+            hint_lbl = t("ERR_HINT_LABEL")
+            full_log_lbl = t("ERR_FULL_LOG")
+
+            first_line = (msg.splitlines()[0] if msg else "").strip()
+
+            def _idx(s: str) -> int:
+                try:
+                    return msg.index(s)
+                except ValueError:
+                    return -1
+
+            db_i = _idx(db_lbl)
+            sql_i = _idx(sql_lbl)
+            hint_i = _idx(hint_lbl)
+            full_log_i = _idx(full_log_lbl)
+
+            db_part = ""
+            sql_part = ""
+            hint_part = ""
+
+            if db_i >= 0:
+                start = db_i + len(db_lbl)
+                end = sql_i if sql_i >= 0 else len(msg)
+                db_part = msg[start:end].strip()
+
+            if sql_i >= 0:
+                start = sql_i + len(sql_lbl)
+                candidates = [i for i in (hint_i, full_log_i) if i >= 0]
+                end = min(candidates) if candidates else len(msg)
+                sql_part = msg[start:end].strip()
+                if full_log_lbl and full_log_lbl in sql_part:
+                    sql_part = sql_part.split(full_log_lbl, 1)[0].strip()
+
+            if hint_i >= 0:
+                start = hint_i + len(hint_lbl)
+                hint_part = msg[start:].strip()
+
+            # Summary tries to be short and scannable
+            summary_lines = []
+            if first_line:
+                summary_lines.append(first_line)
+            if db_part:
+                summary_lines.append("")
+                summary_lines.append(db_lbl)
+                summary_lines.append(db_part.strip())
+            if hint_part:
+                summary_lines.append("")
+                summary_lines.append(hint_lbl)
+                summary_lines.append(hint_part.strip())
+
+            summary = "\n".join(summary_lines).strip() if summary_lines else msg.strip()
+
+            return {
+                "summary": summary,
+                "sql": sql_part.strip(),
+                "full": msg.strip(),
+            }
+
+        parts = _split_error_ui_msg(ui_msg)
+
         popup = tk.Toplevel(root)
         apply_app_icon(popup)
         popup.title(t("ERR_QUERY_TITLE"))
         popup.transient(root)
-        popup.attributes("-topmost", True)
         popup.grab_set()
 
-        popup.geometry("900x450")
+        popup.minsize(860, 420)
+        popup.geometry("980x520")
         _center_window(popup, root)
 
-        text_widget = tk.Text(
-            popup, wrap="none", width=100, height=25, font=("Consolas", 9)
+        # Layout grid
+        popup.columnconfigure(0, weight=1)
+        popup.rowconfigure(1, weight=1)
+
+        header = ttk.Frame(popup, padding=(12, 10, 12, 8))
+        header.grid(row=0, column=0, sticky="we")
+        header.columnconfigure(0, weight=1)
+
+        title_lbl = ttk.Label(
+            header,
+            text=t("ERR_QUERY_TITLE"),
+            font=("Segoe UI", 12, "bold") if sys.platform == "win32" else None,
         )
-        y_scroll = tk.Scrollbar(popup, orient="vertical", command=text_widget.yview)
-        x_scroll = tk.Scrollbar(popup, orient="horizontal", command=text_widget.xview)
-        text_widget.configure(yscrollcommand=y_scroll.set, xscrollcommand=x_scroll.set)
+        title_lbl.grid(row=0, column=0, sticky="w")
 
-        text_widget.insert("1.0", ui_msg)
-        text_widget.config(state="disabled")
+        sub_lbl = ttk.Label(
+            header,
+            text=t("ERR_FULL_LOG"),
+            foreground="gray",
+        )
+        sub_lbl.grid(row=1, column=0, sticky="w", pady=(2, 0))
 
-        button_frame = tk.Frame(popup)
+        body = ttk.Frame(popup, padding=(12, 0, 12, 10))
+        body.grid(row=1, column=0, sticky="nsew")
+        body.columnconfigure(0, weight=1)
+        body.rowconfigure(0, weight=1)
 
-        def copy_error():
+        nb = ttk.Notebook(body)
+        nb.grid(row=0, column=0, sticky="nsew")
+
+        def _make_text_tab(name: str, content: str, wrap: str):
+            frame = ttk.Frame(nb, padding=0)
+            frame.columnconfigure(0, weight=1)
+            frame.rowconfigure(0, weight=1)
+
+            txt = tk.Text(
+                frame,
+                wrap=wrap,
+                font=("Consolas", 9) if sys.platform == "win32" else None,
+                borderwidth=1,
+                relief="solid",
+            )
+            y = ttk.Scrollbar(frame, orient="vertical", command=txt.yview)
+            txt.configure(yscrollcommand=y.set)
+
+            txt.grid(row=0, column=0, sticky="nsew")
+            y.grid(row=0, column=1, sticky="ns")
+
+            x = None
+            if wrap == "none":
+                x = ttk.Scrollbar(frame, orient="horizontal", command=txt.xview)
+                txt.configure(xscrollcommand=x.set)
+                x.grid(row=1, column=0, sticky="we")
+
+            txt.insert("1.0", content or "")
+            txt.config(state="disabled")
+
+            nb.add(frame, text=name)
+            return txt
+
+        summary_txt = _make_text_tab("Summary", parts.get("summary", ""), wrap="word")
+        sql_txt = _make_text_tab("SQL", parts.get("sql", ""), wrap="none")
+        full_txt = _make_text_tab("Details", parts.get("full", ""), wrap="none")
+
+        # Buttons
+        btns = ttk.Frame(popup, padding=(12, 0, 12, 12))
+        btns.grid(row=2, column=0, sticky="we")
+        btns.columnconfigure(0, weight=1)
+
+        def _copy_to_clipboard(text: str):
             popup.clipboard_clear()
-            popup.clipboard_append(ui_msg)
+            popup.clipboard_append(text or "")
 
-        copy_btn = tk.Button(button_frame, text=t("BTN_COPY"), command=copy_error)
-        close_btn = tk.Button(button_frame, text=t("BTN_CLOSE"), command=popup.destroy)
+        def copy_summary():
+            _copy_to_clipboard(parts.get("summary", ""))
 
-        y_scroll.pack(side="right", fill="y")
-        x_scroll.pack(side="bottom", fill="x")
-        text_widget.pack(side="left", fill="both", expand=True)
-        button_frame.pack(side="bottom", fill="x", pady=5)
-        copy_btn.pack(side="right", padx=(0, 10))
-        close_btn.pack(side="right")
+        def copy_sql():
+            _copy_to_clipboard(parts.get("sql", ""))
+
+        def copy_all():
+            _copy_to_clipboard(ui_msg)
+
+        def open_log():
+            log_path = os.path.join(BASE_DIR, "logs", "kkr-query2xlsx.log")
+            if not os.path.exists(log_path):
+                messagebox.showwarning(t("WARN_TITLE"), f"{t('ERR_FILE_PATH', path=log_path)}")
+                return
+            try:
+                if sys.platform.startswith("win"):
+                    os.startfile(log_path)  # type: ignore[attr-defined]
+                elif sys.platform == "darwin":
+                    subprocess.run(["open", log_path], check=False)
+                else:
+                    subprocess.run(["xdg-open", log_path], check=False)
+            except Exception as err:  # noqa: BLE001
+                messagebox.showerror(t("ERR_TITLE"), str(err))
+
+        left = ttk.Frame(btns)
+        left.grid(row=0, column=0, sticky="w")
+
+        ttk.Button(left, text="Copy summary", command=copy_summary).pack(side="left", padx=(0, 8))
+        ttk.Button(left, text="Copy SQL", command=copy_sql).pack(side="left", padx=(0, 8))
+        ttk.Button(left, text="Copy all", command=copy_all).pack(side="left", padx=(0, 8))
+        ttk.Button(left, text="Open log", command=open_log).pack(side="left")
+
+        right = ttk.Frame(btns)
+        right.grid(row=0, column=1, sticky="e")
+
+        ttk.Button(
+            right,
+            text=t("BTN_REPORT_ISSUE"),
+            command=lambda: open_github_issue_chooser(parent=popup),
+        ).pack(side="left", padx=(0, 8))
+        ttk.Button(right, text=t("BTN_CLOSE"), command=popup.destroy).pack(side="left")
 
         popup.bind("<Escape>", lambda *_: popup.destroy())
         popup.focus_set()
+
+    def show_odbc_diagnostics_popup():
+        text = odbc_diagnostics_text()
+
+        dlg = tk.Toplevel(root)
+        apply_app_icon(dlg)
+        dlg.title(t("ODBC_DIAGNOSTICS_TITLE"))
+        dlg.transient(root)
+        dlg.grab_set()
+
+        dlg.minsize(640, 360)
+        dlg.geometry("760x420")
+        _center_window(dlg, root)
+
+        dlg.columnconfigure(0, weight=1)
+        dlg.rowconfigure(0, weight=1)
+
+        body = ttk.Frame(dlg, padding=(12, 12, 12, 8))
+        body.grid(row=0, column=0, sticky="nsew")
+        body.columnconfigure(0, weight=1)
+        body.rowconfigure(0, weight=1)
+
+        text_widget = tk.Text(
+            body,
+            wrap="none",
+            font=("Consolas", 9) if sys.platform == "win32" else None,
+            borderwidth=1,
+            relief="solid",
+        )
+        y_scroll = ttk.Scrollbar(body, orient="vertical", command=text_widget.yview)
+        x_scroll = ttk.Scrollbar(body, orient="horizontal", command=text_widget.xview)
+        text_widget.configure(yscrollcommand=y_scroll.set, xscrollcommand=x_scroll.set)
+
+        text_widget.grid(row=0, column=0, sticky="nsew")
+        y_scroll.grid(row=0, column=1, sticky="ns")
+        x_scroll.grid(row=1, column=0, sticky="we")
+
+        text_widget.insert("1.0", text)
+        text_widget.config(state="disabled")
+
+        btns = ttk.Frame(dlg, padding=(12, 0, 12, 12))
+        btns.grid(row=1, column=0, sticky="we")
+        btns.columnconfigure(0, weight=1)
+
+        def copy_all():
+            dlg.clipboard_clear()
+            dlg.clipboard_append(text or "")
+
+        ttk.Button(btns, text=t("BTN_COPY"), command=copy_all).pack(
+            side="left", padx=(0, 8)
+        )
+        ttk.Button(btns, text=t("BTN_CLOSE"), command=dlg.destroy).pack(side="left")
+
+        dlg.bind("<Escape>", lambda *_: dlg.destroy())
+        dlg.focus_set()
 
     def refresh_secure_edit_button():
         btn = secure_edit_state.get("button")
@@ -4601,6 +4949,14 @@ def run_gui(connection_store, output_directory):
     lang_combo.grid(row=1, column=1, sticky="w", padx=(5, 0), pady=(5, 0))
     i18n_widgets["lang_combo"] = lang_combo
 
+    btn_odbc_diagnostics = tk.Button(
+        connection_controls,
+        text=t("BTN_ODBC_DIAGNOSTICS"),
+        command=show_odbc_diagnostics_popup,
+    )
+    btn_odbc_diagnostics.grid(row=0, column=7, padx=(10, 0), sticky="w")
+    i18n_widgets["btn_odbc_diagnostics"] = btn_odbc_diagnostics
+
     btn_edit_connection = tk.Button(
         connection_controls,
         text=t("BTN_EDIT_CONNECTION"),
@@ -4924,6 +5280,7 @@ def run_gui(connection_store, output_directory):
         btn_open_file.config(text=t("BTN_OPEN_FILE"))
         btn_open_folder.config(text=t("BTN_OPEN_FOLDER"))
         lbl_errors_short.config(text=t("LBL_ERRORS_SHORT"))
+        btn_odbc_diagnostics.config(text=t("BTN_ODBC_DIAGNOSTICS"))
         refresh_csv_profile_controls(csv_profile_state["config"].get("default_profile"))
         if connection_status_state["key"]:
             is_connected = False
@@ -4974,7 +5331,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=t("CLI_DESC"))
     parser.add_argument("-c", "--console", action="store_true", help=t("CLI_CONSOLE_HELP"))
     parser.add_argument("--lang", choices=["en", "pl"], help=t("CLI_LANG_HELP"))
+    parser.add_argument("--diag-odbc", action="store_true", help=t("CLI_DIAG_ODBC_HELP"))
     args = parser.parse_args()
+
+    if args.diag_odbc:
+        print(odbc_diagnostics_text())
+        sys.exit(0)
 
     created_files = bootstrap_local_files()
     if created_files:

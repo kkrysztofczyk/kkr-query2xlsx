@@ -24,16 +24,16 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           if (Test-Path requirements.txt) { pip install -r requirements.txt }
-          pip install pyinstaller
+          pip install pyinstaller pyodbc
 
       - name: Build (PyInstaller - onedir)
         run: |
           $iconCandidates = @("docs\kkr-query2xlsx.ico","docs\icon.ico","docs\app.ico")
           $icon = $iconCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
           if ($icon) {
-            pyinstaller --onedir --windowed --name kkr-query2xlsx --icon $icon --noupx main.pyw
+            pyinstaller --onedir --windowed --name kkr-query2xlsx --icon $icon --noupx --hidden-import pyodbc main.pyw
           } else {
-            pyinstaller --onedir --windowed --name kkr-query2xlsx --noupx main.pyw
+            pyinstaller --onedir --windowed --name kkr-query2xlsx --noupx --hidden-import pyodbc main.pyw
           }
 
       - name: Package (portable bundle with examples + samples)
