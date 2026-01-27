@@ -1,5 +1,5 @@
 <p align="center">
-  <img src=".github/assets/logo.png" width="800" alt="kkr-query2xlsx logo">
+  <img src="docs/logo.png" width="800" alt="kkr-query2xlsx logo">
 </p>
 
 # kkr-query2xlsx
@@ -70,6 +70,19 @@ You have **two options**:
 ### Option 2 — Run from source (developers / non-Windows)
 - Requires Python + dependencies
 - Best if you want to modify the code, contribute, or run on Linux/macOS
+
+---
+
+## Updates
+
+Pick the update path that matches how you run the app:
+
+1. **Windows app (portable EXE bundle from Releases)**  
+   Use the built-in **Check updates** button → it launches the updater and installs the latest ZIP.
+2. **Git repository checkout**  
+   Pull the latest changes: `git pull`.
+3. **Source files without Git**  
+   Download the newest ZIP from Releases or clone the repository.
 
 ---
 

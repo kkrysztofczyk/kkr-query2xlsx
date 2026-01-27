@@ -36,6 +36,10 @@ jobs:
             pyinstaller --onedir --windowed --name kkr-query2xlsx --noupx --hidden-import pyodbc main.pyw
           }
 
+      - name: Build updater (PyInstaller - onefile)
+        run: |
+          pyinstaller --onefile --windowed --name kkr-query2xlsx-updater --noupx updater.py
+
       - name: Package (portable bundle with examples + samples)
         run: |
           $bundleRoot = "bundle\\kkr-query2xlsx"
@@ -43,6 +47,7 @@ jobs:
 
           # App binaries (PyInstaller onedir output)
           Copy-Item -Recurse -Force "dist\\kkr-query2xlsx\\*" $bundleRoot
+          Copy-Item -Force "dist\\kkr-query2xlsx-updater.exe" $bundleRoot
 
           # Starter files described in README (first run bootstrap)
           $extraFiles = @("README.md","LICENSE","secure.sample.json","queries.sample.txt")

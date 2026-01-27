@@ -1,10 +1,13 @@
 import argparse
 import csv
 import json
+import getpass
 import logging
 import textwrap
+import re
 import traceback
 import os
+import string
 import shutil
 import subprocess
 import sys
@@ -16,7 +19,8 @@ from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog
 from tkinter import ttk
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, unquote_plus
+from urllib.request import Request, urlopen
 
 from logging.handlers import RotatingFileHandler
 
@@ -82,11 +86,166 @@ def apply_app_icon(win) -> None:
 
 # --- App version -------------------------------------------------------------
 
-APP_VERSION = "0.3.4"  # bump manually for releases
+APP_VERSION = "0.3.5"  # bump manually for releases
 
 GITHUB_ISSUE_CHOOSER_URL = (
     "https://github.com/kkrysztofczyk/kkr-query2xlsx/issues/new/choose"
 )
+GITHUB_REPO_OWNER = "kkrysztofczyk"
+GITHUB_REPO_NAME = "kkr-query2xlsx"
+GITHUB_RELEASES_LATEST_URL = (
+    f"https://api.github.com/repos/{GITHUB_REPO_OWNER}/{GITHUB_REPO_NAME}/releases/latest"
+)
+UPDATER_EXE_NAME = "kkr-query2xlsx-updater.exe"
+GITHUB_COMMITS_MAIN_URL = (
+    f"https://api.github.com/repos/{GITHUB_REPO_OWNER}/{GITHUB_REPO_NAME}/commits/main"
+)
+
+
+def parse_version(tag: str) -> tuple[int, ...]:
+    parts = re.findall(r"\d+", (tag or "").lstrip("v"))
+    return tuple(int(part) for part in parts)
+
+
+def _find_git_root(start: Path) -> Path | None:
+    for candidate in [start, *start.parents]:
+        if (candidate / ".git").exists():
+            return candidate
+    return None
+
+
+def detect_install_mode() -> str:
+    if getattr(sys, "frozen", False):
+        return "exe"
+    if _find_git_root(Path(__file__).resolve().parent):
+        return "git"
+    return "source"
+
+
+def _fetch_latest_release() -> dict:
+    req = Request(
+        GITHUB_RELEASES_LATEST_URL,
+        headers={
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "kkr-query2xlsx-updater",
+        },
+    )
+    with urlopen(req, timeout=10) as resp:  # noqa: S310
+        payload = resp.read().decode("utf-8")
+    return json.loads(payload)
+
+
+def _fetch_remote_main_sha() -> str | None:
+    req = Request(
+        GITHUB_COMMITS_MAIN_URL,
+        headers={
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "kkr-query2xlsx-updater",
+        },
+    )
+    with urlopen(req, timeout=10) as resp:  # noqa: S310
+        payload = resp.read().decode("utf-8")
+    data = json.loads(payload)
+    sha = (data or {}).get("sha") or ""
+    return sha.strip() or None
+
+
+def _fetch_github_compare_status(base_ref: str, head_ref: str) -> str | None:
+    """Return GitHub compare status between base and head (best-effort).
+
+    GitHub compare status is one of: ahead, behind, diverged, identical.
+    This prevents mislabeling any local!=remote situation as "remote is newer".
+    """
+    try:
+        url = (
+            f"https://api.github.com/repos/{GITHUB_REPO_OWNER}/{GITHUB_REPO_NAME}"
+            f"/compare/{quote_plus(base_ref)}...{quote_plus(head_ref)}"
+        )
+        req = Request(
+            url,
+            headers={
+                "Accept": "application/vnd.github+json",
+                "User-Agent": "kkr-query2xlsx-updater",
+            },
+        )
+        with urlopen(req, timeout=10) as resp:  # noqa: S310
+            payload = resp.read().decode("utf-8")
+        data = json.loads(payload) if payload else {}
+        status = (data or {}).get("status") or ""
+        return status.strip().lower() or None
+    except Exception:
+        return None
+
+
+def _classify_git_relation(local_sha: str | None, remote_sha: str | None) -> str:
+    """Classify local HEAD relative to remote main SHA (best-effort).
+
+    Returns one of: match, remote_ahead, local_ahead, diverged, different
+    """
+    if not local_sha or not remote_sha:
+        return "different"
+    if local_sha == remote_sha:
+        return "match"
+    status = _fetch_github_compare_status(local_sha, remote_sha)
+    if status == "identical":
+        return "match"
+    if status == "ahead":
+        # GitHub: head is ahead of base. For base=local, head=remote => remote ahead.
+        return "remote_ahead"
+    if status == "behind":
+        return "local_ahead"
+    if status == "diverged":
+        return "diverged"
+    return "different"
+
+
+def _select_windows_asset(assets: list[dict]) -> dict | None:
+    for asset in assets:
+        name = (asset.get("name") or "").lower()
+        if "windows" in name and name.endswith(".zip"):
+            return asset
+    for asset in assets:
+        name = (asset.get("name") or "").lower()
+        if name.endswith(".zip"):
+            return asset
+    return None
+
+
+def get_update_info() -> dict:
+    data = _fetch_latest_release()
+    latest_tag = data.get("tag_name") or ""
+    assets = data.get("assets") or []
+    asset = _select_windows_asset(assets)
+    current_tag = f"v{APP_VERSION}"
+    current_version = parse_version(current_tag)
+    latest_version = parse_version(latest_tag)
+    return {
+        "current_tag": current_tag,
+        "latest_tag": latest_tag,
+        "update_available": latest_version > current_version,
+        "asset": asset,
+    }
+
+
+def _get_updater_command() -> list[str] | None:
+    updater_path = Path(BASE_DIR) / UPDATER_EXE_NAME
+    if updater_path.exists():
+        return [str(updater_path)]
+    if not getattr(sys, "frozen", False):
+        py_updater = Path(__file__).with_name("updater.py")
+        if py_updater.exists():
+            return [sys.executable, str(py_updater)]
+    return None
+
+
+def launch_updater(wait_pid: int | None = None) -> bool:
+    cmd = _get_updater_command()
+    if not cmd:
+        return False
+    if wait_pid:
+        cmd += ["--wait-pid", str(wait_pid)]
+    subprocess.Popen(cmd, cwd=BASE_DIR)  # noqa: S603
+    return True
 
 
 def _get_git_short_sha() -> str | None:
@@ -95,6 +254,24 @@ def _get_git_short_sha() -> str | None:
         here = Path(__file__).resolve().parent
         p = subprocess.run(
             ["git", "rev-parse", "--short", "HEAD"],
+            cwd=str(here),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=0.8,
+            check=False,
+        )
+        sha = (p.stdout or "").strip()
+        return sha if sha else None
+    except Exception:
+        return None
+
+
+def _get_git_full_sha() -> str | None:
+    try:
+        here = Path(__file__).resolve().parent
+        p = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
             cwd=str(here),
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
@@ -133,9 +310,31 @@ def odbc_diagnostics_text() -> str:
             )
         except Exception as exc:  # noqa: BLE001
             lines.append(f"pyodbc.drivers()=FAILED ({type(exc).__name__}: {exc})")
+        try:
+            dsns = dict(pyodbc.dataSources())
+            lines.append(
+                "pyodbc.dataSources()="
+                + (", ".join(sorted(dsns.keys())) if dsns else "<empty>")
+            )
+        except Exception as exc:  # noqa: BLE001
+            lines.append(f"pyodbc.dataSources()=FAILED ({type(exc).__name__}: {exc})")
     except Exception as exc:  # noqa: BLE001
         lines.append(f"pyodbc=FAILED ({type(exc).__name__}: {exc})")
     return "\n".join(lines)
+
+
+def _redact_conn_secrets(text: str) -> str:
+    if not text:
+        return text
+    patterns = [
+        r"(?i)(pwd|password)\s*=\s*[^;]*",
+        r"(?i)(user id|uid)\s*=\s*[^;]*",
+        r"(?i)(access_token)\s*=\s*[^;]*",
+    ]
+    out = text
+    for pattern in patterns:
+        out = re.sub(pattern, lambda m: m.group(0).split("=")[0] + "=***", out)
+    return out
 
 
 # =========================
@@ -153,6 +352,7 @@ I18N: dict[str, dict[str, str]] = {
         "LBL_DB": "Database",
         "LBL_OUTPUT": "Output",
         "LBL_LANGUAGE": "Language",
+        "CHK_ARCHIVE_SQL": "Archive SQL (save query + metadata)",
         "MSG_DONE": "Done.",
         "ERR_TITLE": "Error",
         "WARN_TITLE": "Warning",
@@ -218,6 +418,7 @@ I18N: dict[str, dict[str, str]] = {
         "CONSOLE_SQL_TIME": "Data fetch time (SQL): {seconds:.2f} seconds",
         "CONSOLE_EXPORT_TIME": "Export time ({fmt}): {seconds:.2f} seconds",
         "CONSOLE_TOTAL_TIME": "Total time: {seconds:.2f} seconds",
+        "CONSOLE_PROMPT_PASSWORD": "Password for connection '{name}': ",
         "CLI_DIAG_ODBC_HELP": "Print ODBC diagnostics and exit.",
         "DEFAULT_MSSQL_NAME": "Default MSSQL",
         "FRAME_MSSQL": "MSSQL (ODBC)",
@@ -226,6 +427,7 @@ I18N: dict[str, dict[str, str]] = {
         "LBL_DATABASE_NAME": "Database name",
         "LBL_LOGIN": "Login",
         "LBL_PASSWORD": "Password",
+        "CHK_REMEMBER_PASSWORD": "Remember password",
         "CHK_TRUSTED": "Windows authentication (Trusted_Connection)",
         "CHK_ENCRYPT": "Encrypt",
         "CHK_TRUST_CERT": "TrustServerCertificate",
@@ -255,6 +457,13 @@ I18N: dict[str, dict[str, str]] = {
         "ERR_FILL_PG": "Fill in: host, database name, and user.",
         "ERR_FILL_MYSQL": "Fill in: host, database name, and user.",
         "ERR_FILL_SQLITE": "Provide the SQLite database file path.",
+        "PROMPT_PASSWORD_TITLE": "Password required",
+        "PROMPT_PASSWORD_BODY": "Enter password for connection:\n{name}",
+        "WARN_REMEMBER_PASSWORD_TITLE": "Store password?",
+        "WARN_REMEMBER_PASSWORD_BODY": (
+            "The password will be saved in plain text in:\n{path}\n\n"
+            "Keep this file very safe.\n\nContinue?"
+        ),
         "LBL_CONN_NAME": "Connection name",
         "LBL_DB_TYPE": "Database type",
         "ERR_INVALID_CONN_TYPE": "Invalid connection type.",
@@ -379,6 +588,45 @@ I18N: dict[str, dict[str, str]] = {
         "BTN_SELECT_SQL": "Select SQL file",
         "BTN_SELECT_FROM_LIST": "Select from report list",
         "BTN_EDIT_QUERIES": "Edit queries.txt",
+        "BTN_PASTE_SQL": "Paste SQL",
+        "TITLE_PASTE_SQL": "Paste SQL",
+        "LBL_REPORT_NAME": "Report name (required)",
+        "LBL_PASTE_SQL": "SQL (paste here)",
+        "BTN_USE_SQL": "Use SQL",
+        "ERR_INVALID_REPORT_NAME_TITLE": "Invalid report name",
+        "ERR_REPORT_NAME_REQUIRED": "Report name is required (cannot be empty).",
+        "ERR_REPORT_NAME_NO_FOLDERS": "Report name must be a filename only (no folders).",
+        "ERR_REPORT_NAME_INVALID_CHARS": "Report name contains invalid characters: {chars}",
+        "ERR_REPORT_NAME_CONTROL_CHARS": "Report name contains control characters.",
+        "ERR_REPORT_NAME_TRAILING_DOT_SPACE": "Report name cannot end with a space or a dot.",
+        "ERR_REPORT_NAME_RESERVED": "Report name '{name}' is reserved on Windows.",
+        "ERR_REPORT_NAME_TOO_LONG": "Report name is too long (max {max_len} characters).",
+        "ERR_EMPTY_SQL_TITLE": "Empty SQL",
+        "ERR_EMPTY_SQL_BODY": "SQL cannot be empty.",
+        "ERR_INVALID_SQL_FILE_TITLE": "Invalid SQL file",
+        "ERR_NO_FILE_SELECTED": "No file selected.",
+        "ERR_SQLFILE_IS_SQLITE_EXT": (
+            "Selected a SQLite database file. This is not a .sql file with queries."
+        ),
+        "ERR_SQLFILE_IS_SPREADSHEET": (
+            "This looks like a spreadsheet/data file ({ext}). "
+            "Please select a .sql text file containing SQL statements."
+        ),
+        "ERR_SQLFILE_IS_ZIP": (
+            "This file is a ZIP container (starts with 'PK'). "
+            "It is not a plain .sql text file."
+        ),
+        "ERR_SQLFILE_IS_OLD_OFFICE": (
+            "This looks like an old Microsoft Office binary file (e.g. .xls). "
+            "Please select a .sql text file."
+        ),
+        "ERR_SQLFILE_IS_BINARY": (
+            "This file looks like a binary file, not plain text SQL. "
+            "Please select a .sql text file."
+        ),
+        "ERR_CANNOT_OPEN_FILE": "Cannot open file: {error}",
+        "LBL_SQL_PASTED": "Pasted SQL:",
+        "ERR_NO_SQL_SOURCE": "Select a SQL file or paste SQL first.",
         "LBL_CSV_PROFILE": "CSV profile:",
         "BTN_MANAGE_CSV_PROFILES": "Manage CSV profiles",
         "CHK_USE_TEMPLATE": "Use template file (XLSX only, GUI only)",
@@ -389,10 +637,34 @@ I18N: dict[str, dict[str, str]] = {
         "CHK_INCLUDE_HEADERS": "Write headers (column names) to worksheet",
         "BTN_START": "Start",
         "BTN_REPORT_ISSUE": "Report issue / suggestion",
+        "BTN_CHECK_UPDATES": "Check updates",
         "LBL_EXPORT_INFO": "Export info:",
         "BTN_OPEN_FILE": "Open file",
         "BTN_OPEN_FOLDER": "Open folder",
         "LBL_ERRORS_SHORT": "Errors (summary):",
+        "UPD_TITLE": "Updates",
+        "UPD_CHECKING": "Checking for updates...",
+        "UPD_CHECK_FAILED": "Could not check updates.",
+        "UPD_NO_UPDATE": (
+            "No Release updates available. Current: {current}, latest Release: {latest}."
+        ),
+        "UPD_UPDATE_AVAILABLE": "Release update available: {current} → {latest}.",
+        "UPD_PROMPT_INSTALL": "Install the update now?",
+        "UPD_GIT_MODE": (
+            "This run comes from a Git checkout. This check looks only for official Releases. "
+            "To update the code, run:\n\n{command}"
+        ),
+        "UPD_GIT_STATUS_MATCH": "Git status: local {local}, remote main {remote}.",
+        "UPD_GIT_STATUS_AHEAD": "Git status: local {local}, remote main {remote} (update available).",
+        "UPD_GIT_STATUS_LOCAL_AHEAD": "Git status: local {local} is ahead of remote main {remote}.",
+        "UPD_GIT_STATUS_DIVERGED": "Git status: local {local} and remote main {remote} have diverged.",
+        "UPD_GIT_STATUS_DIFFERENT": "Git status: local {local}, remote main {remote} (different).",
+        "UPD_SOURCE_MODE": (
+            "This run comes from source files without Git. This check looks only for official "
+            "Releases. To update, download a new ZIP from Releases or clone the repository."
+        ),
+        "UPD_UPDATER_MISSING": "Updater is missing. Download the latest ZIP manually.",
+        "UPD_START_FAILED": "Failed to start updater.",
         "STATUS_NO_CONNECTION": "No connection. Create a new connection.",
         "STATUS_CONNECTION_ERROR": "Connection error. Create a new connection.",
         "ERR_CONNECTION_TITLE": "Connection error",
@@ -539,6 +811,7 @@ I18N: dict[str, dict[str, str]] = {
         "LBL_DB": "Baza danych",
         "LBL_OUTPUT": "Wyjście",
         "LBL_LANGUAGE": "Język",
+        "CHK_ARCHIVE_SQL": "Archiwizuj SQL (zapisz zapytanie + metadane)",
         "MSG_DONE": "Gotowe.",
         "ERR_TITLE": "Błąd",
         "WARN_TITLE": "Uwaga",
@@ -604,6 +877,7 @@ I18N: dict[str, dict[str, str]] = {
         "CONSOLE_SQL_TIME": "Czas pobrania danych (SQL): {seconds:.2f} s",
         "CONSOLE_EXPORT_TIME": "Czas eksportu ({fmt}): {seconds:.2f} s",
         "CONSOLE_TOTAL_TIME": "Czas łączny: {seconds:.2f} s",
+        "CONSOLE_PROMPT_PASSWORD": "Hasło dla połączenia '{name}': ",
         "CLI_DIAG_ODBC_HELP": "Wypisz diagnostykę ODBC i zakończ.",
         "DEFAULT_MSSQL_NAME": "Domyślne MSSQL",
         "FRAME_MSSQL": "MSSQL (ODBC)",
@@ -612,6 +886,7 @@ I18N: dict[str, dict[str, str]] = {
         "LBL_DATABASE_NAME": "Nazwa bazy",
         "LBL_LOGIN": "Login",
         "LBL_PASSWORD": "Hasło",
+        "CHK_REMEMBER_PASSWORD": "Zapamiętaj hasło",
         "CHK_TRUSTED": "Logowanie Windows (Trusted_Connection)",
         "CHK_ENCRYPT": "Encrypt",
         "CHK_TRUST_CERT": "TrustServerCertificate",
@@ -640,6 +915,13 @@ I18N: dict[str, dict[str, str]] = {
         "ERR_FILL_PG": "Wypełnij: host, nazwę bazy i użytkownika.",
         "ERR_FILL_MYSQL": "Wypełnij: host, nazwę bazy i użytkownika.",
         "ERR_FILL_SQLITE": "Podaj ścieżkę do pliku bazy SQLite.",
+        "PROMPT_PASSWORD_TITLE": "Wymagane hasło",
+        "PROMPT_PASSWORD_BODY": "Podaj hasło dla połączenia:\n{name}",
+        "WARN_REMEMBER_PASSWORD_TITLE": "Zapisać hasło?",
+        "WARN_REMEMBER_PASSWORD_BODY": (
+            "Hasło zostanie zapisane jawnym tekstem w pliku:\n{path}\n\n"
+            "Trzymaj ten plik bardzo ostrożnie.\n\nKontynuować?"
+        ),
         "LBL_CONN_NAME": "Nazwa połączenia",
         "LBL_DB_TYPE": "Typ bazy",
         "ERR_INVALID_CONN_TYPE": "Nieprawidłowy typ połączenia.",
@@ -732,6 +1014,24 @@ I18N: dict[str, dict[str, str]] = {
         "WARN_NO_REPORT_SELECTED": "Nie wybrano żadnego raportu.",
         "ERR_NO_SQL_SELECTED": "Nie wybrano pliku SQL.",
         "ERR_SQL_NOT_FOUND": "Wybrany plik SQL nie istnieje.",
+        "ERR_SQLFILE_IS_SQLITE_EXT": (
+            "Wybrano bazę SQLite. To nie jest plik .sql z zapytaniami."
+        ),
+        "ERR_SQLFILE_IS_SPREADSHEET": (
+            "To wygląda jak arkusz danych ({ext}). "
+            "Wybierz plik .sql zawierający zapytania."
+        ),
+        "ERR_SQLFILE_IS_ZIP": (
+            "To plik ZIP (zaczyna się od 'PK'). Nie jest to zwykły plik .sql."
+        ),
+        "ERR_SQLFILE_IS_OLD_OFFICE": (
+            "To wygląda na stary binarny plik Microsoft Office (np. .xls). "
+            "Wybierz plik .sql."
+        ),
+        "ERR_SQLFILE_IS_BINARY": (
+            "Plik wygląda na binarny, a nie tekstowy SQL. Wybierz plik .sql."
+        ),
+        "ERR_CANNOT_OPEN_FILE": "Nie można otworzyć pliku: {error}",
         "ERR_NEED_CONNECTION": "Utwórz połączenie z bazą danych przed uruchomieniem raportu.",
         "ERR_TEMPLATE_ONLY_XLSX": "Template można użyć tylko dla formatu XLSX.",
         "ERR_TEMPLATE_NOT_SELECTED": "Nie wybrano pliku template.",
@@ -763,6 +1063,25 @@ I18N: dict[str, dict[str, str]] = {
         "BTN_SELECT_SQL": "Wybierz plik SQL",
         "BTN_SELECT_FROM_LIST": "Wybierz z listy raportów",
         "BTN_EDIT_QUERIES": "Edytuj queries.txt",
+        "BTN_PASTE_SQL": "Wklej SQL",
+        "TITLE_PASTE_SQL": "Wklej SQL",
+        "LBL_REPORT_NAME": "Nazwa raportu (wymagana)",
+        "LBL_PASTE_SQL": "SQL (wklej tutaj)",
+        "BTN_USE_SQL": "Użyj SQL",
+        "ERR_INVALID_REPORT_NAME_TITLE": "Nieprawidłowa nazwa raportu",
+        "ERR_REPORT_NAME_REQUIRED": "Nazwa raportu jest wymagana (nie może być pusta).",
+        "ERR_REPORT_NAME_NO_FOLDERS": "Nazwa raportu musi być samą nazwą pliku (bez folderów).",
+        "ERR_REPORT_NAME_INVALID_CHARS": "Nazwa raportu zawiera niedozwolone znaki: {chars}",
+        "ERR_REPORT_NAME_CONTROL_CHARS": "Nazwa raportu zawiera znaki sterujące.",
+        "ERR_REPORT_NAME_TRAILING_DOT_SPACE": "Nazwa raportu nie może kończyć się spacją ani kropką.",
+        "ERR_REPORT_NAME_RESERVED": "Nazwa raportu '{name}' jest zarezerwowana w Windows.",
+        "ERR_REPORT_NAME_TOO_LONG": "Nazwa raportu jest za długa (max {max_len} znaków).",
+        "ERR_EMPTY_SQL_TITLE": "Pusty SQL",
+        "ERR_EMPTY_SQL_BODY": "SQL nie może być pusty.",
+        "ERR_INVALID_SQL_FILE_TITLE": "Nieprawidłowy plik SQL",
+        "ERR_NO_FILE_SELECTED": "Nie wybrano pliku.",
+        "LBL_SQL_PASTED": "Wklejony SQL:",
+        "ERR_NO_SQL_SOURCE": "Wybierz plik SQL albo wklej SQL.",
         "LBL_CSV_PROFILE": "Profil CSV:",
         "BTN_MANAGE_CSV_PROFILES": "Zarządzaj profilami CSV",
         "CHK_USE_TEMPLATE": "Użyj pliku template (tylko dla XLSX, tylko w GUI)",
@@ -773,10 +1092,34 @@ I18N: dict[str, dict[str, str]] = {
         "CHK_INCLUDE_HEADERS": "Zapisz nagłówki (nazwy kolumn) w arkuszu",
         "BTN_START": "Start",
         "BTN_REPORT_ISSUE": "Zgłoś problem / sugestię",
+        "BTN_CHECK_UPDATES": "Sprawdź aktualizacje",
         "LBL_EXPORT_INFO": "Informacje o eksporcie:",
         "BTN_OPEN_FILE": "Otwórz plik",
         "BTN_OPEN_FOLDER": "Otwórz katalog",
         "LBL_ERRORS_SHORT": "Błędy (skrót):",
+        "UPD_TITLE": "Aktualizacje",
+        "UPD_CHECKING": "Sprawdzanie aktualizacji...",
+        "UPD_CHECK_FAILED": "Nie udało się sprawdzić aktualizacji.",
+        "UPD_NO_UPDATE": (
+            "Brak aktualizacji wydań (Release). Obecna: {current}, najnowsze Release: {latest}."
+        ),
+        "UPD_UPDATE_AVAILABLE": "Dostępna aktualizacja wydania (Release): {current} → {latest}.",
+        "UPD_PROMPT_INSTALL": "Zainstalować aktualizację teraz?",
+        "UPD_GIT_MODE": (
+            "Uruchomiono z repozytorium Git. Ta funkcja sprawdza tylko oficjalne wydania "
+            "(Release). Aby zaktualizować kod, uruchom:\n\n{command}"
+        ),
+        "UPD_GIT_STATUS_MATCH": "Status Git: lokalnie {local}, zdalnie main {remote}.",
+        "UPD_GIT_STATUS_AHEAD": "Status Git: lokalnie {local}, zdalnie main {remote} (dostępna aktualizacja).",
+        "UPD_GIT_STATUS_LOCAL_AHEAD": "Status Git: lokalnie {local} jest przed zdalnym main {remote}.",
+        "UPD_GIT_STATUS_DIVERGED": "Status Git: lokalnie {local} i zdalnie main {remote} są rozbieżne.",
+        "UPD_GIT_STATUS_DIFFERENT": "Status Git: lokalnie {local}, zdalnie main {remote} (różne).",
+        "UPD_SOURCE_MODE": (
+            "Uruchomiono ze źródeł bez repo Git. Ta funkcja sprawdza tylko oficjalne wydania "
+            "(Release). Aby zaktualizować, pobierz nowy ZIP z Releases albo sklonuj repozytorium."
+        ),
+        "UPD_UPDATER_MISSING": "Brak updatera. Pobierz najnowszy ZIP ręcznie.",
+        "UPD_START_FAILED": "Nie udało się uruchomić updatera.",
         "STATUS_NO_CONNECTION": "Brak połączenia. Utwórz nowe połączenie.",
         "STATUS_CONNECTION_ERROR": "Błąd połączenia. Utwórz nowe połączenie.",
         "ERR_CONNECTION_TITLE": "Błąd połączenia",
@@ -984,7 +1327,9 @@ def _center_window(win, parent=None):
 
 
 def open_github_issue_chooser(parent=None) -> None:
-    url = GITHUB_ISSUE_CHOOSER_URL
+    version = get_app_version_label()
+    # GitHub Issue Forms: przekazanie wartości do pola "App version"
+    url = f"{GITHUB_ISSUE_CHOOSER_URL}?app_version={quote_plus(version)}"
     try:
         ok = webbrowser.open_new_tab(url)
         if not ok and parent is not None:
@@ -1013,6 +1358,7 @@ SECURE_PATH = _build_path("secure.txt")
 QUERIES_PATH = _build_path("queries.txt")
 APP_CONFIG_PATH = _build_path("kkr-query2xlsx.json")
 LEGACY_CSV_PROFILES_PATH = _build_path("csv_profiles.json")
+SQL_ARCHIVE_DIR = _build_path("sql_archive")
 
 SECURE_SAMPLE_PATH = _build_path("secure.sample.json")
 QUERIES_SAMPLE_PATH = _build_path("queries.sample.txt")
@@ -1141,6 +1487,28 @@ def persist_ui_lang(ui_lang: str) -> None:
     save_app_config(app_config)
 
 
+def load_persisted_archive_sql() -> bool:
+    app_config = load_app_config()
+    raw = app_config.get("archive_sql")
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, int) and raw in (0, 1):
+        return bool(raw)
+    if isinstance(raw, str):
+        value = raw.strip().lower()
+        if value in ("1", "true", "yes", "y", "on"):
+            return True
+        if value in ("0", "false", "no", "n", "off"):
+            return False
+    return False
+
+
+def persist_archive_sql(enabled: bool) -> None:
+    app_config = load_app_config()
+    app_config["archive_sql"] = bool(enabled)
+    save_app_config(app_config)
+
+
 def shorten_path(path, max_len=80):
     if not path:
         return ""
@@ -1202,6 +1570,104 @@ def to_storage_path(path: str) -> str:
 def is_sql_path(path: str) -> bool:
     # Filtr w oknie wyboru to nie walidacja -> walidujemy w kodzie
     return (path or "").strip().lower().endswith(".sql")
+
+
+_WINDOWS_RESERVED_NAMES = {
+    "CON",
+    "PRN",
+    "AUX",
+    "NUL",
+    *(f"COM{i}" for i in range(1, 10)),
+    *(f"LPT{i}" for i in range(1, 10)),
+}
+_INVALID_FILENAME_CHARS = r'<>:"/\|?*'
+
+
+def validate_report_basename(name: str) -> tuple[bool, str, str]:
+    normalized = (name or "").strip()
+    if not normalized:
+        return False, t("ERR_REPORT_NAME_REQUIRED"), ""
+
+    separators = {"/", "\\"}
+    if os.sep:
+        separators.add(os.sep)
+    if os.altsep:
+        separators.add(os.altsep)
+    if any(sep in normalized for sep in separators):
+        return False, t("ERR_REPORT_NAME_NO_FOLDERS"), ""
+
+    invalid_match = re.search(f"[{re.escape(_INVALID_FILENAME_CHARS)}]", normalized)
+    if invalid_match:
+        return False, t("ERR_REPORT_NAME_INVALID_CHARS", chars=_INVALID_FILENAME_CHARS), ""
+
+    if any(ord(ch) < 32 for ch in normalized):
+        return False, t("ERR_REPORT_NAME_CONTROL_CHARS"), ""
+
+    if normalized[-1] in {" ", "."}:
+        return False, t("ERR_REPORT_NAME_TRAILING_DOT_SPACE"), ""
+
+    reserved_check = normalized.split(".", 1)[0].upper()
+    if reserved_check in _WINDOWS_RESERVED_NAMES:
+        return False, t("ERR_REPORT_NAME_RESERVED", name=normalized), ""
+
+    if len(normalized) > 120:
+        return False, t("ERR_REPORT_NAME_TOO_LONG", max_len=120), ""
+
+    return True, "", normalized
+
+
+def _looks_binary(data: bytes) -> bool:
+    # Heurystyka: NUL albo dużo nie-tekstowych bajtów
+    if not data:
+        return False
+    if b"\x00" in data:
+        return True
+    # policz "dziwne" bajty (poza whitespace + printable ASCII)
+    printable = set(bytes(string.printable, "ascii"))
+    weird = sum(1 for b in data if b not in printable)
+    return (weird / max(1, len(data))) > 0.30
+
+
+def validate_sql_text_file(path: str) -> tuple[bool, str]:
+    """
+    Very shallow validation:
+    - blocks obvious mistakes: SQLite db, Excel, zip-like, binary blobs
+    - allows normal text files (even if not actual SQL)
+    Returns: (ok, message_if_not_ok)
+    """
+    if not path:
+        return False, t("ERR_NO_FILE_SELECTED")
+
+    ext = os.path.splitext(path)[1].lower()
+
+    # Najczęstsze pomyłki po rozszerzeniu
+    if ext in {".db", ".sqlite", ".sqlite3"}:
+        return False, t("ERR_SQLFILE_IS_SQLITE_EXT")
+    if ext in {".xlsx", ".xls", ".csv"}:
+        # CSV bywa OK jako tekst, ale w kontekście "SQL file" to zwykle pomyłka
+        return False, t("ERR_SQLFILE_IS_SPREADSHEET", ext=ext)
+
+    try:
+        with open(path, "rb") as f:
+            head = f.read(4096)
+    except OSError as e:
+        return False, t("ERR_CANNOT_OPEN_FILE", error=e)
+
+    # Magic bytes - częste przypadki
+    if head.startswith(b"SQLite format 3\x00"):
+        return False, t("ERR_SQLFILE_IS_SQLITE_EXT")
+    if head.startswith(b"PK\x03\x04"):
+        # ZIP container (często .xlsx, ale też inne)
+        return False, t("ERR_SQLFILE_IS_ZIP")
+    if head.startswith(b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1"):
+        # stary Office (xls/doc)
+        return False, t("ERR_SQLFILE_IS_OLD_OFFICE")
+
+    if _looks_binary(head):
+        return False, t("ERR_SQLFILE_IS_BINARY")
+
+    # Jeśli dotarliśmy tu - wygląda jak tekst (nie gwarantuje, że to SQL, ale o to chodzi)
+    return True, ""
 
 
 def remove_bom(content: bytes) -> str:
@@ -1278,17 +1744,36 @@ def _normalize_connections(data):
         ui_lang = data.get("ui_lang")
         for item in data.get("connections", []):
             name = str(item.get("name") or "").strip()
-            url = str(item.get("url") or "").strip()
+            # url may contain secrets in legacy files - ignore it going forward
+            raw_url = str(item.get("url") or "").strip()
+            url = ""
             conn_type = str(item.get("type") or "custom").strip() or "custom"
             details = item.get("details")
-            if not name or not url:
+            details = details if isinstance(details, dict) else {}
+
+            # Legacy support: old entries may have only URL with odbc_connect
+            if (not details) and raw_url.startswith("mssql+pyodbc://") and "odbc_connect=" in raw_url:
+                try:
+                    odbc_enc = raw_url.split("odbc_connect=", 1)[1]
+                    # cut off any extra params (rare)
+                    odbc_enc = odbc_enc.split("&", 1)[0]
+                    odbc_raw = unquote_plus(odbc_enc).strip()
+                    parsed = _parse_odbc_connect_string(odbc_raw)
+                    if parsed:
+                        details = parsed
+                        # keep type as mssql_odbc if missing/wrong
+                        if conn_type in ("", "custom"):
+                            conn_type = "mssql_odbc"
+                except Exception:
+                    pass
+            if not name:
                 continue
             connections.append(
                 {
                     "name": name,
                     "type": conn_type,
-                    "url": url,
-                    "details": details if isinstance(details, dict) else {},
+                    "url": url,  # may be empty for new-format entries
+                    "details": details,
                 }
             )
 
@@ -1328,7 +1813,17 @@ def save_connections(store, path=SECURE_PATH):
     normalized = _normalize_connections(store)
     normalized.pop("ui_lang", None)
     with open(path, "w", encoding="utf-8") as file:
-        json.dump(normalized, file, ensure_ascii=False, indent=2)
+        # Persist only safe structure: name/type/details (+ last_selected).
+        # url may contain secrets (legacy), so we intentionally do not persist it anymore.
+        safe = {
+            "connections": [
+                {"name": c.get("name"), "type": c.get("type"), "details": c.get("details") or {}}
+                for c in (normalized.get("connections") or [])
+                if (c.get("name") or "").strip()
+            ],
+            "last_selected": normalized.get("last_selected"),
+        }
+        json.dump(safe, file, ensure_ascii=False, indent=2)
 
 
 def load_query_paths(queries_file=QUERIES_PATH):
@@ -1494,21 +1989,25 @@ def handle_db_driver_error(exc, db_type, profile_name=None, show_message=None):
         missing_pyodbc = isinstance(exc, (ImportError, ModuleNotFoundError)) and (
             getattr(exc, "name", "") == "pyodbc" or "pyodbc" in exc_text
         )
+        if isinstance(exc, NoSuchModuleError) and "pyodbc" in exc_text:
+            missing_pyodbc = True
+
+        # Rozpoznawaj brak drivera/DSN tylko po typowych komunikatach driver managera
+        # (nie po samym "ODBC Driver 18..." bo to często występuje w treści błędu TLS/login).
         missing_driver = any(
             signature in exc_text
             for signature in (
                 "data source name not found",
                 "driver not found",
-                "no default driver",
-                "odbc driver 17",
-                "odbc driver 18",
-                "native client",
+                "no default driver specified",
+                "can't open lib",
                 "unable to open lib",
+                "cannot open shared object file",
+                "could not find driver",
+                "im002",
+                "im003",
             )
         )
-
-        if isinstance(exc, NoSuchModuleError) and "pyodbc" in exc_text:
-            missing_pyodbc = True
 
         if missing_pyodbc or missing_driver:
             msg = t("ERR_ODBC_MISSING_BODY", diag=odbc_diagnostics_text())
@@ -1728,6 +2227,81 @@ def remember_last_used_csv_profile(
 def ensure_directories(paths):
     for path in paths:
         os.makedirs(path, exist_ok=True)
+
+
+def _sanitize_filename_part(value: str, max_len: int = 80) -> str:
+    """
+    Unicode-friendly, cross-platform-ish:
+    - keeps letters (incl. Polish), digits, spaces, dot, dash, underscore
+    - replaces the rest with "_"
+    - collapses repeated "_" and trims ends
+    """
+    cleaned = (value or "").strip()
+    if not cleaned:
+        return "unknown"
+
+    # normalize whitespace -> underscores
+    cleaned = re.sub(r"\s+", "_", cleaned, flags=re.UNICODE)
+
+    # keep unicode word chars + . - _
+    # \w in Python (re.UNICODE) includes many unicode letters/digits/underscore
+    cleaned = re.sub(r"[^\w\.\-]+", "_", cleaned, flags=re.UNICODE)
+
+    # collapse multiple underscores and trim
+    cleaned = re.sub(r"_+", "_", cleaned)
+    cleaned = cleaned.strip("._- ")
+
+    if not cleaned:
+        return "unknown"
+
+    return cleaned[:max_len]
+
+
+def write_sql_archive_entry(
+    sql_query: str,
+    report_label: str,
+    sql_source_path: str,
+    output_file_path: str,
+    output_format: str,
+    rows_count: int,
+    sql_duration: float,
+    export_duration: float,
+    total_duration: float,
+    connection_name: str,
+    connection_type: str,
+) -> None:
+    rows_count = max(0, int(rows_count))
+    timestamp = datetime.now()
+    base_label = os.path.splitext(os.path.basename(report_label or ""))[0]
+    safe_label = _sanitize_filename_part(base_label)
+    stamp = timestamp.strftime("%Y%m%d_%H%M%S")
+    base_name = f"{stamp}__{safe_label}__{rows_count}rows"
+
+    os.makedirs(SQL_ARCHIVE_DIR, exist_ok=True)
+    sql_path = os.path.join(SQL_ARCHIVE_DIR, f"{base_name}.sql")
+    metadata_path = os.path.join(SQL_ARCHIVE_DIR, f"{base_name}.json")
+
+    with open(sql_path, "w", encoding="utf-8") as sql_file:
+        sql_file.write((sql_query or "").rstrip() + "\n")
+
+    metadata = {
+        "timestamp": timestamp.isoformat(timespec="seconds"),
+        "rows_count": rows_count,
+        "report_label": report_label,
+        "sql_source_path": sql_source_path,
+        "output_file_path": output_file_path,
+        "output_format": output_format,
+        "sql_duration": sql_duration,
+        "export_duration": export_duration,
+        "total_duration": total_duration,
+        "connection_name": connection_name,
+        "connection_type": connection_type,
+        "sql_file": os.path.basename(sql_path),
+        "metadata_file": os.path.basename(metadata_path),
+    }
+
+    with open(metadata_path, "w", encoding="utf-8") as meta_file:
+        json.dump(metadata, meta_file, ensure_ascii=False, indent=2)
 
 
 def get_csv_profile(config, name):
@@ -1990,7 +2564,7 @@ def run_export_to_template(
     return sql_duration, export_duration, total_duration, rows_count
 
 
-def run_console(engine, output_directory, selected_connection):
+def run_console(engine, output_directory, selected_connection, archive_sql: bool):
     sql_query_file_paths = load_query_paths()
     csv_config = load_csv_profiles()
 
@@ -2017,10 +2591,22 @@ def run_console(engine, output_directory, selected_connection):
                     if not os.path.isfile(resolved):
                         print(t("CONSOLE_FILE_NOT_FOUND"))
                         continue
+                    ok, msg = validate_sql_text_file(resolved)
+                    if not ok:
+                        print(f"ERROR: {msg}")
+                        continue
                     sql_query_file_path = resolved
                     break
                 if 1 <= selection <= len(sql_query_file_paths):
-                    sql_query_file_path = resolve_path(sql_query_file_paths[selection - 1])
+                    resolved = resolve_path(sql_query_file_paths[selection - 1])
+                    if not os.path.isfile(resolved):
+                        print(t("CONSOLE_FILE_NOT_FOUND"))
+                        continue
+                    ok, msg = validate_sql_text_file(resolved)
+                    if not ok:
+                        print(f"ERROR: {msg}")
+                        continue
+                    sql_query_file_path = resolved
                     break
                 print(
                     t(
@@ -2036,6 +2622,10 @@ def run_console(engine, output_directory, selected_connection):
             custom_path = input(t("CONSOLE_PROMPT_CUSTOM_PATH")).strip()
             resolved = resolve_path(custom_path)
             if os.path.isfile(resolved):
+                ok, msg = validate_sql_text_file(resolved)
+                if not ok:
+                    print(f"ERROR: {msg}")
+                    continue
                 sql_query_file_path = resolved
                 break
             print(t("CONSOLE_FILE_NOT_FOUND"))
@@ -2074,6 +2664,11 @@ def run_console(engine, output_directory, selected_connection):
                     break
             print(t("CONSOLE_INVALID_SELECTION"))
 
+    if output_format == "csv" and selected_csv_profile:
+        prof_name = (selected_csv_profile.get("name") or "").strip()
+        if prof_name:
+            csv_config = remember_last_used_csv_profile(prof_name, csv_config)
+
     with open(sql_query_file_path, "rb") as file:
         content = file.read()
 
@@ -2094,10 +2689,23 @@ def run_console(engine, output_directory, selected_connection):
         engine, sql_query, output_file_path, output_format, csv_profile=selected_csv_profile
     )
 
-    if output_format == "csv" and selected_csv_profile:
-        prof_name = (selected_csv_profile.get("name") or "").strip()
-        if prof_name:
-            csv_config = remember_last_used_csv_profile(prof_name, csv_config)
+    if archive_sql:
+        try:
+            write_sql_archive_entry(
+                sql_query=sql_query,
+                report_label=os.path.basename(sql_query_file_path),
+                sql_source_path=sql_query_file_path,
+                output_file_path=output_file_path,
+                output_format=output_format,
+                rows_count=rows_count,
+                sql_duration=sql_dur,
+                export_duration=export_dur,
+                total_duration=total_dur,
+                connection_name=selected_connection.get("name", ""),
+                connection_type=selected_connection.get("type", ""),
+            )
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning("SQL archive failed: %s", exc, exc_info=exc)
 
     if rows_count > 0:
         print(t("CONSOLE_SAVED_PATH", path=output_file_path))
@@ -2120,6 +2728,7 @@ def _create_mssql_frame(parent):
     database_var = tk.StringVar()
     username_var = tk.StringVar()
     password_var = tk.StringVar()
+    remember_password_var = tk.BooleanVar(value=False)
     trusted_var = tk.BooleanVar(value=False)
     encrypt_var = tk.BooleanVar(value=True)
     trust_cert_var = tk.BooleanVar(value=True)
@@ -2155,9 +2764,22 @@ def _create_mssql_frame(parent):
     tk.Label(frame, text=t("LBL_PASSWORD")).grid(
         row=3, column=2, sticky="w", padx=5, pady=(5, 0)
     )
-    tk.Entry(frame, textvariable=password_var, show="*", width=25).grid(
-        row=3, column=3, sticky="we", padx=5, pady=(5, 0)
-    )
+    password_entry = tk.Entry(frame, textvariable=password_var, show="*", width=25)
+    password_entry.grid(row=3, column=3, sticky="we", padx=5, pady=(5, 0))
+
+    def _sync_password_state():  # OFF -> disabled + clear
+        if trusted_var.get():
+            # Trusted auth: password not used
+            remember_password_var.set(False)
+            password_var.set("")
+            password_entry.config(state=tk.DISABLED)
+            return
+
+        if remember_password_var.get():
+            password_entry.config(state=tk.NORMAL)
+        else:
+            password_var.set("")
+            password_entry.config(state=tk.DISABLED)
 
     tk.Checkbutton(
         frame, text=t("CHK_TRUSTED"), variable=trusted_var
@@ -2170,6 +2792,18 @@ def _create_mssql_frame(parent):
     tk.Checkbutton(frame, text=t("CHK_TRUST_CERT"), variable=trust_cert_var).grid(
         row=4, column=3, sticky="w", padx=5, pady=(5, 0)
     )
+    tk.Checkbutton(
+        frame,
+        text=t("CHK_REMEMBER_PASSWORD"),
+        variable=remember_password_var,
+        command=_sync_password_state,
+    ).grid(row=5, column=2, columnspan=2, sticky="w", padx=5, pady=(5, 0))
+
+    def _on_trusted_toggle(*_):  # noqa: ANN001
+        _sync_password_state()
+
+    trusted_var.trace_add("write", _on_trusted_toggle)
+    _sync_password_state()
 
     return frame, {
         "driver": driver_var,
@@ -2177,6 +2811,7 @@ def _create_mssql_frame(parent):
         "database": database_var,
         "username": username_var,
         "password": password_var,
+        "remember_password": remember_password_var,
         "trusted": trusted_var,
         "encrypt": encrypt_var,
         "trust_cert": trust_cert_var,
@@ -2194,6 +2829,7 @@ def _create_pg_frame(parent):
     db_var = tk.StringVar()
     user_var = tk.StringVar()
     password_var = tk.StringVar()
+    remember_password_var = tk.BooleanVar(value=False)
 
     tk.Label(frame, text=t("LBL_HOST")).grid(
         row=0, column=0, sticky="w", padx=5, pady=(5, 0)
@@ -2226,9 +2862,23 @@ def _create_pg_frame(parent):
     tk.Label(frame, text=t("LBL_PASSWORD")).grid(
         row=2, column=0, sticky="w", padx=5, pady=(5, 0)
     )
-    tk.Entry(frame, textvariable=password_var, show="*").grid(
-        row=2, column=1, sticky="we", padx=5, pady=(5, 0)
-    )
+    password_entry = tk.Entry(frame, textvariable=password_var, show="*")
+    password_entry.grid(row=2, column=1, sticky="we", padx=5, pady=(5, 0))
+
+    tk.Checkbutton(
+        frame,
+        text=t("CHK_REMEMBER_PASSWORD"),
+        variable=remember_password_var,
+        command=lambda: (
+            password_entry.config(state=tk.NORMAL)
+            if remember_password_var.get()
+            else (password_var.set(""), password_entry.config(state=tk.DISABLED))
+        ),
+    ).grid(row=3, column=1, columnspan=3, sticky="w", padx=5, pady=(5, 0))
+
+    # init OFF -> disabled
+    password_var.set("")
+    password_entry.config(state=tk.DISABLED)
 
     return frame, {
         "host": host_var,
@@ -2236,6 +2886,7 @@ def _create_pg_frame(parent):
         "database": db_var,
         "user": user_var,
         "password": password_var,
+        "remember_password": remember_password_var,
     }
 
 
@@ -2250,6 +2901,7 @@ def _create_mysql_frame(parent):
     db_var = tk.StringVar()
     user_var = tk.StringVar()
     password_var = tk.StringVar()
+    remember_password_var = tk.BooleanVar(value=False)
 
     tk.Label(frame, text=t("LBL_HOST")).grid(
         row=0, column=0, sticky="w", padx=5, pady=(5, 0)
@@ -2282,9 +2934,23 @@ def _create_mysql_frame(parent):
     tk.Label(frame, text=t("LBL_PASSWORD")).grid(
         row=2, column=0, sticky="w", padx=5, pady=(5, 0)
     )
-    tk.Entry(frame, textvariable=password_var, show="*").grid(
-        row=2, column=1, sticky="we", padx=5, pady=(5, 0)
-    )
+    password_entry = tk.Entry(frame, textvariable=password_var, show="*")
+    password_entry.grid(row=2, column=1, sticky="we", padx=5, pady=(5, 0))
+
+    tk.Checkbutton(
+        frame,
+        text=t("CHK_REMEMBER_PASSWORD"),
+        variable=remember_password_var,
+        command=lambda: (
+            password_entry.config(state=tk.NORMAL)
+            if remember_password_var.get()
+            else (password_var.set(""), password_entry.config(state=tk.DISABLED))
+        ),
+    ).grid(row=3, column=1, columnspan=3, sticky="w", padx=5, pady=(5, 0))
+
+    # init OFF -> disabled
+    password_var.set("")
+    password_entry.config(state=tk.DISABLED)
 
     return frame, {
         "host": host_var,
@@ -2292,6 +2958,7 @@ def _create_mysql_frame(parent):
         "database": db_var,
         "user": user_var,
         "password": password_var,
+        "remember_password": remember_password_var,
     }
 
 
@@ -2424,6 +3091,9 @@ def _load_connection_details(conn_type, vars_by_type, details):
         vars_by_type["database"].set(details.get("database", ""))
         vars_by_type["username"].set(details.get("username", ""))
         vars_by_type["password"].set(details.get("password", ""))
+        remember_var = vars_by_type.get("remember_password")
+        if remember_var is not None:
+            remember_var.set(bool(details.get("password")))
         vars_by_type["trusted"].set(bool(details.get("trusted", False)))
         vars_by_type["encrypt"].set(bool(details.get("encrypt", True)))
         vars_by_type["trust_cert"].set(bool(details.get("trust_server_certificate", True)))
@@ -2433,24 +3103,113 @@ def _load_connection_details(conn_type, vars_by_type, details):
         vars_by_type["database"].set(details.get("database", ""))
         vars_by_type["user"].set(details.get("user", ""))
         vars_by_type["password"].set(details.get("password", ""))
+        remember_var = vars_by_type.get("remember_password")
+        if remember_var is not None:
+            remember_var.set(bool(details.get("password")))
     elif conn_type == "mysql":
         vars_by_type["host"].set(details.get("host", "localhost"))
         vars_by_type["port"].set(str(details.get("port", "3306")))
         vars_by_type["database"].set(details.get("database", ""))
         vars_by_type["user"].set(details.get("user", ""))
         vars_by_type["password"].set(details.get("password", ""))
+        remember_var = vars_by_type.get("remember_password")
+        if remember_var is not None:
+            remember_var.set(bool(details.get("password")))
     elif conn_type == "sqlite":
         vars_by_type["path"].set(details.get("path", ""))
 
 
-def _build_connection_entry(conn_type, vars_by_type, name):
+def _build_runtime_url(conn_type: str, details: dict, runtime_password: str | None) -> str:
+    """
+    Build SQLAlchemy URL from stored details + runtime password (not persisted).
+    IMPORTANT: runtime_password may be None/"" for trusted auth.
+    """
+    details = details or {}
+    pwd = runtime_password or ""
+
+    if conn_type == "mssql_odbc":
+        driver = str(details.get("driver") or "").strip()
+        server = str(details.get("server") or "").strip()
+        database = str(details.get("database") or "").strip()
+        username = str(details.get("username") or "").strip()
+        trusted = bool(details.get("trusted"))
+        encrypt = bool(details.get("encrypt", True))
+        trust_cert = bool(details.get("trust_server_certificate", True))
+
+        parts = [
+            f"DRIVER={{{driver}}}",
+            f"SERVER={server}",
+            f"DATABASE={database}",
+        ]
+        if trusted:
+            parts.append("Trusted_Connection=yes")
+        else:
+            parts.append(f"UID={username}")
+            parts.append(f"PWD={pwd}")
+        if encrypt:
+            parts.append("Encrypt=yes")
+        if trust_cert:
+            parts.append("TrustServerCertificate=yes")
+        odbc = ";".join(parts)
+        return f"mssql+pyodbc:///?odbc_connect={quote_plus(odbc)}"
+
+    if conn_type == "postgresql":
+        host = str(details.get("host") or "").strip()
+        port = str(details.get("port") or "5432").strip() or "5432"
+        database = str(details.get("database") or "").strip()
+        user = str(details.get("user") or "").strip()
+        return (
+            f"postgresql+psycopg2://{quote_plus(user)}:{quote_plus(pwd)}@"
+            f"{host}:{port}/{database}"
+        )
+
+    if conn_type == "mysql":
+        host = str(details.get("host") or "").strip()
+        port = str(details.get("port") or "3306").strip() or "3306"
+        database = str(details.get("database") or "").strip()
+        user = str(details.get("user") or "").strip()
+        return (
+            f"mysql+pymysql://{quote_plus(user)}:{quote_plus(pwd)}@"
+            f"{host}:{port}/{database}"
+        )
+
+    # sqlite
+    db_path = str(details.get("path") or "").strip()
+    return f"sqlite:///{os.path.abspath(db_path)}"
+
+
+def _resolve_password_for_storage(vars_by_type, password, *, confirm_store: bool):
+    remember_var = vars_by_type.get("remember_password")
+    if remember_var is None:
+        return password
+    if not remember_var.get():
+        return ""
+    if not password:
+        return ""
+    if not confirm_store:
+        # e.g. "Test connection" - never ask, never store (caller decides)
+        return password
+    if messagebox.askyesno(
+        t("WARN_REMEMBER_PASSWORD_TITLE"),
+        t("WARN_REMEMBER_PASSWORD_BODY", path=SECURE_PATH),
+    ):
+        return password
+    remember_var.set(False)  # user refused storing -> turn off remember
+    return ""
+
+
+def _build_connection_entry(conn_type, vars_by_type, name, *, confirm_store: bool):
     base_entry = {"name": name, "type": conn_type, "url": "", "details": {}}
     if conn_type == "mssql_odbc":
         driver = vars_by_type["driver"].get().strip()
         server = vars_by_type["server"].get().strip()
         database = vars_by_type["database"].get().strip()
         username = vars_by_type["username"].get().strip()
-        password = vars_by_type["password"].get()
+        password = vars_by_type["password"].get()  # may be empty when remember=OFF (disabled entry)
+        remember_password = vars_by_type.get("remember_password")
+        password_for_storage = _resolve_password_for_storage(
+            vars_by_type, password, confirm_store=confirm_store
+        )
 
         if not driver or not server or not database:
             messagebox.showerror(
@@ -2468,27 +3227,36 @@ def _build_connection_entry(conn_type, vars_by_type, name):
         if vars_by_type["trusted"].get():
             parts.append("Trusted_Connection=yes")
         else:
-            if not username or not password:
+            if not username:
                 messagebox.showerror(
                     t("ERR_DATA_TITLE"),
                     t("ERR_LOGIN_REQUIRED"),
                 )
                 return None
-            parts.extend([f"UID={username}", f"PWD={password}"])
+            if remember_password is not None and remember_password.get() and not password:
+                messagebox.showerror(
+                    t("ERR_DATA_TITLE"),
+                    t("ERR_LOGIN_REQUIRED"),
+                )
+                return None
+            # URL/test uses the runtime password; storage uses password_for_storage
+            parts.append(f"UID={username}")
+            if password:
+                parts.append(f"PWD={password}")
 
         if vars_by_type["encrypt"].get():
             parts.append("Encrypt=yes")
         if vars_by_type["trust_cert"].get():
             parts.append("TrustServerCertificate=yes")
 
-        connection_str = ";".join(parts)
-        base_entry["url"] = f"mssql+pyodbc:///?odbc_connect={quote_plus(connection_str)}"
+        # Do NOT persist URL anymore (may contain secrets). Built at runtime.
+        base_entry["url"] = ""
         base_entry["details"] = {
             "driver": driver,
             "server": server,
             "database": database,
             "username": username,
-            "password": password,
+            "password": password_for_storage,
             "trusted": vars_by_type["trusted"].get(),
             "encrypt": vars_by_type["encrypt"].get(),
             "trust_server_certificate": vars_by_type["trust_cert"].get(),
@@ -2501,6 +3269,10 @@ def _build_connection_entry(conn_type, vars_by_type, name):
         database = vars_by_type["database"].get().strip()
         user = vars_by_type["user"].get().strip()
         password = vars_by_type["password"].get()
+        remember_password = vars_by_type.get("remember_password")
+        password_for_storage = _resolve_password_for_storage(
+            vars_by_type, password, confirm_store=confirm_store
+        )
 
         if not host or not database or not user:
             messagebox.showerror(
@@ -2508,17 +3280,21 @@ def _build_connection_entry(conn_type, vars_by_type, name):
                 t("ERR_FILL_PG"),
             )
             return None
+        if remember_password is not None and remember_password.get() and not password:
+            messagebox.showerror(
+                t("ERR_DATA_TITLE"),
+                t("ERR_LOGIN_REQUIRED"),
+            )
+            return None
 
-        base_entry["url"] = (
-            f"postgresql+psycopg2://{quote_plus(user)}:{quote_plus(password)}@"
-            f"{host}:{port}/{database}"
-        )
+        # Do NOT persist URL anymore (may contain secrets). Built at runtime.
+        base_entry["url"] = ""
         base_entry["details"] = {
             "host": host,
             "port": port,
             "database": database,
             "user": user,
-            "password": password,
+            "password": password_for_storage,
         }
         return base_entry
 
@@ -2528,6 +3304,10 @@ def _build_connection_entry(conn_type, vars_by_type, name):
         database = vars_by_type["database"].get().strip()
         user = vars_by_type["user"].get().strip()
         password = vars_by_type["password"].get()
+        remember_password = vars_by_type.get("remember_password")
+        password_for_storage = _resolve_password_for_storage(
+            vars_by_type, password, confirm_store=confirm_store
+        )
 
         if not host or not database or not user:
             messagebox.showerror(
@@ -2535,17 +3315,21 @@ def _build_connection_entry(conn_type, vars_by_type, name):
                 t("ERR_FILL_MYSQL"),
             )
             return None
+        if remember_password is not None and remember_password.get() and not password:
+            messagebox.showerror(
+                t("ERR_DATA_TITLE"),
+                t("ERR_LOGIN_REQUIRED"),
+            )
+            return None
 
-        base_entry["url"] = (
-            f"mysql+pymysql://{quote_plus(user)}:{quote_plus(password)}@"
-            f"{host}:{port}/{database}"
-        )
+        # Do NOT persist URL anymore (may contain secrets). Built at runtime.
+        base_entry["url"] = ""
         base_entry["details"] = {
             "host": host,
             "port": port,
             "database": database,
             "user": user,
-            "password": password,
+            "password": password_for_storage,
         }
         return base_entry
 
@@ -2555,7 +3339,8 @@ def _build_connection_entry(conn_type, vars_by_type, name):
             t("ERR_DATA_TITLE"), t("ERR_FILL_SQLITE")
         )
         return None
-    base_entry["url"] = f"sqlite:///{os.path.abspath(db_path)}"
+    # Safe even if persisted, but keep consistent: runtime build
+    base_entry["url"] = ""
     base_entry["details"] = {"path": os.path.abspath(db_path)}
     return base_entry
 
@@ -2599,6 +3384,9 @@ def _reset_connection_details(conn_type, vars_by_type):
         vars_by_type["database"].set("")
         vars_by_type["username"].set("")
         vars_by_type["password"].set("")
+        remember_var = vars_by_type.get("remember_password")
+        if remember_var is not None:
+            remember_var.set(False)
         vars_by_type["trusted"].set(False)
         vars_by_type["encrypt"].set(True)
         vars_by_type["trust_cert"].set(True)
@@ -2608,12 +3396,18 @@ def _reset_connection_details(conn_type, vars_by_type):
         vars_by_type["database"].set("")
         vars_by_type["user"].set("")
         vars_by_type["password"].set("")
+        remember_var = vars_by_type.get("remember_password")
+        if remember_var is not None:
+            remember_var.set(False)
     elif conn_type == "mysql":
         vars_by_type["host"].set("localhost")
         vars_by_type["port"].set("3306")
         vars_by_type["database"].set("")
         vars_by_type["user"].set("")
         vars_by_type["password"].set("")
+        remember_var = vars_by_type.get("remember_password")
+        if remember_var is not None:
+            remember_var.set(False)
     elif conn_type == "sqlite":
         vars_by_type["path"].set("")
 
@@ -2710,19 +3504,23 @@ def _load_existing_connection(
 
 
 def _build_and_test_connection_entry(
-    name, conn_type, type_sections, create_engine_from_entry, handle_db_driver_error
+    name, conn_type, type_sections, create_engine_from_entry, handle_db_driver_error, parent=None
 ):
     section = type_sections.get(conn_type)
     if not section:
-        messagebox.showerror(t("ERR_DATA_TITLE"), t("ERR_INVALID_CONN_TYPE"))
+        messagebox.showerror(
+            t("ERR_DATA_TITLE"),
+            t("ERR_INVALID_CONN_TYPE"),
+            parent=parent,
+        )
         return None
 
-    new_entry = _build_connection_entry(conn_type, section[1], name)
+    new_entry = _build_connection_entry(conn_type, section[1], name, confirm_store=False)
     if not new_entry:
         return None
 
     try:
-        engine = create_engine_from_entry(new_entry)
+        engine = create_engine_from_entry(new_entry, parent=parent)
         with engine.connect() as connection:
             connection.execute(text("SELECT 1"))
     except Exception as exc:  # noqa: BLE001
@@ -2737,6 +3535,7 @@ def _build_and_test_connection_entry(
         messagebox.showerror(
             t("ERR_CONNECTION_TITLE"),
             t("ERR_CONNECTION_BODY", error=exc),
+            parent=parent,
         )
         return None
 
@@ -2800,7 +3599,7 @@ def _save_connection_without_test(
         messagebox.showerror(t("ERR_DATA_TITLE"), t("ERR_INVALID_CONN_TYPE"))
         return False
 
-    new_entry = _build_connection_entry(conn_type, section[1], name)
+    new_entry = _build_connection_entry(conn_type, section[1], name, confirm_store=True)
     if not new_entry:
         return False
 
@@ -2835,14 +3634,30 @@ def _save_connection_from_dialog(
     apply_selected_connection,
     handle_db_driver_error,
     create_engine_from_entry,
+    parent=None,
 ):
     name = name_var.get().strip()
     if not _validate_connection_name(name, mode, connections_state["store"], original_name):
         return False
 
-    new_entry = _build_and_test_connection_entry(
-        name, type_var.get(), type_sections, create_engine_from_entry, handle_db_driver_error
+    # Build+test WITHOUT storing prompt, then rebuild for storage with prompt (if needed)
+    tested_entry = _build_and_test_connection_entry(
+        name,
+        type_var.get(),
+        type_sections,
+        create_engine_from_entry,
+        handle_db_driver_error,
+        parent=parent,
     )
+    if not tested_entry:
+        return False
+
+    conn_type = type_var.get()
+    section = type_sections.get(conn_type)
+    if not section:
+        messagebox.showerror(t("ERR_DATA_TITLE"), t("ERR_INVALID_CONN_TYPE"))
+        return False
+    new_entry = _build_connection_entry(conn_type, section[1], name, confirm_store=True)
     if not new_entry:
         return False
 
@@ -2965,6 +3780,7 @@ def open_connection_dialog_gui(
             apply_selected_connection,
             handle_db_driver_error,
             create_engine_from_entry,
+            parent=dlg,
         )
         if saved:
             dlg.destroy()
@@ -2999,6 +3815,7 @@ def open_connection_dialog_gui(
             type_sections,
             create_engine_from_entry,
             handle_db_driver_error,
+            parent=dlg,
         )
         if tested:
             messagebox.showinfo(t("INFO_CONN_TEST_OK_TITLE"), t("INFO_CONN_TEST_OK_BODY"))
@@ -3389,12 +4206,17 @@ def _refresh_csv_profile_list(
     list_var.set(display)
 
     fonts = getattr(listbox, "_fonts", {})
+    item_font_supported = True
     for idx, prof in enumerate(working_profiles):
         font_to_use = (
             fonts.get("bold") if is_builtin_csv_profile(prof["name"]) else fonts.get("normal")
         )
-        if font_to_use is not None:
-            listbox.itemconfig(idx, font=font_to_use)
+        if item_font_supported and font_to_use is not None:
+            try:
+                listbox.itemconfig(idx, font=font_to_use)
+            except tk.TclError:
+                # Some Tk builds (incl. some Windows bundles) do not support per-item fonts in Listbox.
+                item_font_supported = False
 
     display_default_var.set(
         t("CSV_DEFAULT_PROFILE_LABEL", name=default_profile_var.get() or "")
@@ -3745,6 +4567,9 @@ def run_gui(connection_store, output_directory):
     result_info_var = tk.StringVar(value="")
     last_output_path = {"path": None}
     engine_holder = {"engine": None}
+    # Per-session password cache: { cache_key: password }
+    # Exists only in memory for the current app run.
+    password_cache: dict[tuple, str] = {}
     connection_status_var = tk.StringVar(value="")
     connection_status_state = {"key": None, "params": {}}
     secure_edit_state = {"button": None}
@@ -3753,9 +4578,11 @@ def run_gui(connection_store, output_directory):
     selected_connection_var = tk.StringVar(
         value=connections_state["store"].get("last_selected") or ""
     )
+    pasted_sql_state = {"sql": None, "report_name": None}
     lang_var = tk.StringVar(
         value=_CURRENT_LANG.upper()
     )
+    archive_sql_var = tk.BooleanVar(value=load_persisted_archive_sql())
 
     # Template-related state (GUI only; console mode has no template support)
     use_template_var = tk.BooleanVar(value=False)
@@ -3772,7 +4599,15 @@ def run_gui(connection_store, output_directory):
     }
     i18n_widgets = {}
 
+    def on_archive_sql_toggle():  # noqa: ANN001
+        try:
+            persist_archive_sql(bool(archive_sql_var.get()))
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning("Persist archive_sql failed: %s", exc, exc_info=exc)
+
     def _set_sql_path(path):
+        pasted_sql_state["sql"] = None
+        pasted_sql_state["report_name"] = None
         resolved = resolve_path(path)
         selected_sql_path_full.set(resolved)
         sql_label_var.set(shorten_path(path))
@@ -3832,13 +4667,84 @@ def run_gui(connection_store, output_directory):
         set_selected_connection(name)
         apply_selected_connection(show_success=False)
 
-    def create_engine_from_entry(entry):
+    def _password_cache_key(entry):
+        conn_type = (entry.get("type") or "").strip()
+        name = (entry.get("name") or "").strip()
+        details = entry.get("details") or {}
+        if conn_type == "mssql_odbc":
+            return (
+                conn_type,
+                name,
+                details.get("server"),
+                details.get("database"),
+                details.get("username"),
+                bool(details.get("trusted")),
+            )
+        if conn_type == "postgresql":
+            return (
+                conn_type,
+                name,
+                details.get("host"),
+                details.get("port"),
+                details.get("database"),
+                details.get("user"),
+            )
+        if conn_type == "mysql":
+            return (
+                conn_type,
+                name,
+                details.get("host"),
+                details.get("port"),
+                details.get("database"),
+                details.get("user"),
+            )
+        if conn_type == "sqlite":
+            return (conn_type, name, details.get("path"))
+        return (conn_type, name)
+
+    def create_engine_from_entry(entry, parent=None):
         if not entry:
             raise ValueError(t("ERR_NO_SECURE_CONFIG"))
         engine_kwargs = {}
         if entry.get("type") == "mssql_odbc":
             engine_kwargs["isolation_level"] = "AUTOCOMMIT"
-        return create_engine(entry["url"], **engine_kwargs)
+
+        conn_type = str(entry.get("type") or "").strip()
+        name = str(entry.get("name") or "").strip()
+        details = entry.get("details") or {}
+
+        # SQLite: no password prompt
+        if conn_type == "sqlite":
+            url = _build_runtime_url(conn_type, details, None)
+            return create_engine(url, **engine_kwargs)
+
+        # MSSQL trusted auth: no password prompt
+        if conn_type == "mssql_odbc" and bool(details.get("trusted")):
+            url = _build_runtime_url(conn_type, details, None)
+            return create_engine(url, **engine_kwargs)
+
+        stored_pwd = str(details.get("password") or "")
+        if stored_pwd:
+            url = _build_runtime_url(conn_type, details, stored_pwd)
+            return create_engine(url, **engine_kwargs)
+
+        # Not stored -> use cache or prompt once per session
+        cache_key = _password_cache_key(entry)
+        cached = password_cache.get(cache_key)
+        if not cached:
+            pwd = simpledialog.askstring(
+                t("PROMPT_PASSWORD_TITLE"),
+                t("PROMPT_PASSWORD_BODY", name=name),
+                show="*",
+                parent=parent or root,
+            )
+            if pwd is None or not str(pwd):
+                raise ValueError("Password required.")
+            cached = str(pwd)
+            password_cache[cache_key] = cached
+
+        url = _build_runtime_url(conn_type, details, cached)
+        return create_engine(url, **engine_kwargs)
 
     def apply_selected_connection(show_success=False):
         conn = get_connection_by_name(selected_connection_var.get())
@@ -3861,6 +4767,15 @@ def run_gui(connection_store, output_directory):
                 conn.get("type"),
                 exc_info=exc,
             )
+            if conn.get("type") == "mssql_odbc":
+                details = (
+                    f"{type(exc).__name__}: {_redact_conn_secrets(str(exc))}\n\n"
+                    f"e.args={_redact_conn_secrets(str(getattr(exc, 'args', None)))}\n\n"
+                    f"ODBC diagnostics:\n{odbc_diagnostics_text()}\n\n"
+                    f"Traceback:\n{_redact_conn_secrets(traceback.format_exc())}"
+                )
+                messagebox.showerror("Cannot connect to SQL Server (details)", details)
+                return
             messagebox.showerror(
                 t("ERR_CONNECTION_TITLE"),
                 t("ERR_CONNECTION_BODY", error=exc),
@@ -4243,8 +5158,79 @@ def run_gui(connection_store, output_directory):
             title=t("TITLE_SELECT_SQL"),
             filetypes=[(t("FILETYPE_SQL"), "*.sql"), (t("FILETYPE_ALL"), "*.*")],
         )
-        if path:
-            _set_sql_path(path)
+        if not path:
+            return
+        ok, msg = validate_sql_text_file(path)
+        if not ok:
+            messagebox.showerror(t("ERR_INVALID_SQL_FILE_TITLE"), msg)
+            return
+        _set_sql_path(path)
+
+    def open_paste_sql_dialog():
+        dlg = tk.Toplevel(root)
+        apply_app_icon(dlg)
+        dlg.title(t("TITLE_PASTE_SQL"))
+        dlg.transient(root)
+        dlg.grab_set()
+        dlg.minsize(520, 320)
+        _center_window(dlg, root)
+
+        report_name_var = tk.StringVar(value=pasted_sql_state["report_name"] or "")
+
+        dlg.columnconfigure(0, weight=1)
+        dlg.rowconfigure(3, weight=1)
+
+        tk.Label(dlg, text=t("LBL_REPORT_NAME")).grid(
+            row=0, column=0, sticky="w", padx=12, pady=(12, 4)
+        )
+        report_entry = tk.Entry(dlg, textvariable=report_name_var, width=40)
+        report_entry.grid(row=1, column=0, sticky="we", padx=12)
+
+        tk.Label(dlg, text=t("LBL_PASTE_SQL")).grid(
+            row=2, column=0, sticky="nw", padx=12, pady=(12, 4)
+        )
+        sql_text_widget = tk.Text(dlg, wrap="none", height=10)
+        sql_text_widget.grid(row=3, column=0, sticky="nsew", padx=12)
+        if pasted_sql_state["sql"]:
+            sql_text_widget.insert("1.0", pasted_sql_state["sql"])
+
+        btn_frame = tk.Frame(dlg)
+        btn_frame.grid(row=4, column=0, sticky="e", padx=12, pady=(12, 12))
+
+        def use_sql(*_):
+            ok, msg, normalized_name = validate_report_basename(report_name_var.get())
+            if not ok:
+                messagebox.showerror(
+                    t("ERR_INVALID_REPORT_NAME_TITLE"),
+                    msg,
+                    parent=dlg,
+                )
+                return
+            sql = sql_text_widget.get("1.0", tk.END).strip()
+            if not sql:
+                messagebox.showerror(
+                    t("ERR_EMPTY_SQL_TITLE"),
+                    t("ERR_EMPTY_SQL_BODY"),
+                    parent=dlg,
+                )
+                return
+            pasted_sql_state["sql"] = sql
+            pasted_sql_state["report_name"] = normalized_name
+            selected_sql_path_full.set("")
+            sql_label_var.set(f"{t('LBL_SQL_PASTED')} {normalized_name}")
+            dlg.destroy()
+
+        def cancel(*_):
+            dlg.destroy()
+
+        cancel_btn = tk.Button(btn_frame, text=t("BTN_CANCEL"), width=12, command=cancel)
+        use_btn = tk.Button(btn_frame, text=t("BTN_USE_SQL"), width=12, command=use_sql)
+        cancel_btn.pack(side="left", padx=(0, 6))
+        use_btn.pack(side="left")
+
+        dlg.bind("<Escape>", cancel)
+        dlg.bind("<Return>", use_sql)
+        report_entry.focus_set()
 
     def update_template_controls_state():
         enabled = use_template_var.get()
@@ -4701,13 +5687,32 @@ def run_gui(connection_store, output_directory):
         root.wait_window(dlg)
 
     def _build_export_params():
-        path = selected_sql_path_full.get()
-        if not path:
-            messagebox.showerror(t("ERR_TITLE"), t("ERR_NO_SQL_SELECTED"))
-            return None
-        if not os.path.isfile(path):
-            messagebox.showerror(t("ERR_TITLE"), t("ERR_SQL_NOT_FOUND"))
-            return None
+        use_pasted_sql = bool(
+            pasted_sql_state["sql"] and pasted_sql_state["report_name"]
+        )
+        if use_pasted_sql:
+            sql_query = pasted_sql_state["sql"]
+            base_name = pasted_sql_state["report_name"]
+            sql_source_path = f"<pasted:{base_name}>"
+        else:
+            path = selected_sql_path_full.get()
+            if not path:
+                messagebox.showerror(t("ERR_TITLE"), t("ERR_NO_SQL_SOURCE"))
+                return None
+            if not os.path.isfile(path):
+                messagebox.showerror(t("ERR_TITLE"), t("ERR_SQL_NOT_FOUND"))
+                return None
+
+            ok, msg = validate_sql_text_file(path)
+            if not ok:
+                messagebox.showerror(t("ERR_INVALID_SQL_FILE_TITLE"), msg)
+                return None
+
+            with open(path, "rb") as f:
+                content = f.read()
+            sql_query = remove_bom(content).strip()
+            base_name = os.path.basename(path)
+            sql_source_path = path
 
         engine = engine_holder.get("engine")
         current_connection = get_connection_by_name(selected_connection_var.get())
@@ -4718,9 +5723,6 @@ def run_gui(connection_store, output_directory):
             )
             return None
 
-        with open(path, "rb") as f:
-            content = f.read()
-        sql_query = remove_bom(content).strip()
         if current_connection.get("type") == "mssql_odbc" and sql_query:
             sql_query = (
                 "SET ARITHABORT ON;\nSET NOCOUNT ON;\nSET ANSI_WARNINGS OFF;\n"
@@ -4729,7 +5731,6 @@ def run_gui(connection_store, output_directory):
 
         output_format = format_var.get()
         use_template = use_template_var.get()
-        base_name = os.path.basename(path)
 
         csv_profile = None
         if output_format == "csv":
@@ -4757,12 +5758,19 @@ def run_gui(connection_store, output_directory):
                 )
                 return None
 
-            output_file_name = os.path.splitext(base_name)[0] + ".xlsx"
+            if use_pasted_sql:
+                output_file_name = f"{base_name}.xlsx"
+            else:
+                output_file_name = os.path.splitext(base_name)[0] + ".xlsx"
             output_file_path = os.path.join(output_directory, output_file_name)
 
             return {
                 "engine": engine,
                 "sql_query": sql_query,
+                "report_label": base_name,
+                "sql_source_path": sql_source_path,
+                "connection_name": current_connection.get("name", ""),
+                "connection_type": current_connection.get("type", ""),
                 "output_format": output_format,
                 "output_file_path": output_file_path,
                 "csv_profile": csv_profile,
@@ -4775,14 +5783,21 @@ def run_gui(connection_store, output_directory):
                 },
             }
 
-        output_file_name = os.path.splitext(base_name)[0] + (
-            ".xlsx" if output_format == "xlsx" else ".csv"
-        )
+        if use_pasted_sql:
+            output_file_name = base_name + (".xlsx" if output_format == "xlsx" else ".csv")
+        else:
+            output_file_name = os.path.splitext(base_name)[0] + (
+                ".xlsx" if output_format == "xlsx" else ".csv"
+            )
         output_file_path = os.path.join(output_directory, output_file_name)
 
         return {
             "engine": engine,
             "sql_query": sql_query,
+            "report_label": base_name,
+            "sql_source_path": sql_source_path,
+            "connection_name": current_connection.get("name", ""),
+            "connection_type": current_connection.get("type", ""),
             "output_format": output_format,
             "output_file_path": output_file_path,
             "csv_profile": csv_profile,
@@ -4827,6 +5842,24 @@ def run_gui(connection_store, output_directory):
                 )
 
             last_output_path["path"] = params["output_file_path"]
+
+            if archive_sql_var.get():
+                try:
+                    write_sql_archive_entry(
+                        sql_query=sql_query,
+                        report_label=params.get("report_label", ""),
+                        sql_source_path=params.get("sql_source_path", ""),
+                        output_file_path=params["output_file_path"],
+                        output_format=("xlsx" if params.get("use_template") else output_format),
+                        rows_count=rows_count,
+                        sql_duration=sql_dur,
+                        export_duration=export_dur,
+                        total_duration=total_dur,
+                        connection_name=params.get("connection_name", ""),
+                        connection_type=params.get("connection_type", ""),
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    LOGGER.warning("SQL archive failed: %s", exc, exc_info=exc)
 
             if output_format == "csv" and csv_profile:
                 prof_name = (csv_profile.get("name") or "").strip()
@@ -4896,6 +5929,78 @@ def run_gui(connection_store, output_directory):
             folder = os.path.dirname(path)
             _open_path(folder)
 
+    def check_updates_gui():
+        prev_status = connection_status_var.get()
+        prev_key = connection_status_state.get("key")
+        prev_params = connection_status_state.get("params") or {}
+        connection_status_var.set(t("UPD_CHECKING"))
+        root.update_idletasks()
+        mode = detect_install_mode()
+        try:
+            info = get_update_info()
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning("Update check failed: %s", exc, exc_info=exc)
+            messagebox.showerror(t("UPD_TITLE"), t("UPD_CHECK_FAILED"))
+            return
+        finally:
+            if prev_key:
+                set_connection_status(key=prev_key, **prev_params)
+            else:
+                connection_status_var.set(prev_status)
+
+        latest_tag = info.get("latest_tag") or ""
+        current_tag = info.get("current_tag") or f"v{APP_VERSION}"
+        if not latest_tag:
+            messagebox.showerror(t("UPD_TITLE"), t("UPD_CHECK_FAILED"))
+            return
+        if mode == "exe" and not info.get("asset"):
+            messagebox.showerror(t("UPD_TITLE"), t("UPD_CHECK_FAILED"))
+            return
+
+        if not info.get("update_available"):
+            message_lines = [
+                t("UPD_NO_UPDATE", current=current_tag, latest=latest_tag)
+            ]
+            if mode == "git":
+                message_lines.append(t("UPD_GIT_MODE", command="git pull"))
+            elif mode == "source":
+                message_lines.append(t("UPD_SOURCE_MODE"))
+            messagebox.showinfo(
+                t("UPD_TITLE"),
+                "\n\n".join(message_lines),
+            )
+            return
+        if mode in {"git", "source"}:
+            message_lines = [
+                t("UPD_UPDATE_AVAILABLE", current=current_tag, latest=latest_tag)
+            ]
+            if mode == "git":
+                message_lines.append(t("UPD_GIT_MODE", command="git pull"))
+            else:
+                message_lines.append(t("UPD_SOURCE_MODE"))
+            messagebox.showinfo(t("UPD_TITLE"), "\n\n".join(message_lines))
+            return
+        prompt = "\n\n".join(
+            [
+                t("UPD_UPDATE_AVAILABLE", current=current_tag, latest=latest_tag),
+                t("UPD_PROMPT_INSTALL"),
+            ]
+        )
+        if not messagebox.askyesno(t("UPD_TITLE"), prompt):
+            return
+        if not _get_updater_command():
+            messagebox.showerror(t("UPD_TITLE"), t("UPD_UPDATER_MISSING"))
+            return
+        try:
+            if not launch_updater(wait_pid=os.getpid()):
+                messagebox.showerror(t("UPD_TITLE"), t("UPD_START_FAILED"))
+                return
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning("Failed to start updater: %s", exc, exc_info=exc)
+            messagebox.showerror(t("UPD_TITLE"), t("UPD_START_FAILED"))
+            return
+        root.destroy()
+
     connection_frame = tk.LabelFrame(
         root, text=t("FRAME_DB_CONNECTION"), padx=10, pady=10
     )
@@ -4948,6 +6053,15 @@ def run_gui(connection_store, output_directory):
     )
     lang_combo.grid(row=1, column=1, sticky="w", padx=(5, 0), pady=(5, 0))
     i18n_widgets["lang_combo"] = lang_combo
+
+    chk_archive_sql = tk.Checkbutton(
+        connection_controls,
+        text=t("CHK_ARCHIVE_SQL"),
+        variable=archive_sql_var,
+        command=on_archive_sql_toggle,
+    )
+    chk_archive_sql.grid(row=2, column=0, columnspan=2, sticky="w", pady=(5, 0))
+    i18n_widgets["chk_archive_sql"] = chk_archive_sql
 
     btn_odbc_diagnostics = tk.Button(
         connection_controls,
@@ -5072,6 +6186,13 @@ def run_gui(connection_store, output_directory):
         row=1, column=2, pady=5, sticky="w"
     )
     i18n_widgets["btn_edit_queries"] = btn_edit_queries
+    btn_paste_sql = tk.Button(
+        source_frame, text=t("BTN_PASTE_SQL"), command=open_paste_sql_dialog
+    )
+    btn_paste_sql.grid(
+        row=1, column=3, pady=5, sticky="w"
+    )
+    i18n_widgets["btn_paste_sql"] = btn_paste_sql
 
     radio_xlsx = tk.Radiobutton(
         format_frame,
@@ -5195,6 +6316,13 @@ def run_gui(connection_store, output_directory):
     )
     btn_report_issue.grid(row=0, column=1, padx=(10, 0), pady=(0, 10), sticky="w")
     i18n_widgets["btn_report_issue"] = btn_report_issue
+    btn_check_updates = tk.Button(
+        result_frame,
+        text=t("BTN_CHECK_UPDATES"),
+        command=check_updates_gui,
+    )
+    btn_check_updates.grid(row=0, column=2, padx=(10, 0), pady=(0, 10), sticky="w")
+    i18n_widgets["btn_check_updates"] = btn_check_updates
 
     refresh_connection_combobox()
     refresh_secure_edit_button()
@@ -5255,6 +6383,7 @@ def run_gui(connection_store, output_directory):
         result_frame.config(text=t("FRAME_RESULTS"))
         lbl_connection.config(text=t("LBL_CONNECTION"))
         lbl_language.config(text=t("LBL_LANGUAGE"))
+        chk_archive_sql.config(text=t("CHK_ARCHIVE_SQL"))
         btn_edit_connection.config(text=t("BTN_EDIT_CONNECTION"))
         btn_new_connection.config(text=t("BTN_NEW_CONNECTION"))
         btn_test_connection.config(text=t("BTN_TEST_CONNECTION"))
@@ -5264,6 +6393,7 @@ def run_gui(connection_store, output_directory):
         btn_select_sql.config(text=t("BTN_SELECT_SQL"))
         btn_select_from_list.config(text=t("BTN_SELECT_FROM_LIST"))
         btn_edit_queries.config(text=t("BTN_EDIT_QUERIES"))
+        btn_paste_sql.config(text=t("BTN_PASTE_SQL"))
         radio_xlsx.config(text=t("FORMAT_XLSX"))
         radio_csv.config(text=t("FORMAT_CSV"))
         lbl_csv_profile.config(text=t("LBL_CSV_PROFILE"))
@@ -5276,6 +6406,7 @@ def run_gui(connection_store, output_directory):
         include_header_check.config(text=t("CHK_INCLUDE_HEADERS"))
         btn_start.config(text=t("BTN_START"))
         btn_report_issue.config(text=t("BTN_REPORT_ISSUE"))
+        btn_check_updates.config(text=t("BTN_CHECK_UPDATES"))
         lbl_export_info.config(text=t("LBL_EXPORT_INFO"))
         btn_open_file.config(text=t("BTN_OPEN_FILE"))
         btn_open_folder.config(text=t("BTN_OPEN_FOLDER"))
@@ -5291,6 +6422,10 @@ def run_gui(connection_store, output_directory):
                 connected=is_connected,
                 key=connection_status_state["key"],
                 **connection_status_state["params"],
+            )
+        if pasted_sql_state["report_name"]:
+            sql_label_var.set(
+                f"{t('LBL_SQL_PASTED')} {pasted_sql_state['report_name']}"
             )
 
     def on_lang_change(_event=None):  # noqa: ANN001
@@ -5311,6 +6446,7 @@ if __name__ == "__main__":
     ensure_directories(
         [
             output_directory,
+            SQL_ARCHIVE_DIR,
             _build_path("templates"),
             _build_path("queries"),
         ]
@@ -5332,7 +6468,130 @@ if __name__ == "__main__":
     parser.add_argument("-c", "--console", action="store_true", help=t("CLI_CONSOLE_HELP"))
     parser.add_argument("--lang", choices=["en", "pl"], help=t("CLI_LANG_HELP"))
     parser.add_argument("--diag-odbc", action="store_true", help=t("CLI_DIAG_ODBC_HELP"))
+    parser.add_argument(
+        "--check-update",
+        action="store_true",
+        help="Check for updates and exit.",
+    )
+    parser.add_argument(
+        "--update",
+        action="store_true",
+        help="Start updater (if available) and exit.",
+    )
+    parser.add_argument(
+        "--archive-sql",
+        action="store_true",
+        help="Archive executed SQL (with metadata) to sql_archive/.",
+    )
     args = parser.parse_args()
+    install_mode = detect_install_mode()
+
+    if args.check_update:
+        if install_mode == "git":
+            release_info = None
+            try:
+                release_info = get_update_info()
+            except Exception:
+                release_info = None
+            print("Update: repository checkout detected. Use Git to sync with remote (e.g. `git pull`).")
+            local_sha = _get_git_full_sha()
+            remote_sha = None
+            try:
+                remote_sha = _fetch_remote_main_sha()
+            except Exception:
+                remote_sha = None
+            if local_sha and remote_sha:
+                local_short = local_sha[:7]
+                remote_short = remote_sha[:7]
+                relation = _classify_git_relation(local_sha, remote_sha)
+                if relation == "match":
+                    print(
+                        f"Update: local matches remote main (local {local_short}, remote {remote_short})"
+                    )
+                elif relation == "remote_ahead":
+                    print(
+                        f"Update: remote main is ahead (local {local_short}, remote {remote_short})"
+                    )
+                elif relation == "local_ahead":
+                    print(
+                        f"Update: local is ahead of remote main (local {local_short}, remote {remote_short})"
+                    )
+                elif relation == "diverged":
+                    print(
+                        f"Update: local and remote main have diverged (local {local_short}, remote {remote_short})"
+                    )
+                else:
+                    print(
+                        f"Update: local differs from remote main (local {local_short}, remote {remote_short})"
+                    )
+            if release_info:
+                latest_tag = release_info.get("latest_tag") or ""
+                current_tag = release_info.get("current_tag") or f"v{APP_VERSION}"
+                if latest_tag:
+                    status = (
+                        "available"
+                        if release_info.get("update_available")
+                        else "none"
+                    )
+                    print(
+                        f"Release: {status} (current {current_tag}, latest {latest_tag})"
+                    )
+            sys.exit(0)
+        if install_mode == "source":
+            release_info = None
+            try:
+                release_info = get_update_info()
+            except Exception:
+                release_info = None
+            print(
+                "Update: source checkout detected (no Git). Download a new ZIP or clone the repo."
+            )
+            if release_info:
+                latest_tag = release_info.get("latest_tag") or ""
+                current_tag = release_info.get("current_tag") or f"v{APP_VERSION}"
+                if latest_tag:
+                    status = (
+                        "available"
+                        if release_info.get("update_available")
+                        else "none"
+                    )
+                    print(
+                        f"Release: {status} (current {current_tag}, latest {latest_tag})"
+                    )
+            sys.exit(0)
+        try:
+            info = get_update_info()
+        except Exception:
+            print("Update: error (check failed)")
+            sys.exit(0)
+        latest_tag = info.get("latest_tag") or ""
+        current_tag = info.get("current_tag") or f"v{APP_VERSION}"
+        if not latest_tag:
+            print("Update: error (check failed)")
+            sys.exit(0)
+        if info.get("update_available"):
+            print(f"Update: available (current {current_tag}, latest {latest_tag})")
+        else:
+            print(f"Update: none (current {current_tag}, latest {latest_tag})")
+        sys.exit(0)
+
+    if args.update:
+        if install_mode != "exe":
+            print(
+                "Update: not supported for source runs. Use `git pull` or download a new ZIP."
+            )
+            sys.exit(2)
+        if not _get_updater_command():
+            print("Update: updater missing (download new ZIP manually)")
+            sys.exit(2)
+        try:
+            if not launch_updater(wait_pid=os.getpid()):
+                print("Update: start failed")
+                sys.exit(1)
+        except Exception:
+            print("Update: start failed")
+            sys.exit(1)
+        sys.exit(0)
 
     if args.diag_odbc:
         print(odbc_diagnostics_text())
@@ -5375,7 +6634,24 @@ if __name__ == "__main__":
         if selected_connection.get("type") == "mssql_odbc":
             engine_kwargs["isolation_level"] = "AUTOCOMMIT"
         try:
-            engine = create_engine(selected_connection.get("url"), **engine_kwargs)
+            # Console: build runtime URL from details; if password missing -> prompt in console.
+            ctype = selected_connection.get("type")
+            details = selected_connection.get("details") or {}
+            if ctype == "sqlite":
+                url = _build_runtime_url(ctype, details, None)
+            elif ctype == "mssql_odbc" and bool(details.get("trusted")):
+                url = _build_runtime_url(ctype, details, None)
+            else:
+                pwd = str(details.get("password") or "")
+                if not pwd:
+                    pwd = getpass.getpass(
+                        t(
+                            "CONSOLE_PROMPT_PASSWORD",
+                            name=selected_connection.get("name"),
+                        )
+                    )
+                url = _build_runtime_url(ctype, details, pwd)
+            engine = create_engine(url, **engine_kwargs)
         except Exception as exc:  # noqa: BLE001
             handled = handle_db_driver_error(
                 exc,
@@ -5393,6 +6669,11 @@ if __name__ == "__main__":
                 print(t("CLI_CONNECTION_FAIL"))
             sys.exit(1)
 
-        run_console(engine, output_directory, selected_connection)
+        run_console(
+            engine,
+            output_directory,
+            selected_connection,
+            archive_sql=args.archive_sql,
+        )
     else:
         run_gui(connection_store, output_directory)
