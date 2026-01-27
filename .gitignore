@@ -13,6 +13,7 @@ templates/*
 
 data/
 db/
+sql_archive/
 
 # --- Generated output ---
 generated_reports/
