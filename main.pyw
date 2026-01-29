@@ -93,7 +93,7 @@ def apply_app_icon(win) -> None:
 
 # --- App version -------------------------------------------------------------
 
-APP_VERSION = "0.3.6"  # bump manually for releases
+APP_VERSION = "0.3.7"  # bump manually for releases
 
 GITHUB_ISSUE_CHOOSER_URL = (
     "https://github.com/kkrysztofczyk/kkr-query2xlsx/issues/new/choose"
@@ -1254,6 +1254,8 @@ I18N: dict[str, dict[str, str]] = {
         "BTN_REPORT_ISSUE": "Report issue / suggestion",
         "BTN_CHECK_UPDATES": "Check updates",
         "BTN_HELP": "Help / README",
+        "BTN_OPEN_LOGS": "Open logs folder",
+        "LBL_PROJECT_PAGE": "Project page",
         "HELP_TITLE": "Help",
         "HELP_BODY": (
             "Checklist (30 seconds):\n"
@@ -1730,6 +1732,8 @@ I18N: dict[str, dict[str, str]] = {
         "BTN_REPORT_ISSUE": "Zgłoś problem / sugestię",
         "BTN_CHECK_UPDATES": "Sprawdź aktualizacje",
         "BTN_HELP": "Pomoc / README",
+        "BTN_OPEN_LOGS": "Otwórz katalog logów",
+        "LBL_PROJECT_PAGE": "Strona projektu",
         "HELP_TITLE": "Pomoc",
         "HELP_BODY": (
             "Checklista (30 sekund):\n"
@@ -2159,26 +2163,21 @@ def show_readme_window(parent) -> None:
     from tkinter import ttk
 
     win = tk.Toplevel(parent)
-    win.title("kkr-query2xlsx — Dokumentacja")
+    apply_app_icon(win)
+    win.title("kkr-query2xlsx — README")
     win.geometry("920x700")
+    win.minsize(720, 480)
+    win.transient(parent)
+    try:
+        win.lift()
+        win.focus_set()
+    except Exception:
+        pass
 
     top = ttk.Frame(win)
     top.pack(fill="x", padx=10, pady=(10, 6))
 
-    ttk.Label(top, text="Dokumentacja", font=("TkDefaultFont", 12, "bold")).pack(
-        side="left"
-    )
-
-    btns = ttk.Frame(top)
-    btns.pack(side="right")
-
-    ttk.Button(btns, text="Online README", command=lambda: open_docs_online(REPO_URL)).pack(
-        side="left", padx=(0, 6)
-    )
-    ttk.Button(btns, text="Releases", command=lambda: open_docs_online(RELEASES_URL)).pack(
-        side="left", padx=(0, 6)
-    )
-    ttk.Button(btns, text="Issues", command=lambda: open_docs_online(ISSUES_URL)).pack(
+    ttk.Label(top, text="README.md", font=("TkDefaultFont", 12, "bold")).pack(
         side="left"
     )
 
@@ -2199,7 +2198,15 @@ def show_readme_window(parent) -> None:
 
     _maybe_insert_image(txt, win._img_refs, _resource_path("docs/logo.png"), max_width=880)
 
-    md = _read_text_if_exists(_resource_path("README.md")) or _DEFAULT_HELP_MD
+    readme_path = _resource_path("README.md")
+    md = _read_text_if_exists(readme_path)
+    if not md:
+        md = (
+            "# README.md not found\n\n"
+            f"Missing file: {readme_path}\n\n"
+            "Project page:\n"
+            f"- {REPO_URL}\n"
+        )
     md = _cleanup_md_for_viewer(md)
     _insert_md_simple(txt, md)
 
@@ -6864,66 +6871,14 @@ def run_gui(connection_store, output_directory):
             folder = os.path.dirname(path)
             _open_path(folder)
 
+    logs_dir = os.path.join(BASE_DIR, "logs")
+
+    def open_logs_folder():
+        _open_path(logs_dir)
+
     def show_help_window():
-        dlg = tk.Toplevel(root)
-        apply_app_icon(dlg)
-        dlg.title(t("HELP_TITLE"))
-        dlg.transient(root)
-        dlg.grab_set()
-        dlg.resizable(True, True)
-        dlg.minsize(680, 420)
-        dlg.bind("<Escape>", lambda *_: dlg.destroy())
-
-        logs_dir = os.path.join(BASE_DIR, "logs")
-        log_file = os.path.join(logs_dir, "kkr-query2xlsx.log")
-
-        body = tk.Frame(dlg)
-        body.pack(fill="both", expand=True, padx=10, pady=10)
-
-        txt = tk.Text(body, wrap="word", height=18, width=90)
-        y_scroll = tk.Scrollbar(body, orient="vertical", command=txt.yview)
-        txt.configure(yscrollcommand=y_scroll.set)
-
-        y_scroll.pack(side="right", fill="y")
-        txt.pack(side="left", fill="both", expand=True)
-
-        txt.insert(
-            "1.0",
-            t(
-                "HELP_BODY",
-                base_dir=BASE_DIR,
-                reports_dir=output_directory,
-                logs_dir=logs_dir,
-                log_file=log_file,
-            ),
-        )
-        txt.configure(state="disabled")
-
-        btns = tk.Frame(dlg)
-        btns.pack(fill="x", padx=10, pady=(0, 10))
-
-        tk.Button(btns, text=t("HELP_OPEN_README"), command=lambda: show_readme_window(root)).pack(
-            side="left"
-        )
-        tk.Button(
-            btns,
-            text=t("HELP_OPEN_LOGS"),
-            command=lambda: _open_path(logs_dir),
-        ).pack(side="left", padx=(10, 0))
-        tk.Button(
-            btns,
-            text=t("HELP_OPEN_REPORTS"),
-            command=lambda: _open_path(output_directory),
-        ).pack(side="left", padx=(10, 0))
-
-        # Optional: keep Report issue visible here as well
-        tk.Button(
-            btns,
-            text=t("BTN_REPORT_ISSUE"),
-            command=lambda: open_github_issue_chooser(parent=dlg),
-        ).pack(side="right")
-
-        _center_window(dlg, parent=root)
+        # Help == README viewer (no nested modal windows).
+        show_readme_window(root)
 
     def check_updates_gui():
         prev_status = connection_status_var.get()
@@ -7387,6 +7342,25 @@ def run_gui(connection_store, output_directory):
     )
     btn_help.grid(row=0, column=3, padx=(10, 0), pady=(0, 10), sticky="w")
     i18n_widgets["btn_help"] = btn_help
+    btn_open_logs = tk.Button(
+        result_frame, text=t("BTN_OPEN_LOGS"), command=open_logs_folder
+    )
+    btn_open_logs.grid(row=0, column=4, padx=(10, 0), pady=(0, 10), sticky="w")
+    i18n_widgets["btn_open_logs"] = btn_open_logs
+
+    lbl_project_page = tk.Label(
+        result_frame, text=t("LBL_PROJECT_PAGE"), fg="blue", cursor="hand2"
+    )
+    _project_font = tkfont.Font(lbl_project_page, lbl_project_page.cget("font"))
+    _project_font.configure(underline=True)
+    lbl_project_page.configure(font=_project_font)
+    lbl_project_page.bind(
+        "<Button-1>", lambda *_: webbrowser.open(REPO_URL)
+    )
+    lbl_project_page.grid(
+        row=0, column=5, padx=(10, 0), pady=(2, 10), sticky="w"
+    )
+    i18n_widgets["lbl_project_page"] = lbl_project_page
 
     refresh_connection_combobox()
     refresh_secure_edit_button()
@@ -7472,6 +7446,8 @@ def run_gui(connection_store, output_directory):
         btn_report_issue.config(text=t("BTN_REPORT_ISSUE"))
         btn_check_updates.config(text=t("BTN_CHECK_UPDATES"))
         btn_help.config(text=t("BTN_HELP"))
+        btn_open_logs.config(text=t("BTN_OPEN_LOGS"))
+        lbl_project_page.config(text=t("LBL_PROJECT_PAGE"))
         lbl_export_info.config(text=t("LBL_EXPORT_INFO"))
         btn_open_file.config(text=t("BTN_OPEN_FILE"))
         btn_open_folder.config(text=t("BTN_OPEN_FOLDER"))

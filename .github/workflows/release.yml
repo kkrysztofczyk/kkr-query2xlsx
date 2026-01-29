@@ -19,7 +19,8 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $patterns = @("kkr-query2xlsx","kkr-query2xlsx")
+          # legacy name(s) to forbid
+          $patterns = @("kkr-query2sheet")
 
           $files = git ls-files
           $textFiles = $files | Where-Object { $_ -match '\.(md|txt|json|yml|yaml|sql|py|pyw|ps1|bat|cmd)$' }
@@ -46,16 +47,6 @@ jobs:
           python -m pip install --upgrade pip
           if (Test-Path requirements.txt) { pip install -r requirements.txt }
           pip install pyinstaller pyodbc
-
-      - name: Sanity check (no legacy name)
-        run: |
-          $files = git ls-files
-          $hits = Select-String -Path $files -Pattern "kkr-query2xlsx" -SimpleMatch -List -ErrorAction SilentlyContinue
-          if ($hits) {
-            Write-Error "Found forbidden string 'kkr-query2xlsx' in:"
-            $hits | ForEach-Object { Write-Error (" - {0}:{1}" -f $_.Path,$_.LineNumber) }
-            exit 1
-          }
 
       - name: Build (PyInstaller - onedir)
         run: |

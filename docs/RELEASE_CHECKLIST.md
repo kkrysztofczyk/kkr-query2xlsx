@@ -9,5 +9,5 @@
 - Smoke test on Windows: unzip -> launch exe
 
 ex. 
-git tag -a v0.3.6 -m "v0.3.6"
-git push origin v0.3.6
+git tag -a v0.3.7 -m "v0.3.7"
+git push origin v0.3.7
