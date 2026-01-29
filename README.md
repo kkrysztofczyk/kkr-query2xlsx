@@ -67,6 +67,15 @@ You have **two options**:
 - ✅ Auto-creates local config on first run (no manual copying)
 - ✅ Best for non-developers
 
+### Checklist (30 seconds)
+
+- ✅ Unzip to a folder you can write to (Desktop / Documents). Avoid `Program Files`.
+- ✅ Don’t run the EXE from inside the ZIP (unzip first).
+- ✅ Your files are created next to the app folder:
+  - `generated_reports/` (exports)
+  - `logs/kkr-query2xlsx.log` (logs)
+- ✅ If you see “access denied / no permission” → move the extracted folder somewhere writable.
+
 ### Option 2 — Run from source (developers / non-Windows)
 - Requires Python + dependencies
 - Best if you want to modify the code, contribute, or run on Linux/macOS
@@ -145,6 +154,7 @@ If enabled, the app:
 
 - Exports: `generated_reports/`
 - Logs: `logs/kkr-query2xlsx.log` (rotating)
+- In the app: **Help → Open logs / Open reports**
 
 ---
 
@@ -225,6 +235,7 @@ python main.pyw --lang pl
 ## Troubleshooting (Windows)
 
 - **Always unzip first** (don’t run the exe inside the zip)
+- If you see **Access denied / no permission** errors, unzip/move the folder to a user-writable location (Desktop / Documents)
 - If Windows blocks the download: right-click the `.zip` → Properties → **Unblock**
 - If antivirus/EDR blocks the app, whitelist the extracted folder (common with packed apps)
 

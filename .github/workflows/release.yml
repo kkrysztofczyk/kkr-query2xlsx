@@ -15,6 +15,27 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Sanity check (no legacy project name)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $patterns = @("kkr-query2xlsx","kkr-query2xlsx")
+
+          $files = git ls-files
+          $textFiles = $files | Where-Object { $_ -match '\.(md|txt|json|yml|yaml|sql|py|pyw|ps1|bat|cmd)$' }
+
+          $hits = $textFiles | ForEach-Object {
+            Select-String -Path $_ -Pattern $patterns -SimpleMatch -ErrorAction SilentlyContinue
+          }
+
+          if ($hits) {
+            Write-Host "Found legacy name occurrences (first 50):"
+            $hits | Select-Object -First 50 | ForEach-Object {
+              Write-Host ("- {0}:{1}: {2}" -f $_.Path, $_.LineNumber, $_.Line.Trim())
+            }
+            throw "Legacy project name found. Replace with 'kkr-query2xlsx'."
+          }
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -25,6 +46,16 @@ jobs:
           python -m pip install --upgrade pip
           if (Test-Path requirements.txt) { pip install -r requirements.txt }
           pip install pyinstaller pyodbc
+
+      - name: Sanity check (no legacy name)
+        run: |
+          $files = git ls-files
+          $hits = Select-String -Path $files -Pattern "kkr-query2xlsx" -SimpleMatch -List -ErrorAction SilentlyContinue
+          if ($hits) {
+            Write-Error "Found forbidden string 'kkr-query2xlsx' in:"
+            $hits | ForEach-Object { Write-Error (" - {0}:{1}" -f $_.Path,$_.LineNumber) }
+            exit 1
+          }
 
       - name: Build (PyInstaller - onedir)
         run: |
@@ -42,26 +73,107 @@ jobs:
 
       - name: Package (portable bundle with examples + samples)
         run: |
+          # Clean bundle dir (defensive: avoids stale files when re-running locally)
+          if (Test-Path "bundle") { Remove-Item -Recurse -Force "bundle" }
+
           $bundleRoot = "bundle\\kkr-query2xlsx"
           New-Item -ItemType Directory -Force -Path $bundleRoot | Out-Null
 
           # App binaries (PyInstaller onedir output)
           Copy-Item -Recurse -Force "dist\\kkr-query2xlsx\\*" $bundleRoot
-          Copy-Item -Force "dist\\kkr-query2xlsx-updater.exe" $bundleRoot
-
-          # Starter files described in README (first run bootstrap)
-          $extraFiles = @("README.md","LICENSE","secure.sample.json","queries.sample.txt")
-          foreach ($f in $extraFiles) {
-            if (Test-Path $f) { Copy-Item -Force $f $bundleRoot }
+          if (Test-Path "dist\\kkr-query2xlsx-updater.exe") {
+            Copy-Item -Force "dist\\kkr-query2xlsx-updater.exe" $bundleRoot
           }
 
-          # Demo + examples (so Quickstart works)
-          $extraDirs = @("examples","templates","queries","docs")
-          foreach ($d in $extraDirs) {
+          # REQUIRED starter files (portable bundle contract)
+          Copy-Item -Force "README.md" $bundleRoot
+          Copy-Item -Force "secure.sample.json" $bundleRoot
+          Copy-Item -Force "queries.sample.txt" $bundleRoot
+
+          # LICENSE (if present in repo)
+          if (Test-Path "LICENSE") { Copy-Item -Force "LICENSE" $bundleRoot }
+
+          # REQUIRED: demo/examples + docs (README uses docs/logo.png)
+          Copy-Item -Recurse -Force "examples" $bundleRoot
+          Copy-Item -Recurse -Force "docs" $bundleRoot
+
+          # Optional extras
+          $optionalDirs = @("templates","queries")
+          foreach ($d in $optionalDirs) {
             if (Test-Path $d) { Copy-Item -Recurse -Force $d $bundleRoot }
           }
 
+          # Validate bundle structure (fail the release if something is missing)
+          $required = @(
+            "$bundleRoot\\kkr-query2xlsx.exe",
+            "$bundleRoot\\secure.sample.json",
+            "$bundleRoot\\queries.sample.txt",
+            "$bundleRoot\\README.md",
+            "$bundleRoot\\examples",
+            "$bundleRoot\\docs"
+          )
+          $missing = $required | Where-Object { -not (Test-Path $_) }
+          if ($missing) {
+            Write-Error "Portable bundle is missing required paths:`n$($missing -join "`n")"
+            exit 1
+          }
+
           Compress-Archive -Path "bundle\\kkr-query2xlsx" -DestinationPath "kkr-query2xlsx-${{ github.ref_name }}-windows.zip"
+
+      - name: Validate ZIP (portable bundle)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $zip = "kkr-query2xlsx-${{ github.ref_name }}-windows.zip"
+          if (!(Test-Path $zip)) { throw "ZIP not found: $zip" }
+
+          $tmp = "zip_check"
+          if (Test-Path $tmp) { Remove-Item -Recurse -Force $tmp }
+          Expand-Archive -Path $zip -DestinationPath $tmp
+
+          $root = Join-Path $tmp "kkr-query2xlsx"
+          if (!(Test-Path $root)) { throw "Expected folder 'kkr-query2xlsx/' inside ZIP." }
+
+          # Required: onedir exe + runtime folder + samples + examples + README
+          $requiredFiles = @(
+            "kkr-query2xlsx.exe",
+            "secure.sample.json",
+            "queries.sample.txt",
+            "README.md"
+          )
+          foreach ($f in $requiredFiles) {
+            if (!(Test-Path (Join-Path $root $f))) { throw "Missing required file in ZIP: $f" }
+          }
+
+          $requiredDirs = @("_internal", "examples")
+          foreach ($d in $requiredDirs) {
+            if (!(Test-Path (Join-Path $root $d))) { throw "Missing required dir in ZIP: $d" }
+          }
+
+          # Include LICENSE if it exists in repo
+          if (Test-Path "LICENSE") {
+            if (!(Test-Path (Join-Path $root "LICENSE"))) {
+              throw "LICENSE exists in repo, but is missing in ZIP."
+            }
+          }
+
+          # Security: these must be created on first run, never shipped
+          foreach ($f in @("secure.txt","queries.txt")) {
+            if (Test-Path (Join-Path $root $f)) { throw "Forbidden file shipped in ZIP: $f" }
+          }
+
+          # Offline README logo: require docs/logo.png and README referencing it
+          $logoPath = Join-Path $root "docs\\logo.png"
+          if (!(Test-Path $logoPath)) { throw "Missing docs/logo.png in ZIP (offline README logo)." }
+
+          $readme = Get-Content -Raw (Join-Path $root "README.md")
+          if ($readme -notmatch 'docs/logo\.png') {
+            throw "README.md does not reference docs/logo.png (offline logo would be broken)."
+          }
+          if ($readme -match '\.github/assets/logo\.png') {
+            throw "README.md still references .github/assets/logo.png — change it to docs/logo.png for portable bundles."
+          }
 
       - name: Upload to GitHub Release
         uses: softprops/action-gh-release@v2

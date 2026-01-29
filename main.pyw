@@ -1,12 +1,16 @@
+from __future__ import annotations
+
 import argparse
 import csv
 import json
 import getpass
+import importlib.metadata
 import logging
 import textwrap
 import re
 import traceback
 import os
+import sqlite3
 import string
 import shutil
 import subprocess
@@ -19,12 +23,15 @@ from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog
 from tkinter import ttk
+from tkinter.scrolledtext import ScrolledText
+from typing import Optional, Tuple
 from urllib.parse import quote_plus, unquote_plus
 from urllib.request import Request, urlopen
 
 from logging.handlers import RotatingFileHandler
 
 import pandas as pd
+import sqlalchemy
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import DBAPIError, NoSuchModuleError
 from openpyxl import load_workbook
@@ -86,7 +93,7 @@ def apply_app_icon(win) -> None:
 
 # --- App version -------------------------------------------------------------
 
-APP_VERSION = "0.3.5"  # bump manually for releases
+APP_VERSION = "0.3.6"  # bump manually for releases
 
 GITHUB_ISSUE_CHOOSER_URL = (
     "https://github.com/kkrysztofczyk/kkr-query2xlsx/issues/new/choose"
@@ -97,6 +104,7 @@ GITHUB_RELEASES_LATEST_URL = (
     f"https://api.github.com/repos/{GITHUB_REPO_OWNER}/{GITHUB_REPO_NAME}/releases/latest"
 )
 UPDATER_EXE_NAME = "kkr-query2xlsx-updater.exe"
+UPDATER_STAGED_EXE_NAME = "kkr-query2xlsx-updater.new.exe"
 GITHUB_COMMITS_MAIN_URL = (
     f"https://api.github.com/repos/{GITHUB_REPO_OWNER}/{GITHUB_REPO_NAME}/commits/main"
 )
@@ -180,13 +188,16 @@ def _fetch_github_compare_status(base_ref: str, head_ref: str) -> str | None:
 def _classify_git_relation(local_sha: str | None, remote_sha: str | None) -> str:
     """Classify local HEAD relative to remote main SHA (best-effort).
 
-    Returns one of: match, remote_ahead, local_ahead, diverged, different
+    Returns one of: match, remote_ahead, local_ahead, diverged, different,
+    different_unverified
     """
     if not local_sha or not remote_sha:
         return "different"
     if local_sha == remote_sha:
         return "match"
     status = _fetch_github_compare_status(local_sha, remote_sha)
+    if status is None:
+        return "different_unverified"
     if status == "identical":
         return "match"
     if status == "ahead":
@@ -246,6 +257,81 @@ def launch_updater(wait_pid: int | None = None) -> bool:
         cmd += ["--wait-pid", str(wait_pid)]
     subprocess.Popen(cmd, cwd=BASE_DIR)  # noqa: S603
     return True
+
+
+def _is_windows_image_running(image_name: str) -> bool:
+    if sys.platform != "win32":
+        return False
+    try:
+        proc = subprocess.run(
+            ["tasklist", "/FI", f"IMAGENAME eq {image_name}"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        return image_name.lower() in proc.stdout.lower()
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.warning("Process check failed: %s", exc, exc_info=exc)
+        return False
+
+
+def _wait_for_windows_image_exit(image_name: str, timeout_s: float = 5.0) -> bool:
+    if sys.platform != "win32":
+        return True
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        if not _is_windows_image_running(image_name):
+            return True
+        time.sleep(0.5)
+    return False
+
+
+def _apply_pending_updater_update() -> None:
+    if not getattr(sys, "frozen", False):
+        return
+
+    cfg = load_app_config()
+    updates = cfg.get("_updates")
+    pending = updates.get("pending_updater") if isinstance(updates, dict) else None
+    staged_name = None
+    if isinstance(pending, dict):
+        staged_name = pending.get("file")
+    if not isinstance(staged_name, str) or not staged_name.strip():
+        staged_name = UPDATER_STAGED_EXE_NAME
+
+    staged_path = Path(BASE_DIR) / staged_name
+    if not staged_path.exists():
+        return
+
+    if _is_windows_image_running(UPDATER_EXE_NAME):
+        if not _wait_for_windows_image_exit(UPDATER_EXE_NAME, timeout_s=5.0):
+            LOGGER.info(
+                "Updater still running, deferring staged update: %s", staged_path
+            )
+            return
+
+    target_path = Path(BASE_DIR) / UPDATER_EXE_NAME
+    try:
+        os.replace(staged_path, target_path)
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.warning("Failed to replace updater: %s", exc, exc_info=exc)
+        return
+
+    if isinstance(updates, dict) and "pending_updater" in updates:
+        updates.pop("pending_updater", None)
+        if updates:
+            cfg["_updates"] = updates
+        else:
+            cfg.pop("_updates", None)
+        save_app_config(cfg)
+
+    try:
+        LOGGER.info("Updater updated successfully")
+        LOGGER.info(
+            "Updater updated: %s -> %s", staged_path.name, target_path.name
+        )
+    except Exception:
+        pass
 
 
 def _get_git_short_sha() -> str | None:
@@ -323,6 +409,536 @@ def odbc_diagnostics_text() -> str:
     return "\n".join(lines)
 
 
+def _is_frozen_exe() -> bool:
+    return bool(getattr(sys, "frozen", False))
+
+
+def _extract_driver_from_conn_str(conn_str: str) -> Optional[str]:
+    """
+    Extracts DRIVER={...} from ODBC connection string.
+    Returns driver name without braces, or None if not present.
+    """
+    m = re.search(r"(?i)\bDRIVER\s*=\s*\{([^}]+)\}", conn_str or "")
+    return m.group(1).strip() if m else None
+
+
+def _pyodbc_sqlstate_and_msg(exc: BaseException) -> Tuple[Optional[str], str]:
+    """
+    pyodbc errors often look like:
+      e.args == ('08001', '[08001] [Microsoft][ODBC Driver 18 for SQL Server] ...')
+    but sometimes it's only one string. We normalize.
+    """
+    args = getattr(exc, "args", None) or ()
+    if len(args) >= 2 and isinstance(args[0], str) and isinstance(args[1], str):
+        sqlstate = args[0].strip() or None
+        msg = args[1].strip()
+        return sqlstate, msg
+    if len(args) == 1 and isinstance(args[0], str):
+        return None, args[0].strip()
+    return None, str(exc)
+
+
+def _classify_mssql_conn_error(
+    *,
+    exc: BaseException,
+    conn_str: str,
+    pyodbc_ok: bool,
+    drivers: list[str],
+) -> tuple[str, list[str]]:
+    """
+    Returns: (title, hints[])
+    """
+    sqlstate, msg = _pyodbc_sqlstate_and_msg(exc)
+    msg_l = (msg or "").lower()
+
+    # Missing pyodbc / cannot load module
+    if not pyodbc_ok:
+        if _is_frozen_exe():
+            return (
+                "Missing pyodbc in packaged EXE",
+                ["pyodbc is missing or failed to load inside the packaged EXE."],
+            )
+        return (
+            "Missing pyodbc",
+            ["pyodbc is not installed or failed to load. Try: pip install pyodbc"],
+        )
+
+    # Missing / wrong ODBC driver (only if it actually matches reality)
+    requested_driver = _extract_driver_from_conn_str(conn_str)
+    if requested_driver:
+        # connection string explicitly requests a driver - verify it's installed
+        if all(requested_driver.lower() != d.lower() for d in (drivers or [])):
+            return (
+                "Missing ODBC driver",
+                [
+                    f"Requested ODBC driver is not installed: {requested_driver}",
+                    "Install Microsoft 'ODBC Driver 17/18 for SQL Server' and try again.",
+                    "Check 32/64-bit mismatch between Python/EXE and the ODBC driver.",
+                ],
+            )
+
+    # SQLSTATE-based classification (more accurate than a fixed “missing driver”)
+    if sqlstate in ("IM002", "IM003"):
+        return (
+            "ODBC configuration error",
+            [
+                "ODBC driver/DSN configuration is invalid or driver cannot be loaded.",
+                "Verify DRIVER={...} in connection string and installed ODBC drivers.",
+            ],
+        )
+
+    if sqlstate in ("28000",):
+        return (
+            "Authentication failed",
+            [
+                "Check username/password or authentication method (Windows/SQL).",
+                "If using Windows auth, verify Trusted_Connection / Integrated Security.",
+            ],
+        )
+
+    if sqlstate in ("HYT00", "HYT01"):
+        return (
+            "Connection timeout",
+            [
+                "Server is not reachable or responds too slowly.",
+                "Check network/VPN, host, port, firewall rules.",
+            ],
+        )
+
+    if sqlstate and sqlstate.startswith("08"):
+        return (
+            "Cannot connect to SQL Server",
+            [
+                "Check server/instance name, port, and network/VPN connectivity.",
+                "If using ODBC Driver 18, TLS settings may matter (Encrypt/TrustServerCertificate).",
+            ],
+        )
+
+    # Fallback: use message content
+    if "login failed" in msg_l:
+        return ("Authentication failed", ["Check credentials and authentication method."])
+
+    return (
+        "Cannot connect to SQL Server",
+        [
+            "Verify connection string (server/instance/database).",
+            "Check network/VPN and firewall.",
+        ],
+    )
+
+
+def _build_mssql_error_message(
+    *,
+    exc: BaseException,
+    title: str,
+    hints: list[str],
+    pyodbc_ok: bool,
+    drivers: list[str],
+) -> str:
+    sqlstate, msg = _pyodbc_sqlstate_and_msg(exc)
+
+    diagnostics_lines = [
+        f"exe={sys.executable}",
+        f"python={sys.version.split()[0]} ({'frozen' if _is_frozen_exe() else 'source'})",
+        f"platform={sys.platform}",
+        f"pyodbc={'OK' if pyodbc_ok else 'MISSING/FAILED'}",
+        f"pyodbc.drivers()={', '.join(drivers) if drivers else '(none)'}",
+    ]
+
+    text = []
+    text.append(msg if msg else "Connection failed.")
+    text.append("")
+    if sqlstate:
+        text.append(t("CONN_SQLSTATE_LINE", sqlstate=sqlstate))
+        text.append("")
+    if hints:
+        text.append("Most common causes:")
+        for hint in hints:
+            text.append(f"- {hint}")
+        text.append("")
+    text.append("Diagnostics:")
+    text.extend(diagnostics_lines)
+    return "\n".join(text)
+
+
+def _unwrap_dbapi_original(exc: BaseException) -> BaseException:
+    current = exc
+    seen = {id(current)}
+    while True:
+        orig = getattr(current, "orig", None)
+        if orig is None:
+            return current
+        if id(orig) in seen:
+            return current
+        seen.add(id(orig))
+        current = orig
+
+
+def _best_exception_message(exc: BaseException) -> str:
+    args = getattr(exc, "args", None) or ()
+    candidates = []
+    if len(args) >= 2 and isinstance(args[1], str) and args[1].strip():
+        candidates.append(args[1].strip())
+    for arg in args:
+        if isinstance(arg, str) and arg.strip():
+            candidates.append(arg.strip())
+    msg = str(exc).strip()
+    if msg:
+        candidates.append(msg)
+    if not candidates:
+        return ""
+    return min(candidates, key=len)
+
+
+def _package_version(package_name: str) -> Optional[str]:
+    try:
+        return importlib.metadata.version(package_name)
+    except importlib.metadata.PackageNotFoundError:
+        return None
+    except Exception:
+        return None
+
+
+def _classify_postgresql_conn_error(exc: BaseException) -> tuple[str, list[str]]:
+    msg = _best_exception_message(exc)
+    msg_l = msg.lower()
+    sqlstate = getattr(exc, "pgcode", None) or getattr(exc, "sqlstate", None)
+
+    if sqlstate in ("28P01", "28000") or "password authentication failed" in msg_l:
+        return (
+            "Authentication failed",
+            [
+                "Check username/password.",
+                "Verify the authentication method configured on the server.",
+            ],
+        )
+
+    if sqlstate == "3D000" or ("does not exist" in msg_l and "database" in msg_l):
+        return (
+            "Database does not exist",
+            [
+                "Check database name.",
+                "Ensure the database exists on the target server.",
+            ],
+        )
+
+    if sqlstate and sqlstate.startswith("08"):
+        return (
+            "Cannot connect to PostgreSQL",
+            [
+                "Check host/port and network/VPN connectivity.",
+                "Verify the server is running and accepting TCP connections.",
+            ],
+        )
+
+    if any(
+        phrase in msg_l
+        for phrase in (
+            "could not translate host name",
+            "could not connect to server",
+            "connection refused",
+            "connection timed out",
+            "no route to host",
+            "network is unreachable",
+            "timeout expired",
+            "name or service not known",
+            "timeout",
+        )
+    ):
+        return (
+            "Cannot connect to PostgreSQL",
+            [
+                "Check host/port and network/VPN connectivity.",
+                "Verify the server is running and accepting TCP connections.",
+            ],
+        )
+
+    return (
+        "Cannot connect to PostgreSQL",
+        [
+            "Check host/port, database name, and network connectivity.",
+            "Verify the server is running and accepting TCP connections.",
+        ],
+    )
+
+
+def _classify_mysql_conn_error(exc: BaseException) -> tuple[str, list[str]]:
+    msg = _best_exception_message(exc)
+    msg_l = msg.lower()
+    args = getattr(exc, "args", None) or ()
+    errcode = args[0] if args and isinstance(args[0], int) else None
+
+    if errcode == 1045 or "access denied" in msg_l:
+        return (
+            "Authentication failed",
+            [
+                "Check username/password.",
+                "Verify the authentication plugin and permissions.",
+            ],
+        )
+
+    if errcode == 1049 or "unknown database" in msg_l:
+        return (
+            "Database does not exist",
+            [
+                "Check database name.",
+                "Ensure the database exists on the target server.",
+            ],
+        )
+
+    if errcode in (2002, 2003, 2005) or "can't connect to mysql server" in msg_l or "unknown mysql server host" in msg_l:
+        return (
+            "Cannot connect to MySQL",
+            [
+                "Check host/port and network/VPN connectivity.",
+                "Verify the server is running and accepting TCP connections.",
+            ],
+        )
+
+    if errcode in (2006, 2013):
+        return (
+            "MySQL connection lost",
+            [
+                "Server closed the connection unexpectedly.",
+                "Check network stability and server logs.",
+            ],
+        )
+
+    if errcode == 2059:
+        return (
+            "Authentication plugin error",
+            [
+                "Server requires a different authentication plugin.",
+                "Update client driver or change server user plugin.",
+            ],
+        )
+
+    return (
+        "Cannot connect to MySQL",
+        [
+            "Check host/port, database name, and network connectivity.",
+            "Verify the server is running and accepting TCP connections.",
+        ],
+    )
+
+
+def _classify_sqlite_conn_error(exc: BaseException) -> tuple[str, list[str]]:
+    msg = _best_exception_message(exc)
+    msg_l = msg.lower()
+
+    if "unable to open database file" in msg_l:
+        return (
+            "Cannot open SQLite database file",
+            [
+                "Check file path and permissions.",
+                "Ensure the directory exists and is writable.",
+            ],
+        )
+
+    if "database is locked" in msg_l:
+        return (
+            "SQLite database is locked",
+            [
+                "Close other applications using the file.",
+                "Retry after the lock is released.",
+            ],
+        )
+
+    if "file is not a database" in msg_l:
+        return (
+            "Invalid SQLite database file",
+            [
+                "Verify the selected file is a valid SQLite database.",
+                "Ensure the file is not corrupted.",
+            ],
+        )
+
+    if "disk i/o error" in msg_l:
+        return (
+            "SQLite disk I/O error",
+            [
+                "Check disk health and permissions.",
+                "Verify the storage device is available.",
+            ],
+        )
+
+    return (
+        "Cannot open SQLite database",
+        [
+            "Check file path and permissions.",
+            "Ensure the file exists and is accessible.",
+        ],
+    )
+
+
+def _build_connection_error_message(
+    *,
+    exc: BaseException,
+    hints: list[str],
+    diagnostics_lines: list[str],
+) -> str:
+    msg = _best_exception_message(exc)
+    text = []
+    text.append(msg if msg else "Connection failed.")
+    text.append("")
+    if hints:
+        text.append("Most common causes:")
+        for hint in hints:
+            text.append(f"- {hint}")
+        text.append("")
+    text.append("Diagnostics:")
+    text.extend(diagnostics_lines)
+    return "\n".join(text)
+
+
+def _format_connection_error(
+    *,
+    conn_type: str,
+    exc: BaseException,
+    details: dict,
+) -> tuple[str, str]:
+    base_diagnostics = [
+        f"exe={sys.executable}",
+        f"python={sys.version.split()[0]} ({'frozen' if _is_frozen_exe() else 'source'})",
+        f"platform={sys.platform}",
+        f"sqlalchemy={sqlalchemy.__version__}",
+    ]
+    conn_type = (conn_type or "").strip()
+    details = details or {}
+
+    if conn_type == "mssql_odbc":
+        pyodbc_ok = False
+        drivers = []
+        try:
+            import pyodbc  # type: ignore
+
+            pyodbc_ok = True
+            drivers = list(pyodbc.drivers())
+        except Exception:
+            pyodbc_ok = False
+            drivers = []
+
+        driver = str(details.get("driver") or "").strip()
+        server = str(details.get("server") or "").strip()
+        database = str(details.get("database") or "").strip()
+        username = str(details.get("username") or "").strip()
+        trusted = bool(details.get("trusted"))
+        encrypt = bool(details.get("encrypt", True))
+        trust_cert = bool(details.get("trust_server_certificate", True))
+
+        conn_parts = []
+        if driver:
+            conn_parts.append(f"DRIVER={{{driver}}}")
+        if server:
+            conn_parts.append(f"SERVER={server}")
+        if database:
+            conn_parts.append(f"DATABASE={database}")
+        if trusted:
+            conn_parts.append("Trusted_Connection=yes")
+        elif username:
+            conn_parts.append(f"UID={username}")
+        if encrypt:
+            conn_parts.append("Encrypt=yes")
+        if trust_cert:
+            conn_parts.append("TrustServerCertificate=yes")
+
+        conn_str = ";".join(conn_parts)
+
+        title, hints = _classify_mssql_conn_error(
+            exc=exc,
+            conn_str=conn_str,
+            pyodbc_ok=pyodbc_ok,
+            drivers=drivers,
+        )
+        msg = _build_mssql_error_message(
+            exc=exc,
+            title=title,
+            hints=hints,
+            pyodbc_ok=pyodbc_ok,
+            drivers=drivers,
+        )
+        return title, msg
+
+    if conn_type == "postgresql":
+        orig = _unwrap_dbapi_original(exc)
+        title, hints = _classify_postgresql_conn_error(orig)
+        host = str(details.get("host") or "").strip()
+        port = str(details.get("port") or "5432").strip() or "5432"
+        database = str(details.get("database") or "").strip()
+        target = f"{host}:{port}/{database}".strip(":")
+        driver_pkg = None
+        driver_version = None
+        for candidate in ("psycopg", "psycopg2", "psycopg2-binary"):
+            version = _package_version(candidate)
+            if version:
+                driver_pkg = candidate
+                driver_version = version
+                break
+        diagnostics = base_diagnostics + [
+            f"driver={driver_pkg or '(unknown)'} {driver_version or ''}".strip(),
+            f"target={target}" if target else "target=(not specified)",
+        ]
+        msg = _build_connection_error_message(
+            exc=orig,
+            hints=hints,
+            diagnostics_lines=diagnostics,
+        )
+        return title, msg
+
+    if conn_type == "mysql":
+        orig = _unwrap_dbapi_original(exc)
+        title, hints = _classify_mysql_conn_error(orig)
+        host = str(details.get("host") or "").strip()
+        port = str(details.get("port") or "3306").strip() or "3306"
+        database = str(details.get("database") or "").strip()
+        target = f"{host}:{port}/{database}".strip(":")
+        driver_pkg = None
+        driver_version = None
+        for candidate in ("pymysql", "mysqlclient", "mysql-connector-python"):
+            version = _package_version(candidate)
+            if version:
+                driver_pkg = candidate
+                driver_version = version
+                break
+        diagnostics = base_diagnostics + [
+            f"driver={driver_pkg or '(unknown)'} {driver_version or ''}".strip(),
+            f"target={target}" if target else "target=(not specified)",
+        ]
+        msg = _build_connection_error_message(
+            exc=orig,
+            hints=hints,
+            diagnostics_lines=diagnostics,
+        )
+        return title, msg
+
+    if conn_type == "sqlite":
+        orig = _unwrap_dbapi_original(exc)
+        title, hints = _classify_sqlite_conn_error(orig)
+        path = str(details.get("path") or "").strip()
+        abs_path = os.path.abspath(path) if path else ""
+        diagnostics = base_diagnostics + [
+            f"sqlite3={sqlite3.sqlite_version}",
+            f"path={abs_path}" if abs_path else "path=(not specified)",
+        ]
+        msg = _build_connection_error_message(
+            exc=orig,
+            hints=hints,
+            diagnostics_lines=diagnostics,
+        )
+        return title, msg
+
+    title = "Connection failed"
+    msg = _build_connection_error_message(
+        exc=exc,
+        hints=[
+            "Verify connection details and network connectivity.",
+            "Check logs for more details.",
+        ],
+        diagnostics_lines=base_diagnostics,
+    )
+    return title, msg
+
+
 def _redact_conn_secrets(text: str) -> str:
     if not text:
         return text
@@ -365,15 +981,6 @@ I18N: dict[str, dict[str, str]] = {
         "BROWSER_OPEN_FAIL_ERROR_BODY": (
             "Could not open the browser.\n\n{error}\n\nLink:\n{url}"
         ),
-        "ERR_ODBC_MISSING_TITLE": "Missing ODBC driver",
-        "ERR_ODBC_MISSING_BODY": (
-            "Cannot connect to SQL Server.\n\n"
-            "Most common causes:\n"
-            "- ODBC driver is not installed for this app bitness (32/64-bit mismatch)\n"
-            "- pyodbc is missing or failed to load inside the packaged EXE\n\n"
-            "Install Microsoft 'ODBC Driver 17/18 for SQL Server' and try again.\n\n"
-            "Diagnostics:\n{diag}"
-        ),
         "ODBC_DIAGNOSTICS_TITLE": "ODBC diagnostics",
         "ODBC_DIAGNOSTICS_LABEL": "ODBC diagnostics:",
         "ERR_PG_MISSING_TITLE": "Missing PostgreSQL library",
@@ -394,6 +1001,7 @@ I18N: dict[str, dict[str, str]] = {
         "MSG_UI_TRUNCATED": (
             "...\n(Trimmed in UI, full details in kkr-query2xlsx.log)"
         ),
+        "CONN_SQLSTATE_LINE": "SQLSTATE: {sqlstate}",
         "CONSOLE_AVAILABLE_FILES": "Available SQL query files:",
         "CONSOLE_CUSTOM_PATH": "0: [Custom path]",
         "CONSOLE_PROMPT_SELECT": (
@@ -571,6 +1179,13 @@ I18N: dict[str, dict[str, str]] = {
         ),
         "MSG_SAVED_DETAILS_CSV": "CSV profile: {profile}",
         "MSG_NO_ROWS": "Query returned no rows.\nSQL time: {sql_time:.2f} s",
+        "ERR_XLSX_TOO_LARGE": (
+            "XLSX export skipped because the result would exceed Excel limits. "
+            "Result: {rows} rows, {cols} columns. "
+            "Sheet would require: {sheet_rows} rows, {sheet_cols} columns "
+            "(max {max_rows} rows, {max_cols} columns). "
+            "Please export to CSV instead."
+        ),
         "ERR_EXPORT": "Export error. Full details in log.",
         "FRAME_DB_CONNECTION": "Database connection",
         "LBL_CONNECTION": "Connection:",
@@ -638,6 +1253,24 @@ I18N: dict[str, dict[str, str]] = {
         "BTN_START": "Start",
         "BTN_REPORT_ISSUE": "Report issue / suggestion",
         "BTN_CHECK_UPDATES": "Check updates",
+        "BTN_HELP": "Help / README",
+        "HELP_TITLE": "Help",
+        "HELP_BODY": (
+            "Checklist (30 seconds):\n"
+            "1) Unzip the ZIP to a folder you can write to (Desktop / Documents).\n"
+            "   Avoid Program Files.\n"
+            "2) Do NOT run the .exe from inside the ZIP (unzip first).\n"
+            "3) If you see access denied / no permission errors, move the folder\n"
+            "   somewhere writable.\n\n"
+            "Where are my files?\n"
+            "- App folder: {base_dir}\n"
+            "- Reports (exports): {reports_dir}\n"
+            "- Logs: {log_file}\n\n"
+            "Tip: Use the buttons below to open these locations."
+        ),
+        "HELP_OPEN_README": "Open README",
+        "HELP_OPEN_LOGS": "Open logs folder",
+        "HELP_OPEN_REPORTS": "Open reports folder",
         "LBL_EXPORT_INFO": "Export info:",
         "BTN_OPEN_FILE": "Open file",
         "BTN_OPEN_FOLDER": "Open folder",
@@ -659,6 +1292,10 @@ I18N: dict[str, dict[str, str]] = {
         "UPD_GIT_STATUS_LOCAL_AHEAD": "Git status: local {local} is ahead of remote main {remote}.",
         "UPD_GIT_STATUS_DIVERGED": "Git status: local {local} and remote main {remote} have diverged.",
         "UPD_GIT_STATUS_DIFFERENT": "Git status: local {local}, remote main {remote} (different).",
+        "UPD_GIT_STATUS_DIFFERENT_UNVERIFIED": (
+            "Git status: local {local}, remote main {remote} (different) "
+            "(could not compare — check GitHub connection)."
+        ),
         "UPD_SOURCE_MODE": (
             "This run comes from source files without Git. This check looks only for official "
             "Releases. To update, download a new ZIP from Releases or clone the repository."
@@ -824,15 +1461,6 @@ I18N: dict[str, dict[str, str]] = {
         "BROWSER_OPEN_FAIL_ERROR_BODY": (
             "Nie udało się otworzyć przeglądarki.\n\n{error}\n\nLink:\n{url}"
         ),
-        "ERR_ODBC_MISSING_TITLE": "Brak sterownika ODBC",
-        "ERR_ODBC_MISSING_BODY": (
-            "Nie można połączyć z SQL Server.\n\n"
-            "Najczęstsze przyczyny:\n"
-            "- sterownik ODBC nie jest zainstalowany dla tej architektury (32/64-bit)\n"
-            "- brak pyodbc albo pyodbc nie może się załadować w EXE\n\n"
-            "Zainstaluj Microsoft 'ODBC Driver 17/18 for SQL Server' i spróbuj ponownie.\n\n"
-            "Diagnostyka:\n{diag}"
-        ),
         "ODBC_DIAGNOSTICS_TITLE": "Diagnostyka ODBC",
         "ODBC_DIAGNOSTICS_LABEL": "Diagnostyka ODBC:",
         "ERR_PG_MISSING_TITLE": "Brak biblioteki PostgreSQL",
@@ -853,6 +1481,7 @@ I18N: dict[str, dict[str, str]] = {
         "MSG_UI_TRUNCATED": (
             "...\n(Przycięto w UI, pełna treść w kkr-query2xlsx.log)"
         ),
+        "CONN_SQLSTATE_LINE": "SQLSTATE: {sqlstate}",
         "CONSOLE_AVAILABLE_FILES": "Dostępne pliki zapytań SQL:",
         "CONSOLE_CUSTOM_PATH": "0: [Własna ścieżka]",
         "CONSOLE_PROMPT_SELECT": (
@@ -1046,6 +1675,13 @@ I18N: dict[str, dict[str, str]] = {
         ),
         "MSG_SAVED_DETAILS_CSV": "Profil CSV: {profile}",
         "MSG_NO_ROWS": "Zapytanie nie zwróciło wierszy.\nCzas SQL: {sql_time:.2f} s",
+        "ERR_XLSX_TOO_LARGE": (
+            "Eksport XLSX pominięty, ponieważ wynik przekracza limity Excela. "
+            "Wynik: {rows} wierszy, {cols} kolumn. "
+            "Arkusz wymaga: {sheet_rows} wierszy, {sheet_cols} kolumn "
+            "(maks. {max_rows} wierszy, {max_cols} kolumn). "
+            "Zamiast tego użyj CSV."
+        ),
         "ERR_EXPORT": "Błąd eksportu. Pełne szczegóły w logu.",
         "FRAME_DB_CONNECTION": "Połączenie z bazą danych",
         "LBL_CONNECTION": "Połączenie:",
@@ -1093,6 +1729,24 @@ I18N: dict[str, dict[str, str]] = {
         "BTN_START": "Start",
         "BTN_REPORT_ISSUE": "Zgłoś problem / sugestię",
         "BTN_CHECK_UPDATES": "Sprawdź aktualizacje",
+        "BTN_HELP": "Pomoc / README",
+        "HELP_TITLE": "Pomoc",
+        "HELP_BODY": (
+            "Checklista (30 sekund):\n"
+            "1) Rozpakuj ZIP do katalogu z prawem zapisu (Pulpit / Dokumenty).\n"
+            "   Unikaj Program Files.\n"
+            "2) Nie uruchamiaj .exe z wnętrza ZIP (najpierw rozpakuj).\n"
+            "3) Jeśli widzisz komunikat access denied / no permission, przenieś\n"
+            "   folder w miejsce, do którego masz prawa zapisu.\n\n"
+            "Gdzie są moje pliki?\n"
+            "- Katalog aplikacji: {base_dir}\n"
+            "- Eksporty: {reports_dir}\n"
+            "- Logi: {log_file}\n\n"
+            "Wskazówka: użyj przycisków poniżej, żeby otworzyć te lokalizacje."
+        ),
+        "HELP_OPEN_README": "Otwórz README",
+        "HELP_OPEN_LOGS": "Otwórz katalog logów",
+        "HELP_OPEN_REPORTS": "Otwórz katalog eksportów",
         "LBL_EXPORT_INFO": "Informacje o eksporcie:",
         "BTN_OPEN_FILE": "Otwórz plik",
         "BTN_OPEN_FOLDER": "Otwórz katalog",
@@ -1114,6 +1768,10 @@ I18N: dict[str, dict[str, str]] = {
         "UPD_GIT_STATUS_LOCAL_AHEAD": "Status Git: lokalnie {local} jest przed zdalnym main {remote}.",
         "UPD_GIT_STATUS_DIVERGED": "Status Git: lokalnie {local} i zdalnie main {remote} są rozbieżne.",
         "UPD_GIT_STATUS_DIFFERENT": "Status Git: lokalnie {local}, zdalnie main {remote} (różne).",
+        "UPD_GIT_STATUS_DIFFERENT_UNVERIFIED": (
+            "Status Git: lokalnie {local}, zdalnie main {remote} (różne) "
+            "(nie udało się porównać — sprawdź połączenie z GitHub)."
+        ),
         "UPD_SOURCE_MODE": (
             "Uruchomiono ze źródeł bez repo Git. Ta funkcja sprawdza tylko oficjalne wydania "
             "(Release). Aby zaktualizować, pobierz nowy ZIP z Releases albo sklonuj repozytorium."
@@ -1354,6 +2012,203 @@ def open_github_issue_chooser(parent=None) -> None:
             )
 
 
+# =========================
+# README / DOCS VIEWER (GUI)
+# =========================
+
+REPO_URL = "https://github.com/kkrysztofczyk/kkr-query2xlsx"
+RELEASES_URL = f"{REPO_URL}/releases"
+ISSUES_URL = f"{REPO_URL}/issues"
+
+_DEFAULT_HELP_MD = """# kkr-query2xlsx
+
+Run SQL queries from `.sql` files and export results to **XLSX** or **CSV**.
+
+## Quickstart (GUI)
+1. Select a connection
+2. Choose a `.sql` file (or pick from the list)
+3. Choose output format (XLSX/CSV)
+4. Click **Start**
+5. Your file appears in `generated_reports/`
+
+## Need full docs?
+Open the online README on GitHub.
+"""
+
+
+def _resource_path(rel_path: str) -> Path:
+    """Resolve paths for source run and PyInstaller (_MEIPASS)."""
+    base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+    return (base / rel_path).resolve()
+
+
+def _read_text_if_exists(path: Path) -> str | None:
+    try:
+        if path.exists():
+            return path.read_text(encoding="utf-8")
+    except Exception:
+        return None
+    return None
+
+
+def open_docs_online(url: str = REPO_URL) -> None:
+    try:
+        webbrowser.open_new_tab(url)
+    except Exception:
+        pass
+
+
+def _cleanup_md_for_viewer(md: str) -> str:
+    """
+    Removes HTML blocks like <p align="center">...</p> and Markdown image lines,
+    because we show images separately inside the app.
+    """
+    lines: list[str] = []
+    in_html_block = False
+
+    for raw in md.splitlines():
+        s = raw.strip()
+
+        if s.startswith("<p") and "align" in s:
+            in_html_block = True
+            continue
+        if in_html_block:
+            if "</p>" in s:
+                in_html_block = False
+            continue
+
+        if s.startswith("<img") or s.startswith("</") or s.startswith("<br"):
+            continue
+
+        if re.match(r"^!\[.*?\]\(.*?\)\s*$", s):
+            continue
+
+        lines.append(raw)
+
+    return "\n".join(lines).strip()
+
+
+def _maybe_insert_image(
+    txt: "tkinter.Text", img_refs: list, path: Path, max_width: int = 880
+) -> None:
+    try:
+        if not path.exists():
+            return
+
+        img = __import__("tkinter").PhotoImage(file=str(path))
+
+        w = img.width()
+        if w > max_width:
+            factor = (w + max_width - 1) // max_width
+            img = img.subsample(factor, factor)
+
+        img_refs.append(img)  # keep reference alive
+        txt.image_create("end", image=img)
+        txt.insert("end", "\n")
+    except Exception:
+        return
+
+
+def _insert_md_simple(txt: "tkinter.Text", md: str) -> None:
+    in_code = False
+
+    for raw in md.splitlines():
+        line = raw.rstrip("\n")
+        s = line.lstrip()
+
+        if s.startswith("```"):
+            in_code = not in_code
+            txt.insert("end", "\n")
+            continue
+
+        if in_code:
+            txt.insert("end", line + "\n", ("codeblock",))
+            continue
+
+        if s.startswith("# "):
+            txt.insert("end", s[2:] + "\n", ("h1",))
+            continue
+        if s.startswith("## "):
+            txt.insert("end", s[3:] + "\n", ("h2",))
+            continue
+        if s.startswith("### "):
+            txt.insert("end", s[4:] + "\n", ("h3",))
+            continue
+
+        if re.match(r"^(\* \* \*|---+)\s*$", s):
+            txt.insert("end", "\n")
+            continue
+
+        if s.startswith(">"):
+            txt.insert("end", s.lstrip("> ").rstrip() + "\n", ("quote",))
+            continue
+
+        if s.startswith(("- ", "* ")):
+            txt.insert("end", "• " + s[2:] + "\n", ("bullet",))
+            continue
+
+        if re.match(r"^\d+\.\s+", s):
+            txt.insert("end", s + "\n", ("bullet",))
+            continue
+
+        txt.insert("end", line + "\n")
+
+
+def show_readme_window(parent) -> None:
+    import tkinter as tk
+    from tkinter import ttk
+
+    win = tk.Toplevel(parent)
+    win.title("kkr-query2xlsx — Dokumentacja")
+    win.geometry("920x700")
+
+    top = ttk.Frame(win)
+    top.pack(fill="x", padx=10, pady=(10, 6))
+
+    ttk.Label(top, text="Dokumentacja", font=("TkDefaultFont", 12, "bold")).pack(
+        side="left"
+    )
+
+    btns = ttk.Frame(top)
+    btns.pack(side="right")
+
+    ttk.Button(btns, text="Online README", command=lambda: open_docs_online(REPO_URL)).pack(
+        side="left", padx=(0, 6)
+    )
+    ttk.Button(btns, text="Releases", command=lambda: open_docs_online(RELEASES_URL)).pack(
+        side="left", padx=(0, 6)
+    )
+    ttk.Button(btns, text="Issues", command=lambda: open_docs_online(ISSUES_URL)).pack(
+        side="left"
+    )
+
+    txt = ScrolledText(win, wrap="word")
+    txt.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+    txt.configure(state="normal")
+
+    txt.tag_configure("h1", font=("TkDefaultFont", 16, "bold"), spacing3=8)
+    txt.tag_configure("h2", font=("TkDefaultFont", 14, "bold"), spacing3=6)
+    txt.tag_configure("h3", font=("TkDefaultFont", 12, "bold"), spacing3=4)
+    txt.tag_configure(
+        "codeblock", font=("TkFixedFont", 10), lmargin1=12, lmargin2=12
+    )
+    txt.tag_configure("quote", foreground="gray40", lmargin1=12, lmargin2=12)
+    txt.tag_configure("bullet", lmargin1=12, lmargin2=24)
+
+    win._img_refs = []
+
+    _maybe_insert_image(txt, win._img_refs, _resource_path("docs/logo.png"), max_width=880)
+
+    md = _read_text_if_exists(_resource_path("README.md")) or _DEFAULT_HELP_MD
+    md = _cleanup_md_for_viewer(md)
+    _insert_md_simple(txt, md)
+
+    txt.insert("end", "\n")
+    _maybe_insert_image(txt, win._img_refs, _resource_path("docs/gui.png"), max_width=880)
+
+    txt.configure(state="disabled")
+
+
 SECURE_PATH = _build_path("secure.txt")
 QUERIES_PATH = _build_path("queries.txt")
 APP_CONFIG_PATH = _build_path("kkr-query2xlsx.json")
@@ -1394,6 +2249,11 @@ BUILTIN_CSV_PROFILES = [
 ]
 
 BUILTIN_CSV_PROFILE_NAMES = {p["name"] for p in BUILTIN_CSV_PROFILES}
+
+PREFERRED_DEFAULT_CSV_PROFILE_BY_LANG = {
+    "en": "CSV standard (comma, dot)",
+    "pl": "CSV Excel Europe (semicolon, comma)",
+}
 
 
 def is_builtin_csv_profile(name: str) -> bool:
@@ -1899,6 +2759,8 @@ DEFAULT_CSV_PROFILE = {
     "doublequote": True,
     "date_format": "",
 }
+XLSX_MAX_ROWS = 1_048_576
+XLSX_MAX_COLS = 16_384
 
 
 # --- Logging setup ----------------------------------------------------------
@@ -1992,26 +2854,21 @@ def handle_db_driver_error(exc, db_type, profile_name=None, show_message=None):
         if isinstance(exc, NoSuchModuleError) and "pyodbc" in exc_text:
             missing_pyodbc = True
 
-        # Rozpoznawaj brak drivera/DSN tylko po typowych komunikatach driver managera
-        # (nie po samym "ODBC Driver 18..." bo to często występuje w treści błędu TLS/login).
-        missing_driver = any(
-            signature in exc_text
-            for signature in (
-                "data source name not found",
-                "driver not found",
-                "no default driver specified",
-                "can't open lib",
-                "unable to open lib",
-                "cannot open shared object file",
-                "could not find driver",
-                "im002",
-                "im003",
+        if missing_pyodbc:
+            title, hints = _classify_mssql_conn_error(
+                exc=exc,
+                conn_str="",
+                pyodbc_ok=False,
+                drivers=[],
             )
-        )
-
-        if missing_pyodbc or missing_driver:
-            msg = t("ERR_ODBC_MISSING_BODY", diag=odbc_diagnostics_text())
-            _notify(t("ERR_ODBC_MISSING_TITLE"), msg)
+            msg = _build_mssql_error_message(
+                exc=exc,
+                title=title,
+                hints=hints,
+                pyodbc_ok=False,
+                drivers=[],
+            )
+            _notify(title, msg)
             return True
 
     if db_type == "postgresql":
@@ -2144,7 +3001,11 @@ def _normalize_csv_config(data):
 
     names = {p["name"] for p in merged_profiles}
     if default_profile not in names:
-        default_profile = merged_profiles[0]["name"]
+        preferred_name = PREFERRED_DEFAULT_CSV_PROFILE_BY_LANG.get(_CURRENT_LANG)
+        if preferred_name in names:
+            default_profile = preferred_name
+        else:
+            default_profile = merged_profiles[0]["name"]
 
     return {"default_profile": default_profile, "profiles": merged_profiles}
 
@@ -2346,6 +3207,54 @@ def csv_profile_to_kwargs(profile):
     }
 
 
+class XlsxSizeError(ValueError):
+    pass
+
+
+def _ensure_xlsx_limits(
+    rows_count: int,
+    columns_count: int,
+    *,
+    header_rows: int = 0,
+    start_row: int = 1,
+    start_col: int = 1,
+) -> None:
+    """Ensure writing data to XLSX will not exceed Excel sheet limits.
+
+    rows_count/columns_count refer to DATA size.
+    header_rows accounts for extra header rows written above the data.
+    start_row/start_col are 1-based coordinates of the top-left cell
+    where header/data begins.
+    """
+    rows_count = max(0, int(rows_count))
+    columns_count = max(0, int(columns_count))
+    header_rows = max(0, int(header_rows))
+    start_row = max(1, int(start_row))
+    start_col = max(1, int(start_col))
+
+    total_rows = rows_count + header_rows
+    if total_rows <= 0 or columns_count <= 0:
+        return
+
+    last_row = start_row + total_rows - 1
+    last_col = start_col + columns_count - 1
+
+    if last_row > XLSX_MAX_ROWS or last_col > XLSX_MAX_COLS:
+        raise XlsxSizeError(
+            t(
+                "ERR_XLSX_TOO_LARGE",
+                # Keep message semantics: {rows}/{cols} = query result (data),
+                # and show effective worksheet bounds separately.
+                rows=rows_count,
+                cols=columns_count,
+                sheet_rows=last_row,
+                sheet_cols=last_col,
+                max_rows=XLSX_MAX_ROWS,
+                max_cols=XLSX_MAX_COLS,
+            )
+        )
+
+
 def _run_query_to_rows(engine, sql_query):
     """
     Execute SQL with retry/deadlock handling and return:
@@ -2471,9 +3380,21 @@ def format_error_for_ui(exc: Exception, sql_query: str, max_chars: int = 2000) -
 def run_export(engine, sql_query, output_file_path, output_format, csv_profile=None):
     """Execute SQL, export the result, and return timing + row count details."""
     rows, columns, sql_duration, sql_start = _run_query_to_rows(engine, sql_query)
+    rows_count = len(rows)
+    columns_count = len(columns)
+    if output_format == "xlsx":
+        # pandas.DataFrame.to_excel writes a header row by default.
+        # We only write the file when rows_count > 0, so reserve header row only then.
+        _ensure_xlsx_limits(
+            rows_count,
+            columns_count,
+            header_rows=(1 if rows_count else 0),
+            start_row=1,
+            start_col=1,
+        )
 
     export_duration = 0.0
-    if rows:
+    if rows_count:
         df = pd.DataFrame(rows, columns=columns)
 
         export_start = time.perf_counter()
@@ -2501,7 +3422,7 @@ def run_export(engine, sql_query, output_file_path, output_format, csv_profile=N
     else:
         total_duration = sql_duration
 
-    return sql_duration, export_duration, total_duration, len(rows)
+    return sql_duration, export_duration, total_duration, rows_count
 
 
 def run_export_to_template(
@@ -2520,12 +3441,24 @@ def run_export_to_template(
     (sql_duration, export_duration, total_duration, rows_count).
     """
     rows, columns, sql_duration, sql_start = _run_query_to_rows(engine, sql_query)
+    rows_count = len(rows)
+    columns_count = len(columns)
+
+    # Validate worksheet bounds before copying the template.
+    # Note: we only write header/data when rows_count > 0.
+    start_row, start_col = coordinate_to_tuple(start_cell)
+    _ensure_xlsx_limits(
+        rows_count,
+        columns_count,
+        header_rows=(1 if (include_header and rows_count) else 0),
+        start_row=start_row,
+        start_col=start_col,
+    )
 
     export_start = time.perf_counter()
     # Zawsze kopiujemy template, nawet jeśli nie ma wierszy z SQL
     shutil.copyfile(template_path, output_file_path)
 
-    rows_count = len(rows)
     if rows_count:
         df = pd.DataFrame(rows, columns=columns)
 
@@ -2537,8 +3470,6 @@ def run_export_to_template(
             )
 
         ws = wb[sheet_name]
-
-        start_row, start_col = coordinate_to_tuple(start_cell)
 
         data_start_row = start_row
         if include_header:
@@ -2685,9 +3616,13 @@ def run_console(engine, output_directory, selected_connection, archive_sql: bool
     output_file_name = os.path.splitext(base_name)[0] + (".xlsx" if output_format == "xlsx" else ".csv")
     output_file_path = os.path.join(output_directory, output_file_name)
 
-    sql_dur, export_dur, total_dur, rows_count = run_export(
-        engine, sql_query, output_file_path, output_format, csv_profile=selected_csv_profile
-    )
+    try:
+        sql_dur, export_dur, total_dur, rows_count = run_export(
+            engine, sql_query, output_file_path, output_format, csv_profile=selected_csv_profile
+        )
+    except XlsxSizeError as exc:
+        print(str(exc))
+        return
 
     if archive_sql:
         try:
@@ -3532,11 +4467,12 @@ def _build_and_test_connection_entry(
             conn_type,
             exc_info=exc,
         )
-        messagebox.showerror(
-            t("ERR_CONNECTION_TITLE"),
-            t("ERR_CONNECTION_BODY", error=exc),
-            parent=parent,
+        title, msg = _format_connection_error(
+            conn_type=conn_type,
+            exc=exc,
+            details=new_entry.get("details") or {},
         )
+        messagebox.showerror(title, msg, parent=parent)
         return None
 
     return new_entry
@@ -4217,6 +5153,7 @@ def _refresh_csv_profile_list(
             except tk.TclError:
                 # Some Tk builds (incl. some Windows bundles) do not support per-item fonts in Listbox.
                 item_font_supported = False
+                break
 
     display_default_var.set(
         t("CSV_DEFAULT_PROFILE_LABEL", name=default_profile_var.get() or "")
@@ -4767,19 +5704,12 @@ def run_gui(connection_store, output_directory):
                 conn.get("type"),
                 exc_info=exc,
             )
-            if conn.get("type") == "mssql_odbc":
-                details = (
-                    f"{type(exc).__name__}: {_redact_conn_secrets(str(exc))}\n\n"
-                    f"e.args={_redact_conn_secrets(str(getattr(exc, 'args', None)))}\n\n"
-                    f"ODBC diagnostics:\n{odbc_diagnostics_text()}\n\n"
-                    f"Traceback:\n{_redact_conn_secrets(traceback.format_exc())}"
-                )
-                messagebox.showerror("Cannot connect to SQL Server (details)", details)
-                return
-            messagebox.showerror(
-                t("ERR_CONNECTION_TITLE"),
-                t("ERR_CONNECTION_BODY", error=exc),
+            title, msg = _format_connection_error(
+                conn_type=str(conn.get("type") or ""),
+                exc=exc,
+                details=conn.get("details") or {},
             )
+            messagebox.showerror(title, msg)
             return
 
         set_connection_status(
@@ -5007,7 +5937,7 @@ def run_gui(connection_store, output_directory):
         dlg.transient(root)
         dlg.grab_set()
 
-        dlg.minsize(640, 360)
+        dlg.minsize(680, 420)
         dlg.geometry("760x420")
         _center_window(dlg, root)
 
@@ -5898,6 +6828,11 @@ def run_gui(connection_store, output_directory):
             btn_open_folder.config(state=tk.NORMAL)
             update_error_display("")
 
+        except XlsxSizeError as exc:
+            msg = str(exc)
+            result_info_var.set(msg)
+            update_error_display("")
+            messagebox.showwarning(t("WARN_TITLE"), msg)
         except Exception as exc:  # noqa: BLE001
             ui_msg = format_error_for_ui(exc, sql_query)
             result_info_var.set(t("ERR_EXPORT"))
@@ -5929,6 +6864,67 @@ def run_gui(connection_store, output_directory):
             folder = os.path.dirname(path)
             _open_path(folder)
 
+    def show_help_window():
+        dlg = tk.Toplevel(root)
+        apply_app_icon(dlg)
+        dlg.title(t("HELP_TITLE"))
+        dlg.transient(root)
+        dlg.grab_set()
+        dlg.resizable(True, True)
+        dlg.minsize(680, 420)
+        dlg.bind("<Escape>", lambda *_: dlg.destroy())
+
+        logs_dir = os.path.join(BASE_DIR, "logs")
+        log_file = os.path.join(logs_dir, "kkr-query2xlsx.log")
+
+        body = tk.Frame(dlg)
+        body.pack(fill="both", expand=True, padx=10, pady=10)
+
+        txt = tk.Text(body, wrap="word", height=18, width=90)
+        y_scroll = tk.Scrollbar(body, orient="vertical", command=txt.yview)
+        txt.configure(yscrollcommand=y_scroll.set)
+
+        y_scroll.pack(side="right", fill="y")
+        txt.pack(side="left", fill="both", expand=True)
+
+        txt.insert(
+            "1.0",
+            t(
+                "HELP_BODY",
+                base_dir=BASE_DIR,
+                reports_dir=output_directory,
+                logs_dir=logs_dir,
+                log_file=log_file,
+            ),
+        )
+        txt.configure(state="disabled")
+
+        btns = tk.Frame(dlg)
+        btns.pack(fill="x", padx=10, pady=(0, 10))
+
+        tk.Button(btns, text=t("HELP_OPEN_README"), command=lambda: show_readme_window(root)).pack(
+            side="left"
+        )
+        tk.Button(
+            btns,
+            text=t("HELP_OPEN_LOGS"),
+            command=lambda: _open_path(logs_dir),
+        ).pack(side="left", padx=(10, 0))
+        tk.Button(
+            btns,
+            text=t("HELP_OPEN_REPORTS"),
+            command=lambda: _open_path(output_directory),
+        ).pack(side="left", padx=(10, 0))
+
+        # Optional: keep Report issue visible here as well
+        tk.Button(
+            btns,
+            text=t("BTN_REPORT_ISSUE"),
+            command=lambda: open_github_issue_chooser(parent=dlg),
+        ).pack(side="right")
+
+        _center_window(dlg, parent=root)
+
     def check_updates_gui():
         prev_status = connection_status_var.get()
         prev_key = connection_status_state.get("key")
@@ -5936,6 +6932,31 @@ def run_gui(connection_store, output_directory):
         connection_status_var.set(t("UPD_CHECKING"))
         root.update_idletasks()
         mode = detect_install_mode()
+        git_status_line = None
+        if mode == "git":
+            local_sha = _get_git_full_sha()
+            remote_sha = None
+            try:
+                remote_sha = _fetch_remote_main_sha()
+            except Exception:
+                remote_sha = None
+            if local_sha and remote_sha:
+                local_short = local_sha[:7]
+                remote_short = remote_sha[:7]
+                relation = _classify_git_relation(local_sha, remote_sha)
+                if relation == "match":
+                    key = "UPD_GIT_STATUS_MATCH"
+                elif relation == "remote_ahead":
+                    key = "UPD_GIT_STATUS_AHEAD"
+                elif relation == "local_ahead":
+                    key = "UPD_GIT_STATUS_LOCAL_AHEAD"
+                elif relation == "diverged":
+                    key = "UPD_GIT_STATUS_DIVERGED"
+                elif relation == "different_unverified":
+                    key = "UPD_GIT_STATUS_DIFFERENT_UNVERIFIED"
+                else:
+                    key = "UPD_GIT_STATUS_DIFFERENT"
+                git_status_line = t(key, local=local_short, remote=remote_short)
         try:
             info = get_update_info()
         except Exception as exc:  # noqa: BLE001
@@ -5947,6 +6968,34 @@ def run_gui(connection_store, output_directory):
                 set_connection_status(key=prev_key, **prev_params)
             else:
                 connection_status_var.set(prev_status)
+
+        git_status_line = None
+        if mode == "git":
+            local_sha = _get_git_full_sha()
+            remote_sha = None
+            try:
+                remote_sha = _fetch_remote_main_sha()
+            except Exception:
+                remote_sha = None
+            if local_sha and remote_sha:
+                local_short = local_sha[:7]
+                remote_short = remote_sha[:7]
+                relation = _classify_git_relation(local_sha, remote_sha)
+                if relation == "match":
+                    key = "UPD_GIT_STATUS_MATCH"
+                elif relation == "remote_ahead":
+                    key = "UPD_GIT_STATUS_AHEAD"
+                elif relation == "local_ahead":
+                    key = "UPD_GIT_STATUS_LOCAL_AHEAD"
+                elif relation == "diverged":
+                    key = "UPD_GIT_STATUS_DIVERGED"
+                elif relation == "different_unverified":
+                    key = "UPD_GIT_STATUS_DIFFERENT_UNVERIFIED"
+                else:
+                    key = "UPD_GIT_STATUS_DIFFERENT"
+                git_status_line = t(
+                    key, local=local_short, remote=remote_short
+                )
 
         latest_tag = info.get("latest_tag") or ""
         current_tag = info.get("current_tag") or f"v{APP_VERSION}"
@@ -5962,7 +7011,11 @@ def run_gui(connection_store, output_directory):
                 t("UPD_NO_UPDATE", current=current_tag, latest=latest_tag)
             ]
             if mode == "git":
+                if git_status_line:
+                    message_lines.append(git_status_line)
                 message_lines.append(t("UPD_GIT_MODE", command="git pull"))
+                if git_status_line:
+                    message_lines.append(git_status_line)
             elif mode == "source":
                 message_lines.append(t("UPD_SOURCE_MODE"))
             messagebox.showinfo(
@@ -5975,7 +7028,11 @@ def run_gui(connection_store, output_directory):
                 t("UPD_UPDATE_AVAILABLE", current=current_tag, latest=latest_tag)
             ]
             if mode == "git":
+                if git_status_line:
+                    message_lines.append(git_status_line)
                 message_lines.append(t("UPD_GIT_MODE", command="git pull"))
+                if git_status_line:
+                    message_lines.append(git_status_line)
             else:
                 message_lines.append(t("UPD_SOURCE_MODE"))
             messagebox.showinfo(t("UPD_TITLE"), "\n\n".join(message_lines))
@@ -6323,6 +7380,13 @@ def run_gui(connection_store, output_directory):
     )
     btn_check_updates.grid(row=0, column=2, padx=(10, 0), pady=(0, 10), sticky="w")
     i18n_widgets["btn_check_updates"] = btn_check_updates
+    btn_help = tk.Button(
+        result_frame,
+        text=t("BTN_HELP"),
+        command=show_help_window,
+    )
+    btn_help.grid(row=0, column=3, padx=(10, 0), pady=(0, 10), sticky="w")
+    i18n_widgets["btn_help"] = btn_help
 
     refresh_connection_combobox()
     refresh_secure_edit_button()
@@ -6407,6 +7471,7 @@ def run_gui(connection_store, output_directory):
         btn_start.config(text=t("BTN_START"))
         btn_report_issue.config(text=t("BTN_REPORT_ISSUE"))
         btn_check_updates.config(text=t("BTN_CHECK_UPDATES"))
+        btn_help.config(text=t("BTN_HELP"))
         lbl_export_info.config(text=t("LBL_EXPORT_INFO"))
         btn_open_file.config(text=t("BTN_OPEN_FILE"))
         btn_open_folder.config(text=t("BTN_OPEN_FOLDER"))
@@ -6485,6 +7550,8 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
     install_mode = detect_install_mode()
+    if install_mode == "exe":
+        _apply_pending_updater_update()
 
     if args.check_update:
         if install_mode == "git":
@@ -6519,6 +7586,12 @@ if __name__ == "__main__":
                 elif relation == "diverged":
                     print(
                         f"Update: local and remote main have diverged (local {local_short}, remote {remote_short})"
+                    )
+                elif relation == "different_unverified":
+                    print(
+                        "Update: local differs from remote main "
+                        f"(local {local_short}, remote {remote_short}) "
+                        "(could not compare — check GitHub connection)"
                     )
                 else:
                     print(
@@ -6666,7 +7739,12 @@ if __name__ == "__main__":
                     selected_connection.get("type"),
                     exc_info=exc,
                 )
-                print(t("CLI_CONNECTION_FAIL"))
+                title, msg = _format_connection_error(
+                    conn_type=str(selected_connection.get("type") or ""),
+                    exc=exc,
+                    details=selected_connection.get("details") or {},
+                )
+                print(f"{title}\n{msg}")
             sys.exit(1)
 
         run_console(

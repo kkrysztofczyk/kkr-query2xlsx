@@ -15,6 +15,9 @@ from urllib.request import Request, urlopen
 from zipfile import ZipFile
 
 APP_EXE_NAME = "kkr-query2xlsx.exe"
+UPDATER_EXE_NAME = "kkr-query2xlsx-updater.exe"
+UPDATER_STAGED_EXE_NAME = "kkr-query2xlsx-updater.new.exe"
+APP_CONFIG_NAME = "kkr-query2xlsx.json"
 UPDATER_TITLE = "Update"
 GITHUB_REPO_OWNER = "kkrysztofczyk"
 GITHUB_REPO_NAME = "kkr-query2xlsx"
@@ -30,6 +33,7 @@ def _get_base_dir() -> Path:
 
 
 BASE_DIR = _get_base_dir()
+APP_CONFIG_PATH = BASE_DIR / APP_CONFIG_NAME
 LOG_DIR = BASE_DIR / "logs"
 LOG_PATH = LOG_DIR / "update.log"
 
@@ -60,6 +64,50 @@ def _get_logger() -> logging.Logger:
 
 
 LOGGER = _get_logger()
+
+
+def _load_app_config() -> dict:
+    if not APP_CONFIG_PATH.exists():
+        return {}
+    try:
+        with APP_CONFIG_PATH.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.warning("Failed to read %s: %s", APP_CONFIG_PATH, exc, exc_info=exc)
+        return {}
+
+
+def _save_app_config(cfg: dict) -> None:
+    if not isinstance(cfg, dict):
+        cfg = {}
+    tmp_path = APP_CONFIG_PATH.with_suffix(f"{APP_CONFIG_PATH.suffix}.tmp")
+    try:
+        with tmp_path.open("w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, APP_CONFIG_PATH)
+    finally:
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+
+
+def _set_pending_updater_update(
+    staged_file_name: str, latest_tag: str = ""
+) -> None:
+    cfg = _load_app_config()
+    updates = cfg.get("_updates")
+    if not isinstance(updates, dict):
+        updates = {}
+    updates["pending_updater"] = {
+        "file": staged_file_name,
+        "tag": latest_tag or "",
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    cfg["_updates"] = updates
+    _save_app_config(cfg)
 
 
 def _show_error(message: str, exc: Exception | None = None) -> None:
@@ -176,9 +224,10 @@ def _wait_for_pid(pid: int, timeout_s: float = 60.0) -> bool:
     return False
 
 
-def _update_files(bundle_root: Path, install_root: Path) -> None:
+def _update_files(bundle_root: Path, install_root: Path, latest_tag: str = "") -> None:
     files_to_replace = [
         "kkr-query2xlsx.exe",
+        UPDATER_EXE_NAME,
         "README.md",
         "LICENSE",
         "secure.sample.json",
@@ -195,6 +244,16 @@ def _update_files(bundle_root: Path, install_root: Path) -> None:
         if not src.exists():
             continue
         dst = install_root / item
+        if (
+            item == UPDATER_EXE_NAME
+            and getattr(sys, "frozen", False)
+            and dst.resolve() == Path(sys.executable).resolve()
+        ):
+            staged_path = install_root / UPDATER_STAGED_EXE_NAME
+            shutil.copy2(src, staged_path)
+            _set_pending_updater_update(UPDATER_STAGED_EXE_NAME, latest_tag=latest_tag)
+            LOGGER.info("Staged updater update: %s", staged_path)
+            continue
         shutil.copy2(src, dst)
         LOGGER.info("Updated file: %s", dst)
 
@@ -266,7 +325,7 @@ def run_update(wait_pid: int | None = None) -> None:
             return
 
         try:
-            _update_files(bundle_root, BASE_DIR)
+            _update_files(bundle_root, BASE_DIR, latest_tag=latest_tag)
         except Exception as exc:  # noqa: BLE001
             _show_error("Failed to apply update.", exc)
             return
