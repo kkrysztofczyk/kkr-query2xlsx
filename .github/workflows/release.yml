@@ -4,6 +4,7 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -14,6 +15,14 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Debug marker (always)
+        shell: pwsh
+        run: |
+          "tag=${{ github.ref_name }}" | Out-File -Encoding utf8 ci_debug.txt
+          git rev-parse HEAD | Out-File -Append -Encoding utf8 ci_debug.txt
 
       - name: Sanity check (no legacy project name)
         shell: pwsh
@@ -23,7 +32,9 @@ jobs:
           $patterns = @("kkr-query2sheet")
 
           $files = git ls-files
-          $textFiles = $files | Where-Object { $_ -match '\.(md|txt|json|yml|yaml|sql|py|pyw|ps1|bat|cmd)$' }
+          $textFiles = $files |
+            Where-Object { $_ -match '\.(md|txt|json|yml|yaml|sql|py|pyw|ps1|bat|cmd)$' } |
+            Where-Object { $_ -ne ".github/workflows/release.yml" }
 
           $hits = $textFiles | ForEach-Object {
             Select-String -Path $_ -Pattern $patterns -SimpleMatch -ErrorAction SilentlyContinue
@@ -41,15 +52,23 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: "pip"
 
       - name: Install dependencies
+        shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
+          python --version
           python -m pip install --upgrade pip
-          if (Test-Path requirements.txt) { pip install -r requirements.txt }
-          pip install pyinstaller pyodbc
+          if (Test-Path requirements.txt) { python -m pip install -r requirements.txt }
+          python -m pip install pyinstaller pyodbc
+          pip --version
+          pip list
 
       - name: Build (PyInstaller - onedir)
+        shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
           $iconCandidates = @("docs\kkr-query2xlsx.ico","docs\icon.ico","docs\app.ico")
           $icon = $iconCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
           if ($icon) {
@@ -59,11 +78,26 @@ jobs:
           }
 
       - name: Build updater (PyInstaller - onefile)
+        shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
           pyinstaller --onefile --windowed --name kkr-query2xlsx-updater --noupx updater.py
 
-      - name: Package (portable bundle with examples + samples)
+      - name: Debug (dist tree)
+        shell: pwsh
         run: |
+          $ErrorActionPreference = "Continue"
+          if (Test-Path "dist") {
+            Write-Host "dist tree:"
+            Get-ChildItem -Path "dist" -Recurse | Select-Object FullName
+          } else {
+            Write-Host "dist does not exist"
+          }
+
+      - name: Package (portable bundle with examples + samples)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
           # Clean bundle dir (defensive: avoids stale files when re-running locally)
           if (Test-Path "bundle") { Remove-Item -Recurse -Force "bundle" }
 
@@ -110,6 +144,17 @@ jobs:
           }
 
           Compress-Archive -Path "bundle\\kkr-query2xlsx" -DestinationPath "kkr-query2xlsx-${{ github.ref_name }}-windows.zip"
+
+      - name: Debug (bundle + zip presence)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Continue"
+          if (Test-Path "bundle") {
+            Write-Host "bundle tree:"
+            Get-ChildItem -Path "bundle" -Recurse | Select-Object FullName
+          }
+          $zip = "kkr-query2xlsx-${{ github.ref_name }}-windows.zip"
+          Write-Host "ZIP exists? " (Test-Path $zip)
 
       - name: Validate ZIP (portable bundle)
         shell: pwsh
@@ -166,8 +211,22 @@ jobs:
             throw "README.md still references .github/assets/logo.png — change it to docs/logo.png for portable bundles."
           }
 
+      - name: Upload artifacts (debug - always)
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows-debug
+          path: |
+            ci_debug.txt
+            dist/**
+            bundle/**
+            kkr-query2xlsx-*-windows.zip
+          if-no-files-found: ignore
+
       - name: Upload to GitHub Release
         uses: softprops/action-gh-release@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           files: |
             kkr-query2xlsx-${{ github.ref_name }}-windows.zip

@@ -5,6 +5,7 @@ import csv
 import json
 import getpass
 import importlib.metadata
+import importlib.util
 import logging
 import textwrap
 import re
@@ -37,6 +38,26 @@ from sqlalchemy.exc import DBAPIError, NoSuchModuleError
 from openpyxl import load_workbook
 from openpyxl.utils import coordinate_to_tuple
 
+
+def _load_optional_sql_highlighter():
+    if importlib.util.find_spec("chlorophyll") is None:
+        return None, {}
+    if importlib.util.find_spec("pygments") is None:
+        return None, {}
+    if importlib.util.find_spec("pygments.lexers.sql") is None:
+        return None, {}
+    from chlorophyll import CodeView
+    from pygments.lexers.sql import SqlLexer, MySqlLexer, PostgresLexer, TransactSqlLexer
+
+    return CodeView, {
+        "SQLite": SqlLexer,
+        "MySQL": MySqlLexer,
+        "Postgres": PostgresLexer,
+        "MSSQL": TransactSqlLexer,
+    }
+
+
+CodeView, SQL_LEXER_CLASSES = _load_optional_sql_highlighter()
 
 def _get_base_dir() -> str:
     """Return the directory that should be treated as the app "home".
@@ -93,7 +114,7 @@ def apply_app_icon(win) -> None:
 
 # --- App version -------------------------------------------------------------
 
-APP_VERSION = "0.3.7"  # bump manually for releases
+APP_VERSION = "0.3.8"  # bump manually for releases
 
 GITHUB_ISSUE_CHOOSER_URL = (
     "https://github.com/kkrysztofczyk/kkr-query2xlsx/issues/new/choose"
@@ -334,6 +355,27 @@ def _apply_pending_updater_update() -> None:
         pass
 
 
+def apply_native_ttk_theme(root: tk.Tk) -> None:
+    """Apply a safe, native-looking ttk theme when available."""
+    try:
+        style = ttk.Style(root)
+        available = set(style.theme_names())
+        preferred = []
+        if sys.platform.startswith("win"):
+            preferred = ["vista", "xpnative"]
+        elif sys.platform == "darwin":
+            preferred = ["aqua"]
+        preferred.append("clam")
+        for theme in preferred:
+            if theme in available:
+                try:
+                    style.theme_use(theme)
+                    break
+                except tk.TclError:
+                    continue
+    except Exception:
+        pass
+
 def _get_git_short_sha() -> str | None:
     """Best-effort git short SHA for local/dev runs. Returns None when unavailable."""
     try:
@@ -460,7 +502,7 @@ def _classify_mssql_conn_error(
             )
         return (
             "Missing pyodbc",
-            ["pyodbc is not installed or failed to load. Try: pip install pyodbc"],
+            ["pyodbc is not installed or failed to load. Try: python -m pip install pyodbc"],
         )
 
     # Missing / wrong ODBC driver (only if it actually matches reality)
@@ -969,6 +1011,8 @@ I18N: dict[str, dict[str, str]] = {
         "LBL_OUTPUT": "Output",
         "LBL_LANGUAGE": "Language",
         "CHK_ARCHIVE_SQL": "Archive SQL (save query + metadata)",
+        "CHK_SQL_HIGHLIGHT": "Syntax highlighting (Chlorophyll)",
+        "LBL_SQL_DIALECT": "SQL dialect",
         "MSG_DONE": "Done.",
         "ERR_TITLE": "Error",
         "WARN_TITLE": "Warning",
@@ -997,6 +1041,10 @@ I18N: dict[str, dict[str, str]] = {
         "ERR_ORACLE_MISSING_BODY": (
             "Cannot connect to Oracle. Required Python library (e.g. cx_Oracle) "
             "is not installed. Install the missing library and try again."
+        ),
+        "INFO_SQL_HIGHLIGHT_TITLE": "Syntax highlighting",
+        "INFO_SQL_HIGHLIGHT_BODY": (
+            "Chlorophyll is not available. Install it to enable SQL highlighting."
         ),
         "MSG_UI_TRUNCATED": (
             "...\n(Trimmed in UI, full details in kkr-query2xlsx.log)"
@@ -1188,13 +1236,18 @@ I18N: dict[str, dict[str, str]] = {
         ),
         "ERR_EXPORT": "Export error. Full details in log.",
         "FRAME_DB_CONNECTION": "Database connection",
+        "FRAME_ADVANCED": "Advanced",
         "LBL_CONNECTION": "Connection:",
+        "BTN_MANAGE_CONNECTIONS": "Manage connections...",
         "BTN_EDIT_CONNECTION": "Edit connection",
         "BTN_NEW_CONNECTION": "New connection",
         "BTN_DUPLICATE_CONNECTION": "Duplicate",
         "BTN_TEST_CONNECTION": "Test connection",
         "BTN_DELETE_CONNECTION": "Delete connection",
         "BTN_EDIT_SECURE": "Edit secure.txt",
+        "BTN_SET_CURRENT_CONNECTION": "Set as current",
+        "CONNECTIONS_MANAGER_TITLE": "Connections",
+        "WARN_SELECT_CONNECTION": "Select a connection from the list.",
         "FRAME_SQL_SOURCE": "SQL query source",
         "FRAME_OUTPUT_FORMAT": "Output format",
         "FRAME_TEMPLATE_OPTIONS": "XLSX template options (GUI)",
@@ -1451,6 +1504,8 @@ I18N: dict[str, dict[str, str]] = {
         "LBL_OUTPUT": "Wyjście",
         "LBL_LANGUAGE": "Język",
         "CHK_ARCHIVE_SQL": "Archiwizuj SQL (zapisz zapytanie + metadane)",
+        "CHK_SQL_HIGHLIGHT": "Podświetlanie składni (Chlorophyll)",
+        "LBL_SQL_DIALECT": "Dialekt SQL",
         "MSG_DONE": "Gotowe.",
         "ERR_TITLE": "Błąd",
         "WARN_TITLE": "Uwaga",
@@ -1479,6 +1534,11 @@ I18N: dict[str, dict[str, str]] = {
         "ERR_ORACLE_MISSING_BODY": (
             "Nie można połączyć z Oracle. Wymagana biblioteka Pythona (np. cx_Oracle) "
             "nie jest zainstalowana. Zainstaluj brakującą bibliotekę i spróbuj ponownie."
+        ),
+        "INFO_SQL_HIGHLIGHT_TITLE": "Podświetlanie składni",
+        "INFO_SQL_HIGHLIGHT_BODY": (
+            "Chlorophyll nie jest dostępny. Zainstaluj go, aby włączyć "
+            "podświetlanie SQL."
         ),
         "MSG_UI_TRUNCATED": (
             "...\n(Przycięto w UI, pełna treść w kkr-query2xlsx.log)"
@@ -1686,13 +1746,18 @@ I18N: dict[str, dict[str, str]] = {
         ),
         "ERR_EXPORT": "Błąd eksportu. Pełne szczegóły w logu.",
         "FRAME_DB_CONNECTION": "Połączenie z bazą danych",
+        "FRAME_ADVANCED": "Zaawansowane",
         "LBL_CONNECTION": "Połączenie:",
+        "BTN_MANAGE_CONNECTIONS": "Zarządzaj połączeniami...",
         "BTN_EDIT_CONNECTION": "Edytuj połączenie",
         "BTN_NEW_CONNECTION": "Nowe połączenie",
         "BTN_DUPLICATE_CONNECTION": "Duplikuj",
         "BTN_TEST_CONNECTION": "Testuj połączenie",
         "BTN_DELETE_CONNECTION": "Usuń połączenie",
         "BTN_EDIT_SECURE": "Edytuj secure.txt",
+        "BTN_SET_CURRENT_CONNECTION": "Ustaw jako bieżące",
+        "CONNECTIONS_MANAGER_TITLE": "Połączenia",
+        "WARN_SELECT_CONNECTION": "Wybierz połączenie z listy.",
         "FRAME_SQL_SOURCE": "Źródło zapytania SQL",
         "FRAME_OUTPUT_FORMAT": "Format wyjściowy",
         "FRAME_TEMPLATE_OPTIONS": "Opcje template XLSX (GUI)",
@@ -2219,6 +2284,7 @@ def show_readme_window(parent) -> None:
 SECURE_PATH = _build_path("secure.txt")
 QUERIES_PATH = _build_path("queries.txt")
 APP_CONFIG_PATH = _build_path("kkr-query2xlsx.json")
+UI_CONFIG_FILENAME = "kkr-query2xlsx.user.json"
 LEGACY_CSV_PROFILES_PATH = _build_path("csv_profiles.json")
 SQL_ARCHIVE_DIR = _build_path("sql_archive")
 
@@ -2261,6 +2327,72 @@ PREFERRED_DEFAULT_CSV_PROFILE_BY_LANG = {
     "en": "CSV standard (comma, dot)",
     "pl": "CSV Excel Europe (semicolon, comma)",
 }
+
+
+def _default_ui_config() -> dict:
+    return {
+        "ui": {
+            "sql_highlight_enabled": False,
+        }
+    }
+
+
+def load_ui_config(app_dir: Path) -> dict:
+    path = Path(app_dir) / UI_CONFIG_FILENAME
+    if not path.exists():
+        return _default_ui_config()
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+    except Exception:
+        return _default_ui_config()
+
+    if not isinstance(raw, dict):
+        return _default_ui_config()
+
+    cfg = _default_ui_config()
+    ui_section = raw.get("ui")
+    if isinstance(ui_section, dict):
+        raw_val = ui_section.get("sql_highlight_enabled")
+        if isinstance(raw_val, bool):
+            cfg["ui"]["sql_highlight_enabled"] = raw_val
+        elif isinstance(raw_val, int) and raw_val in (0, 1):
+            cfg["ui"]["sql_highlight_enabled"] = bool(raw_val)
+    return cfg
+
+
+def save_ui_config(app_dir: Path, data: dict) -> None:
+    tmp_path: Path | None = None
+    try:
+        if not isinstance(data, dict):
+            data = _default_ui_config()
+
+        ui_section = data.get("ui") if isinstance(data.get("ui"), dict) else {}
+        normalized = _default_ui_config()
+        raw_enabled = ui_section.get("sql_highlight_enabled")
+        if isinstance(raw_enabled, bool):
+            normalized["ui"]["sql_highlight_enabled"] = raw_enabled
+        elif isinstance(raw_enabled, int) and raw_enabled in (0, 1):
+            normalized["ui"]["sql_highlight_enabled"] = bool(raw_enabled)
+
+        path = Path(app_dir) / UI_CONFIG_FILENAME
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = path.with_suffix(path.suffix + ".tmp")
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(normalized, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, path)
+    except Exception:
+        if tmp_path and tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+    finally:
+        if tmp_path and tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
 
 
 def is_builtin_csv_profile(name: str) -> bool:
@@ -2374,6 +2506,172 @@ def persist_archive_sql(enabled: bool) -> None:
     app_config = load_app_config()
     app_config["archive_sql"] = bool(enabled)
     save_app_config(app_config)
+
+
+def _dialect_from_db_kind(db_kind: str) -> str:
+    kind = (db_kind or "").strip().lower()
+    if "sqlite" in kind:
+        return "SQLite"
+    if "postgres" in kind:
+        return "Postgres"
+    if "mysql" in kind:
+        return "MySQL"
+    if any(token in kind for token in ("mssql", "sqlserver", "sql server", "odbc")):
+        return "MSSQL"
+    return "SQLite"
+
+
+def _apply_codeview_pygments_style(w: tk.Text, style_name: str = "vs") -> None:
+    """
+    Apply a Pygments style (e.g. 'vs') to Chlorophyll CodeView by configuring Text tags.
+    This gives a much more coherent look (keywords/types/punctuation) than ad-hoc coloring.
+    """
+    try:
+        from pygments.styles import get_style_by_name
+        from pygments.token import Token, string_to_tokentype
+    except Exception:
+        return
+
+    def _parse_style(s: str) -> dict:
+        # Pygments style strings look like: "bold #RRGGBB" or "#RRGGBB"
+        if not s:
+            return {}
+        fg = None
+        for part in str(s).split():
+            if part.startswith("#") and len(part) == 7:
+                fg = part
+        return {"foreground": fg} if fg else {}
+
+    def _lookup_style(pyg_style, ttype):
+        # climb parents until we find a defined style
+        cur = ttype
+        while cur not in pyg_style.styles and cur is not Token:
+            cur = cur.parent
+        return pyg_style.styles.get(cur, "")
+
+    try:
+        pyg_style = get_style_by_name(style_name)
+    except Exception:
+        return
+
+    # keep light background (light UI)
+    bg = getattr(pyg_style, "background_color", None) or "white"
+    w.configure(
+        bg=bg,
+        fg="black",
+        insertbackground="black",
+        selectbackground="#cce8ff",
+        inactiveselectbackground="#cce8ff",
+    )
+
+    # Apply per-tag colors from Pygments
+    for tag in w.tag_names():
+        tag_norm = tag.replace("_", ".")
+        if not tag_norm.startswith("Token"):
+            continue
+        try:
+            ttype = string_to_tokentype(tag_norm)
+        except Exception:
+            continue
+
+        style_str = _lookup_style(pyg_style, ttype)
+        cfg = _parse_style(style_str)
+        if cfg:
+            try:
+                w.tag_configure(tag, **cfg)
+            except Exception:
+                pass
+
+    # Light theme tweaks (readability on white background):
+    # - brackets/punctuation slightly darker so quotes like '' are visible
+    # - functions use a subtle accent (not pure black)
+    # - types (VARCHAR/NVARCHAR/INT...) and keywords strong blue
+    # - strings in readable red
+    # - numbers dark for contrast
+    for tag in w.tag_names():
+        lt = tag.lower().replace(".", "_").replace("-", "_")
+
+        if "punctuation" in lt:
+            try:
+                w.tag_configure(tag, foreground="#404040")
+            except Exception:
+                pass
+
+        if "name_function" in lt:
+            try:
+                w.tag_configure(tag, foreground="#2f5597")
+            except Exception:
+                pass
+
+        if "keyword" in lt or "keyword_type" in lt:
+            try:
+                w.tag_configure(tag, foreground="#0000ff")
+            except Exception:
+                pass
+
+        if "name_builtin" in lt:
+            try:
+                w.tag_configure(tag, foreground="#0000ff")
+            except Exception:
+                pass
+
+        if "string" in lt:
+            try:
+                w.tag_configure(tag, foreground="#a31515")
+            except Exception:
+                pass
+
+        if "number" in lt:
+            try:
+                w.tag_configure(tag, foreground="#000000")
+            except Exception:
+                pass
+
+
+def _apply_sql_light_theme_simple(w: tk.Text) -> None:
+    # base
+    w.configure(
+        bg="white",
+        fg="black",
+        insertbackground="black",
+        selectbackground="#cce8ff",
+        inactiveselectbackground="#cce8ff",
+    )
+
+    def _set(tag: str, **cfg):
+        try:
+            w.tag_configure(tag, **cfg)
+        except Exception:
+            pass
+
+    for tag in w.tag_names():
+        lt = tag.lower()
+        norm = lt.replace(".", "_").replace("-", "_")
+
+        # comments
+        if "comment" in norm:
+            _set(tag, foreground="#008000")
+            continue
+
+        # strings
+        if "string" in norm:
+            _set(tag, foreground="#a31515")
+            continue
+
+        # keywords (SELECT/CREATE/INSERT/...)
+        if "keyword" in norm:
+            _set(tag, foreground="#0000ff")
+            continue
+
+        # datatypes often come as Name.Builtin / Keyword.Type
+        if "name_builtin" in norm or "keyword_type" in norm or "type" in norm:
+            _set(tag, foreground="#0000ff")
+            continue
+
+        # numbers (opcjonalnie)
+        if "number" in norm:
+            _set(tag, foreground="#098658")
+            continue
 
 
 def shorten_path(path, max_len=80):
@@ -5502,6 +5800,7 @@ def run_gui(connection_store, output_directory):
     root = tk.Tk()
     root.title(f"{t('APP_TITLE_FULL')} {get_app_version_label()}")
     apply_app_icon(root)
+    apply_native_ttk_theme(root)
 
     selected_sql_path_full = tk.StringVar(value="")
     sql_label_var = tk.StringVar(value="")
@@ -5527,6 +5826,15 @@ def run_gui(connection_store, output_directory):
         value=_CURRENT_LANG.upper()
     )
     archive_sql_var = tk.BooleanVar(value=load_persisted_archive_sql())
+    ui_config = load_ui_config(Path(BASE_DIR))
+    sql_highlight_enabled = bool(
+        (ui_config.get("ui") or {}).get("sql_highlight_enabled", False)
+    )
+    if sql_highlight_enabled and (CodeView is None or not SQL_LEXER_CLASSES):
+        sql_highlight_enabled = False
+    sql_highlight_var = tk.BooleanVar(value=sql_highlight_enabled)
+    sql_dialect_var = tk.StringVar(value="SQLite")
+    sql_editor_state = {"dialog": None, "widget": None, "rebuild": None}
 
     # Template-related state (GUI only; console mode has no template support)
     use_template_var = tk.BooleanVar(value=False)
@@ -5548,6 +5856,20 @@ def run_gui(connection_store, output_directory):
             persist_archive_sql(bool(archive_sql_var.get()))
         except Exception as exc:  # noqa: BLE001
             LOGGER.warning("Persist archive_sql failed: %s", exc, exc_info=exc)
+
+    def _sql_highlight_available() -> bool:
+        return CodeView is not None and bool(SQL_LEXER_CLASSES)
+
+    def persist_sql_highlight_setting(enabled: bool) -> None:
+        config = load_ui_config(Path(BASE_DIR))
+        config.setdefault("ui", {})["sql_highlight_enabled"] = bool(enabled)
+        save_ui_config(Path(BASE_DIR), config)
+
+    def reset_sql_dialect_for_connection(conn_type: str) -> None:
+        sql_dialect_var.set(_dialect_from_db_kind(conn_type))
+        rebuild = sql_editor_state.get("rebuild")
+        if rebuild and sql_highlight_var.get():
+            rebuild(keep_text=True)
 
     def _set_sql_path(path):
         pasted_sql_state["sql"] = None
@@ -5696,6 +6018,7 @@ def run_gui(connection_store, output_directory):
             set_connection_status(connected=False, key="STATUS_NO_CONNECTION")
             apply_engine(None)
             return
+        reset_sql_dialect_for_connection(str(conn.get("type") or ""))
         try:
             engine = create_engine_from_entry(conn)
             with engine.connect() as connection:
@@ -5990,6 +6313,187 @@ def run_gui(connection_store, output_directory):
         dlg.bind("<Escape>", lambda *_: dlg.destroy())
         dlg.focus_set()
 
+    def open_connections_manager_gui():
+        dlg = tk.Toplevel(root)
+        apply_app_icon(dlg)
+        dlg.title(t("CONNECTIONS_MANAGER_TITLE"))
+        dlg.transient(root)
+        dlg.grab_set()
+
+        dlg.minsize(560, 320)
+        dlg.geometry("680x360")
+        dlg.update_idletasks()
+        _center_window(dlg, root)
+
+        dlg.columnconfigure(0, weight=1)
+        dlg.rowconfigure(0, weight=1)
+
+        body = ttk.Frame(dlg, padding=(12, 12, 12, 12))
+        body.grid(row=0, column=0, sticky="nsew")
+        body.columnconfigure(0, weight=1)
+        body.rowconfigure(0, weight=1)
+
+        list_frame = ttk.Frame(body)
+        list_frame.grid(row=0, column=0, sticky="nsew")
+        list_frame.columnconfigure(0, weight=1)
+        list_frame.rowconfigure(0, weight=1)
+
+        tree = ttk.Treeview(list_frame, show="tree", selectmode="browse", height=12)
+        scroll = ttk.Scrollbar(list_frame, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=scroll.set)
+        tree.grid(row=0, column=0, sticky="nsew")
+        scroll.grid(row=0, column=1, sticky="ns")
+
+        button_frame = ttk.Frame(body)
+        button_frame.grid(row=0, column=1, sticky="ns", padx=(12, 0))
+
+        def selected_name() -> str:
+            sel = tree.selection()
+            return sel[0] if sel else ""
+
+        def update_button_state() -> None:
+            has_selection = bool(selected_name())
+            state = tk.NORMAL if has_selection else tk.DISABLED
+            set_current_btn.config(state=state)
+            edit_btn.config(state=state)
+            delete_btn.config(state=state)
+
+        def refresh_list(select_name: str | None = None) -> None:
+            tree.delete(*tree.get_children())
+            names = [
+                c.get("name", "") for c in connections_state["store"].get("connections", [])
+            ]
+            for name in names:
+                if name:
+                    tree.insert("", "end", iid=name, text=name)
+            preferred = select_name or selected_connection_var.get()
+            if preferred and preferred in names:
+                tree.selection_set(preferred)
+                tree.see(preferred)
+            elif names:
+                tree.selection_set(names[0])
+                tree.see(names[0])
+            update_button_state()
+
+        def warn_no_selection() -> None:
+            messagebox.showwarning(t("WARN_TITLE"), t("WARN_SELECT_CONNECTION"))
+
+        def on_set_current() -> None:
+            name = selected_name()
+            if not name:
+                warn_no_selection()
+                return
+            set_selected_connection(name)
+            refresh_connection_combobox()
+            apply_selected_connection(show_success=False)
+            refresh_list(select_name=name)
+
+        def on_new() -> None:
+            open_connection_dialog_gui(
+                root,
+                connections_state,
+                selected_connection_var,
+                get_connection_by_name,
+                set_selected_connection,
+                persist_connections,
+                refresh_connection_combobox,
+                apply_selected_connection,
+                handle_db_driver_error,
+                create_engine_from_entry,
+                mode="new",
+            )
+            refresh_list(select_name=selected_connection_var.get() or None)
+
+        def on_edit() -> None:
+            name = selected_name()
+            if not name:
+                warn_no_selection()
+                return
+            set_selected_connection(name)
+            open_connection_dialog_gui(
+                root,
+                connections_state,
+                selected_connection_var,
+                get_connection_by_name,
+                set_selected_connection,
+                persist_connections,
+                refresh_connection_combobox,
+                apply_selected_connection,
+                handle_db_driver_error,
+                create_engine_from_entry,
+                mode="edit",
+            )
+            refresh_list(select_name=name)
+
+        def on_delete() -> None:
+            name = selected_name()
+            if not name:
+                warn_no_selection()
+                return
+            set_selected_connection(name)
+            delete_selected_connection()
+            refresh_list()
+
+        def on_close() -> None:
+            if secure_edit_state.get("button") is security_btn:
+                secure_edit_state["button"] = None
+            dlg.destroy()
+
+        set_current_btn = ttk.Button(
+            button_frame,
+            text=t("BTN_SET_CURRENT_CONNECTION"),
+            command=on_set_current,
+            width=20,
+        )
+        set_current_btn.pack(fill="x", pady=(0, 6))
+
+        new_btn = ttk.Button(
+            button_frame, text=t("BTN_NEW_CONNECTION"), command=on_new, width=20
+        )
+        new_btn.pack(fill="x", pady=(0, 6))
+
+        edit_btn = ttk.Button(
+            button_frame, text=t("BTN_EDIT_CONNECTION"), command=on_edit, width=20
+        )
+        edit_btn.pack(fill="x", pady=(0, 6))
+
+        delete_btn = ttk.Button(
+            button_frame, text=t("BTN_DELETE_CONNECTION"), command=on_delete, width=20
+        )
+        delete_btn.pack(fill="x", pady=(0, 6))
+
+        security_btn = ttk.Button(
+            button_frame,
+            text=t("BTN_EDIT_SECURE"),
+            command=open_secure_editor,
+            width=20,
+        )
+        security_btn.pack(fill="x", pady=(0, 6))
+
+        odbc_btn = ttk.Button(
+            button_frame,
+            text=t("BTN_ODBC_DIAGNOSTICS"),
+            command=show_odbc_diagnostics_popup,
+            width=20,
+        )
+        odbc_btn.pack(fill="x", pady=(0, 6))
+
+        close_btn = ttk.Button(
+            button_frame, text=t("BTN_CLOSE"), command=on_close, width=20
+        )
+        close_btn.pack(fill="x")
+
+        secure_edit_state["button"] = security_btn
+        refresh_secure_edit_button()
+        refresh_list()
+
+        tree.bind("<<TreeviewSelect>>", lambda *_: update_button_state())
+        tree.bind("<Double-Button-1>", lambda *_: on_set_current())
+        dlg.bind("<Escape>", lambda *_: on_close())
+        dlg.protocol("WM_DELETE_WINDOW", on_close)
+        tree.focus_set()
+        dlg.wait_window(dlg)
+
     def refresh_secure_edit_button():
         btn = secure_edit_state.get("button")
         if btn is None:
@@ -6115,7 +6619,7 @@ def run_gui(connection_store, output_directory):
         report_name_var = tk.StringVar(value=pasted_sql_state["report_name"] or "")
 
         dlg.columnconfigure(0, weight=1)
-        dlg.rowconfigure(3, weight=1)
+        dlg.rowconfigure(4, weight=1)
 
         tk.Label(dlg, text=t("LBL_REPORT_NAME")).grid(
             row=0, column=0, sticky="w", padx=12, pady=(12, 4)
@@ -6126,13 +6630,120 @@ def run_gui(connection_store, output_directory):
         tk.Label(dlg, text=t("LBL_PASTE_SQL")).grid(
             row=2, column=0, sticky="nw", padx=12, pady=(12, 4)
         )
-        sql_text_widget = tk.Text(dlg, wrap="none", height=10)
-        sql_text_widget.grid(row=3, column=0, sticky="nsew", padx=12)
-        if pasted_sql_state["sql"]:
-            sql_text_widget.insert("1.0", pasted_sql_state["sql"])
+        options_frame = tk.Frame(dlg)
+        options_frame.grid(row=3, column=0, sticky="we", padx=12)
+        options_frame.columnconfigure(2, weight=1)
+
+        def update_dialect_controls_state():
+            combo_state = "readonly" if sql_highlight_var.get() else "disabled"
+            dialect_combo.config(state=combo_state)
+
+        def rebuild_sql_editor(keep_text: bool = True) -> None:
+            current_text = ""
+            existing = sql_editor_state.get("widget")
+            if keep_text and existing is not None:
+                try:
+                    current_text = existing.get("1.0", tk.END).rstrip()
+                except Exception:
+                    current_text = ""
+            elif keep_text and pasted_sql_state.get("sql"):
+                current_text = pasted_sql_state.get("sql") or ""
+
+            for child in editor_container.winfo_children():
+                child.destroy()
+
+            editor_container.columnconfigure(0, weight=1)
+            editor_container.rowconfigure(0, weight=1)
+
+            if sql_highlight_var.get() and _sql_highlight_available():
+                lexer_cls = (
+                    SQL_LEXER_CLASSES.get(sql_dialect_var.get())
+                    or SQL_LEXER_CLASSES.get("SQLite")
+                )
+                sql_widget = CodeView(  # type: ignore[call-arg]
+                    editor_container,
+                    lexer=lexer_cls,
+                    wrap="none",
+                    height=10,
+                )
+                sql_widget.grid(row=0, column=0, sticky="nsew")
+                _apply_codeview_pygments_style(sql_widget, "vs")
+            else:
+                sql_widget = tk.Text(editor_container, wrap="none", height=10)
+
+                y_scroll = ttk.Scrollbar(
+                    editor_container, orient="vertical", command=sql_widget.yview
+                )
+                x_scroll = ttk.Scrollbar(
+                    editor_container, orient="horizontal", command=sql_widget.xview
+                )
+                sql_widget.configure(
+                    yscrollcommand=y_scroll.set,
+                    xscrollcommand=x_scroll.set,
+                )
+                sql_widget.grid(row=0, column=0, sticky="nsew")
+                y_scroll.grid(row=0, column=1, sticky="ns")
+                x_scroll.grid(row=1, column=0, sticky="we")
+
+            if current_text:
+                sql_widget.insert("1.0", current_text)
+
+            sql_editor_state["widget"] = sql_widget
+
+        def on_sql_highlight_toggle():  # noqa: ANN001
+            if sql_highlight_var.get():
+                if not _sql_highlight_available():
+                    messagebox.showinfo(
+                        t("INFO_SQL_HIGHLIGHT_TITLE"),
+                        t("INFO_SQL_HIGHLIGHT_BODY"),
+                        parent=dlg,
+                    )
+                    sql_highlight_var.set(False)
+                    persist_sql_highlight_setting(False)
+                    update_dialect_controls_state()
+                    return
+                persist_sql_highlight_setting(True)
+            else:
+                persist_sql_highlight_setting(False)
+            update_dialect_controls_state()
+            rebuild_sql_editor(keep_text=True)
+
+        chk_sql_highlight = tk.Checkbutton(
+            options_frame,
+            text=t("CHK_SQL_HIGHLIGHT"),
+            variable=sql_highlight_var,
+            command=on_sql_highlight_toggle,
+        )
+        chk_sql_highlight.grid(row=0, column=0, sticky="w")
+
+        tk.Label(options_frame, text=t("LBL_SQL_DIALECT")).grid(
+            row=0, column=1, sticky="w", padx=(12, 4)
+        )
+        dialect_combo = ttk.Combobox(
+            options_frame,
+            textvariable=sql_dialect_var,
+            values=["SQLite", "MSSQL", "Postgres", "MySQL"],
+            state="readonly",
+            width=12,
+        )
+        dialect_combo.grid(row=0, column=2, sticky="w")
+
+        editor_container = tk.Frame(dlg)
+        editor_container.grid(row=4, column=0, sticky="nsew", padx=12)
+
+        update_dialect_controls_state()
+        rebuild_sql_editor(keep_text=True)
+        sql_editor_state["dialog"] = dlg
+        sql_editor_state["rebuild"] = rebuild_sql_editor
+
+        def on_dialect_change(*_):  # noqa: ANN001
+            if sql_highlight_var.get():
+                rebuild_sql_editor(keep_text=True)
+
+        dialect_combo.bind("<<ComboboxSelected>>", on_dialect_change)
 
         btn_frame = tk.Frame(dlg)
-        btn_frame.grid(row=4, column=0, sticky="e", padx=12, pady=(12, 12))
+        btn_frame.grid(row=5, column=0, sticky="e", padx=12, pady=(12, 12))
 
         def use_sql(*_):
             ok, msg, normalized_name = validate_report_basename(report_name_var.get())
@@ -6143,7 +6754,8 @@ def run_gui(connection_store, output_directory):
                     parent=dlg,
                 )
                 return
-            sql = sql_text_widget.get("1.0", tk.END).strip()
+            sql_widget = sql_editor_state.get("widget")
+            sql = sql_widget.get("1.0", tk.END).strip() if sql_widget else ""
             if not sql:
                 messagebox.showerror(
                     t("ERR_EMPTY_SQL_TITLE"),
@@ -6155,9 +6767,15 @@ def run_gui(connection_store, output_directory):
             pasted_sql_state["report_name"] = normalized_name
             selected_sql_path_full.set("")
             sql_label_var.set(f"{t('LBL_SQL_PASTED')} {normalized_name}")
+            sql_editor_state["dialog"] = None
+            sql_editor_state["widget"] = None
+            sql_editor_state["rebuild"] = None
             dlg.destroy()
 
         def cancel(*_):
+            sql_editor_state["dialog"] = None
+            sql_editor_state["widget"] = None
+            sql_editor_state["rebuild"] = None
             dlg.destroy()
 
         cancel_btn = tk.Button(btn_frame, text=t("BTN_CANCEL"), width=12, command=cancel)
@@ -6167,6 +6785,7 @@ def run_gui(connection_store, output_directory):
 
         dlg.bind("<Escape>", cancel)
         dlg.bind("<Return>", use_sql)
+        dlg.protocol("WM_DELETE_WINDOW", cancel)
         report_entry.focus_set()
 
     def update_template_controls_state():
@@ -7013,13 +7632,13 @@ def run_gui(connection_store, output_directory):
             return
         root.destroy()
 
-    connection_frame = tk.LabelFrame(
-        root, text=t("FRAME_DB_CONNECTION"), padx=10, pady=10
+    connection_frame = ttk.LabelFrame(
+        root, text=t("FRAME_DB_CONNECTION"), padding=(10, 10)
     )
     connection_frame.pack(fill=tk.X, padx=10, pady=(10, 5))
     i18n_widgets["connection_frame"] = connection_frame
 
-    status_label = tk.Label(
+    status_label = ttk.Label(
         connection_frame,
         textvariable=connection_status_var,
         justify="left",
@@ -7036,11 +7655,11 @@ def run_gui(connection_store, output_directory):
     connection_frame.bind("<Configure>", _update_status_wrap)
     status_label.bind("<Configure>", _update_status_wrap)
 
-    connection_controls = tk.Frame(connection_frame)
+    connection_controls = ttk.Frame(connection_frame)
     connection_controls.grid(row=1, column=0, sticky="we", pady=(5, 0))
     connection_controls.columnconfigure(1, weight=1)
 
-    lbl_connection = tk.Label(connection_controls, text=t("LBL_CONNECTION"))
+    lbl_connection = ttk.Label(connection_controls, text=t("LBL_CONNECTION"))
     lbl_connection.grid(row=0, column=0, sticky="w")
     i18n_widgets["lbl_connection"] = lbl_connection
     connection_combo = ttk.Combobox(
@@ -7053,8 +7672,8 @@ def run_gui(connection_store, output_directory):
     connections_state["combobox"] = connection_combo
     connection_combo.bind("<<ComboboxSelected>>", on_connection_change)
 
-    lbl_language = tk.Label(connection_controls, text=t("LBL_LANGUAGE"))
-    lbl_language.grid(row=1, column=0, sticky="w", pady=(5, 0))
+    lbl_language = ttk.Label(connection_controls, text=t("LBL_LANGUAGE"))
+    lbl_language.grid(row=1, column=0, sticky="w", pady=(6, 0))
     i18n_widgets["lbl_language"] = lbl_language
     lang_combo = ttk.Combobox(
         connection_controls,
@@ -7063,106 +7682,67 @@ def run_gui(connection_store, output_directory):
         state="readonly",
         width=6,
     )
-    lang_combo.grid(row=1, column=1, sticky="w", padx=(5, 0), pady=(5, 0))
+    lang_combo.grid(row=1, column=1, sticky="w", padx=(5, 0), pady=(6, 0))
     i18n_widgets["lang_combo"] = lang_combo
 
-    chk_archive_sql = tk.Checkbutton(
-        connection_controls,
+    buttons_frame = ttk.Frame(connection_controls)
+    buttons_frame.grid(row=0, column=2, sticky="e", padx=(10, 0))
+
+    btn_manage_connections = ttk.Button(
+        buttons_frame,
+        text=t("BTN_MANAGE_CONNECTIONS"),
+        command=open_connections_manager_gui,
+    )
+    btn_manage_connections.pack(side="left", padx=(0, 8))
+    i18n_widgets["btn_manage_connections"] = btn_manage_connections
+
+    btn_test_connection = ttk.Button(
+        buttons_frame,
+        text=t("BTN_TEST_CONNECTION"),
+        command=test_connection_only,
+    )
+    btn_test_connection.pack(side="left", padx=(0, 8))
+    i18n_widgets["btn_test_connection"] = btn_test_connection
+
+    btn_odbc_diagnostics = ttk.Button(
+        buttons_frame,
+        text=t("BTN_ODBC_DIAGNOSTICS"),
+        command=show_odbc_diagnostics_popup,
+    )
+    btn_odbc_diagnostics.pack(side="left")
+    i18n_widgets["btn_odbc_diagnostics"] = btn_odbc_diagnostics
+
+    advanced_frame = ttk.LabelFrame(
+        connection_frame, text=t("FRAME_ADVANCED"), padding=(10, 8)
+    )
+    advanced_frame.grid(row=2, column=0, sticky="we", pady=(8, 0))
+    advanced_frame.columnconfigure(0, weight=1)
+    i18n_widgets["advanced_frame"] = advanced_frame
+
+    chk_archive_sql = ttk.Checkbutton(
+        advanced_frame,
         text=t("CHK_ARCHIVE_SQL"),
         variable=archive_sql_var,
         command=on_archive_sql_toggle,
     )
-    chk_archive_sql.grid(row=2, column=0, columnspan=2, sticky="w", pady=(5, 0))
+    chk_archive_sql.grid(row=0, column=0, sticky="w")
     i18n_widgets["chk_archive_sql"] = chk_archive_sql
 
-    btn_odbc_diagnostics = tk.Button(
-        connection_controls,
-        text=t("BTN_ODBC_DIAGNOSTICS"),
-        command=show_odbc_diagnostics_popup,
-    )
-    btn_odbc_diagnostics.grid(row=0, column=7, padx=(10, 0), sticky="w")
-    i18n_widgets["btn_odbc_diagnostics"] = btn_odbc_diagnostics
-
-    btn_edit_connection = tk.Button(
-        connection_controls,
-        text=t("BTN_EDIT_CONNECTION"),
-        command=lambda: open_connection_dialog_gui(
-            root,
-            connections_state,
-            selected_connection_var,
-            get_connection_by_name,
-            set_selected_connection,
-            persist_connections,
-            refresh_connection_combobox,
-            apply_selected_connection,
-            handle_db_driver_error,
-            create_engine_from_entry,
-            mode="edit",
-        ),
-    )
-    btn_edit_connection.grid(row=0, column=2, padx=(10, 0), sticky="e")
-    i18n_widgets["btn_edit_connection"] = btn_edit_connection
-
-    btn_new_connection = tk.Button(
-        connection_controls,
-        text=t("BTN_NEW_CONNECTION"),
-        command=lambda: open_connection_dialog_gui(
-            root,
-            connections_state,
-            selected_connection_var,
-            get_connection_by_name,
-            set_selected_connection,
-            persist_connections,
-            refresh_connection_combobox,
-            apply_selected_connection,
-            handle_db_driver_error,
-            create_engine_from_entry,
-            mode="new",
-        ),
-    )
-    btn_new_connection.grid(row=0, column=3, padx=(10, 0), sticky="e")
-    i18n_widgets["btn_new_connection"] = btn_new_connection
-
-    btn_test_connection = tk.Button(
-        connection_controls,
-        text=t("BTN_TEST_CONNECTION"),
-        command=test_connection_only,
-    )
-    btn_test_connection.grid(row=0, column=4, padx=(10, 0), sticky="e")
-    i18n_widgets["btn_test_connection"] = btn_test_connection
-
-    btn_delete_connection = tk.Button(
-        connection_controls,
-        text=t("BTN_DELETE_CONNECTION"),
-        command=delete_selected_connection,
-    )
-    btn_delete_connection.grid(row=0, column=5, padx=(10, 0), sticky="e")
-    i18n_widgets["btn_delete_connection"] = btn_delete_connection
-
-    secure_edit_btn = tk.Button(
-        connection_controls,
-        text=t("BTN_EDIT_SECURE"),
-        command=open_secure_editor,
-    )
-    secure_edit_btn.grid(row=0, column=6, padx=(10, 0), sticky="e")
-    secure_edit_state["button"] = secure_edit_btn
-    i18n_widgets["secure_edit_btn"] = secure_edit_btn
-
-    source_frame = tk.LabelFrame(root, text=t("FRAME_SQL_SOURCE"), padx=10, pady=10)
+    source_frame = ttk.LabelFrame(root, text=t("FRAME_SQL_SOURCE"), padding=(10, 10))
     source_frame.pack(fill=tk.X, padx=10, pady=(10, 5))
     i18n_widgets["source_frame"] = source_frame
 
-    format_frame = tk.LabelFrame(root, text=t("FRAME_OUTPUT_FORMAT"), padx=10, pady=10)
+    format_frame = ttk.LabelFrame(root, text=t("FRAME_OUTPUT_FORMAT"), padding=(10, 10))
     format_frame.pack(fill=tk.X, padx=10, pady=5)
     i18n_widgets["format_frame"] = format_frame
 
-    template_frame = tk.LabelFrame(
-        root, text=t("FRAME_TEMPLATE_OPTIONS"), padx=10, pady=10
+    template_frame = ttk.LabelFrame(
+        root, text=t("FRAME_TEMPLATE_OPTIONS"), padding=(10, 10)
     )
     template_frame.pack(fill=tk.X, padx=10, pady=5)
     i18n_widgets["template_frame"] = template_frame
 
-    result_frame = tk.LabelFrame(root, text=t("FRAME_RESULTS"), padx=10, pady=10)
+    result_frame = ttk.LabelFrame(root, text=t("FRAME_RESULTS"), padding=(10, 10))
     result_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(5, 10))
     i18n_widgets["result_frame"] = result_frame
 
@@ -7172,33 +7752,33 @@ def run_gui(connection_store, output_directory):
     result_frame.columnconfigure(1, weight=1)
     result_frame.rowconfigure(3, weight=1)
 
-    lbl_selected_sql = tk.Label(source_frame, text=t("LBL_SELECTED_SQL"))
+    lbl_selected_sql = ttk.Label(source_frame, text=t("LBL_SELECTED_SQL"))
     lbl_selected_sql.grid(row=0, column=0, sticky="nw")
     i18n_widgets["lbl_selected_sql"] = lbl_selected_sql
-    tk.Label(source_frame, textvariable=sql_label_var, wraplength=600, justify="left").grid(
+    ttk.Label(source_frame, textvariable=sql_label_var, wraplength=600, justify="left").grid(
         row=0, column=1, columnspan=3, sticky="we"
     )
 
-    btn_select_sql = tk.Button(source_frame, text=t("BTN_SELECT_SQL"), command=choose_sql_file)
+    btn_select_sql = ttk.Button(source_frame, text=t("BTN_SELECT_SQL"), command=choose_sql_file)
     btn_select_sql.grid(
         row=1, column=0, pady=5, sticky="w"
     )
     i18n_widgets["btn_select_sql"] = btn_select_sql
-    btn_select_from_list = tk.Button(
+    btn_select_from_list = ttk.Button(
         source_frame, text=t("BTN_SELECT_FROM_LIST"), command=choose_from_list
     )
     btn_select_from_list.grid(
         row=1, column=1, pady=5, sticky="w"
     )
     i18n_widgets["btn_select_from_list"] = btn_select_from_list
-    btn_edit_queries = tk.Button(
+    btn_edit_queries = ttk.Button(
         source_frame, text=t("BTN_EDIT_QUERIES"), command=open_queries_manager
     )
     btn_edit_queries.grid(
         row=1, column=2, pady=5, sticky="w"
     )
     i18n_widgets["btn_edit_queries"] = btn_edit_queries
-    btn_paste_sql = tk.Button(
+    btn_paste_sql = ttk.Button(
         source_frame, text=t("BTN_PASTE_SQL"), command=open_paste_sql_dialog
     )
     btn_paste_sql.grid(
@@ -7227,7 +7807,7 @@ def run_gui(connection_store, output_directory):
 
     on_format_change()
 
-    lbl_csv_profile = tk.Label(format_frame, text=t("LBL_CSV_PROFILE"))
+    lbl_csv_profile = ttk.Label(format_frame, text=t("LBL_CSV_PROFILE"))
     lbl_csv_profile.grid(
         row=1, column=0, sticky="w", pady=(5, 0)
     )
@@ -7241,7 +7821,7 @@ def run_gui(connection_store, output_directory):
     csv_profile_combo.grid(row=1, column=1, sticky="w", pady=(5, 0))
     csv_profile_state["combobox"] = csv_profile_combo
 
-    csv_profile_manage_btn = tk.Button(
+    csv_profile_manage_btn = ttk.Button(
         format_frame,
         text=t("BTN_MANAGE_CSV_PROFILES"),
         command=lambda: open_csv_profiles_manager_gui(
@@ -7255,13 +7835,13 @@ def run_gui(connection_store, output_directory):
     csv_profile_state["manage_button"] = csv_profile_manage_btn
     i18n_widgets["csv_profile_manage_btn"] = csv_profile_manage_btn
 
-    tk.Label(format_frame, textvariable=default_csv_label_var, justify="left", wraplength=600).grid(
+    ttk.Label(format_frame, textvariable=default_csv_label_var, justify="left", wraplength=600).grid(
         row=2, column=0, columnspan=3, sticky="w", pady=(5, 0)
     )
 
     refresh_csv_profile_controls(csv_profile_state["config"].get("default_profile"))
 
-    chk_use_template = tk.Checkbutton(
+    chk_use_template = ttk.Checkbutton(
         template_frame,
         text=t("CHK_USE_TEMPLATE"),
         variable=use_template_var,
@@ -7270,23 +7850,23 @@ def run_gui(connection_store, output_directory):
     chk_use_template.grid(row=0, column=0, columnspan=2, sticky="w")
     i18n_widgets["chk_use_template"] = chk_use_template
 
-    lbl_template_file = tk.Label(template_frame, text=t("LBL_TEMPLATE_FILE"))
+    lbl_template_file = ttk.Label(template_frame, text=t("LBL_TEMPLATE_FILE"))
     lbl_template_file.grid(row=1, column=0, sticky="w", pady=(5, 0))
     i18n_widgets["lbl_template_file"] = lbl_template_file
-    choose_template_btn = tk.Button(
+    choose_template_btn = ttk.Button(
         template_frame, text=t("BTN_SELECT_TEMPLATE"), command=choose_template_file
     )
     choose_template_btn.grid(row=1, column=1, sticky="w", pady=(5, 0))
     template_state["choose_button"] = choose_template_btn
     i18n_widgets["choose_template_btn"] = choose_template_btn
-    tk.Label(
+    ttk.Label(
         template_frame,
         textvariable=template_label_var,
         wraplength=600,
         justify="left",
     ).grid(row=2, column=0, columnspan=2, sticky="we")
 
-    lbl_template_sheet = tk.Label(template_frame, text=t("LBL_TEMPLATE_SHEET"))
+    lbl_template_sheet = ttk.Label(template_frame, text=t("LBL_TEMPLATE_SHEET"))
     lbl_template_sheet.grid(row=3, column=0, sticky="w", pady=(5, 0))
     i18n_widgets["lbl_template_sheet"] = lbl_template_sheet
     sheet_combobox = ttk.Combobox(
@@ -7298,14 +7878,14 @@ def run_gui(connection_store, output_directory):
     sheet_combobox.grid(row=3, column=1, sticky="w", pady=(5, 0))
     template_state["sheet_combobox"] = sheet_combobox
 
-    lbl_template_start_cell = tk.Label(template_frame, text=t("LBL_TEMPLATE_START_CELL"))
+    lbl_template_start_cell = ttk.Label(template_frame, text=t("LBL_TEMPLATE_START_CELL"))
     lbl_template_start_cell.grid(row=4, column=0, sticky="w", pady=(5, 0))
     i18n_widgets["lbl_template_start_cell"] = lbl_template_start_cell
-    start_cell_entry = tk.Entry(template_frame, textvariable=start_cell_var, width=10)
+    start_cell_entry = ttk.Entry(template_frame, textvariable=start_cell_var, width=10)
     start_cell_entry.grid(row=4, column=1, sticky="w", pady=(5, 0))
     template_state["start_cell_entry"] = start_cell_entry
 
-    include_header_check = tk.Checkbutton(
+    include_header_check = ttk.Checkbutton(
         template_frame,
         text=t("CHK_INCLUDE_HEADERS"),
         variable=include_header_var,
@@ -7317,32 +7897,32 @@ def run_gui(connection_store, output_directory):
     update_template_controls_state()
     update_csv_profile_controls_state()
 
-    btn_start = tk.Button(result_frame, text=t("BTN_START"), command=run_export_gui)
+    btn_start = ttk.Button(result_frame, text=t("BTN_START"), command=run_export_gui)
     btn_start.grid(row=0, column=0, pady=(0, 10), sticky="w")
     start_button_holder["widget"] = btn_start
     i18n_widgets["btn_start"] = btn_start
-    btn_report_issue = tk.Button(
+    btn_report_issue = ttk.Button(
         result_frame,
         text=t("BTN_REPORT_ISSUE"),
         command=lambda: open_github_issue_chooser(parent=root),
     )
     btn_report_issue.grid(row=0, column=1, padx=(10, 0), pady=(0, 10), sticky="w")
     i18n_widgets["btn_report_issue"] = btn_report_issue
-    btn_check_updates = tk.Button(
+    btn_check_updates = ttk.Button(
         result_frame,
         text=t("BTN_CHECK_UPDATES"),
         command=check_updates_gui,
     )
     btn_check_updates.grid(row=0, column=2, padx=(10, 0), pady=(0, 10), sticky="w")
     i18n_widgets["btn_check_updates"] = btn_check_updates
-    btn_help = tk.Button(
+    btn_help = ttk.Button(
         result_frame,
         text=t("BTN_HELP"),
         command=show_help_window,
     )
     btn_help.grid(row=0, column=3, padx=(10, 0), pady=(0, 10), sticky="w")
     i18n_widgets["btn_help"] = btn_help
-    btn_open_logs = tk.Button(
+    btn_open_logs = ttk.Button(
         result_frame, text=t("BTN_OPEN_LOGS"), command=open_logs_folder
     )
     btn_open_logs.grid(row=0, column=4, padx=(10, 0), pady=(0, 10), sticky="w")
@@ -7369,31 +7949,31 @@ def run_gui(connection_store, output_directory):
     else:
         set_connection_status(connected=False, key="STATUS_NO_CONNECTION")
 
-    lbl_export_info = tk.Label(result_frame, text=t("LBL_EXPORT_INFO"))
+    lbl_export_info = ttk.Label(result_frame, text=t("LBL_EXPORT_INFO"))
     lbl_export_info.grid(row=1, column=0, sticky="nw")
     i18n_widgets["lbl_export_info"] = lbl_export_info
-    tk.Label(result_frame, textvariable=result_info_var, justify="left", wraplength=600).grid(
+    ttk.Label(result_frame, textvariable=result_info_var, justify="left", wraplength=600).grid(
         row=1, column=1, columnspan=3, sticky="w"
     )
 
-    btn_open_file = tk.Button(result_frame, text=t("BTN_OPEN_FILE"), command=open_file)
+    btn_open_file = ttk.Button(result_frame, text=t("BTN_OPEN_FILE"), command=open_file)
     btn_open_file.grid(row=2, column=0, pady=5, sticky="w")
     i18n_widgets["btn_open_file"] = btn_open_file
-    btn_open_folder = tk.Button(
+    btn_open_folder = ttk.Button(
         result_frame, text=t("BTN_OPEN_FOLDER"), command=open_folder
     )
     btn_open_folder.grid(row=2, column=1, pady=5, sticky="w")
     i18n_widgets["btn_open_folder"] = btn_open_folder
 
-    lbl_errors_short = tk.Label(result_frame, text=t("LBL_ERRORS_SHORT"))
+    lbl_errors_short = ttk.Label(result_frame, text=t("LBL_ERRORS_SHORT"))
     lbl_errors_short.grid(row=3, column=0, sticky="nw", pady=(10, 0))
     i18n_widgets["lbl_errors_short"] = lbl_errors_short
-    error_frame = tk.Frame(result_frame)
+    error_frame = ttk.Frame(result_frame)
     error_frame.grid(row=3, column=1, columnspan=3, sticky="nsew", pady=(10, 0))
 
     error_text = tk.Text(
         error_frame,
-        width=120,
+        width=90,
         height=6,
         wrap="none",
         state="disabled",
@@ -7415,6 +7995,7 @@ def run_gui(connection_store, output_directory):
     def apply_i18n():
         root.title(f"{t('APP_TITLE_FULL')} {get_app_version_label()}")
         connection_frame.config(text=t("FRAME_DB_CONNECTION"))
+        advanced_frame.config(text=t("FRAME_ADVANCED"))
         source_frame.config(text=t("FRAME_SQL_SOURCE"))
         format_frame.config(text=t("FRAME_OUTPUT_FORMAT"))
         template_frame.config(text=t("FRAME_TEMPLATE_OPTIONS"))
@@ -7422,11 +8003,8 @@ def run_gui(connection_store, output_directory):
         lbl_connection.config(text=t("LBL_CONNECTION"))
         lbl_language.config(text=t("LBL_LANGUAGE"))
         chk_archive_sql.config(text=t("CHK_ARCHIVE_SQL"))
-        btn_edit_connection.config(text=t("BTN_EDIT_CONNECTION"))
-        btn_new_connection.config(text=t("BTN_NEW_CONNECTION"))
+        btn_manage_connections.config(text=t("BTN_MANAGE_CONNECTIONS"))
         btn_test_connection.config(text=t("BTN_TEST_CONNECTION"))
-        btn_delete_connection.config(text=t("BTN_DELETE_CONNECTION"))
-        secure_edit_btn.config(text=t("BTN_EDIT_SECURE"))
         lbl_selected_sql.config(text=t("LBL_SELECTED_SQL"))
         btn_select_sql.config(text=t("BTN_SELECT_SQL"))
         btn_select_from_list.config(text=t("BTN_SELECT_FROM_LIST"))
