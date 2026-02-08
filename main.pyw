@@ -2,24 +2,30 @@ from __future__ import annotations
 
 import argparse
 import csv
+import decimal
 import json
 import getpass
 import importlib.metadata
-import importlib.util
 import logging
+import math
+import platform
 import textwrap
+import queue
 import re
+import threading
 import traceback
 import os
 import sqlite3
-import string
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import tkinter as tk
 import tkinter.font as tkfont
 import webbrowser
+import io
+import contextlib
 from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog
@@ -31,23 +37,21 @@ from urllib.request import Request, urlopen
 
 from logging.handlers import RotatingFileHandler
 
-import pandas as pd
+import openpyxl
 import sqlalchemy
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, event, text
 from sqlalchemy.exc import DBAPIError, NoSuchModuleError
-from openpyxl import load_workbook
+from openpyxl import Workbook, load_workbook
 from openpyxl.utils import coordinate_to_tuple
 
 
 def _load_optional_sql_highlighter():
-    if importlib.util.find_spec("chlorophyll") is None:
+    try:
+        from chlorophyll import CodeView
+        import tklinenums  # noqa: F401
+        from pygments.lexers.sql import SqlLexer, MySqlLexer, PostgresLexer, TransactSqlLexer
+    except Exception:
         return None, {}
-    if importlib.util.find_spec("pygments") is None:
-        return None, {}
-    if importlib.util.find_spec("pygments.lexers.sql") is None:
-        return None, {}
-    from chlorophyll import CodeView
-    from pygments.lexers.sql import SqlLexer, MySqlLexer, PostgresLexer, TransactSqlLexer
 
     return CodeView, {
         "SQLite": SqlLexer,
@@ -58,6 +62,211 @@ def _load_optional_sql_highlighter():
 
 
 CodeView, SQL_LEXER_CLASSES = _load_optional_sql_highlighter()
+
+
+def _xlsx_get_sheetnames(xlsx_path: str) -> list[str]:
+    """Returns sheetnames or [] on error."""
+    wb = None
+    try:
+        wb = openpyxl.load_workbook(
+            xlsx_path,
+            read_only=True,
+            data_only=True,
+            keep_vba=True,
+        )
+        return list(wb.sheetnames or [])
+    except Exception:
+        return []
+    finally:
+        if wb is not None:
+            try:
+                wb.close()
+            except Exception:
+                pass
+
+
+def _pick_default_sheet(sheetnames: list[str]) -> str:
+    """Prefer 'data' (case-insensitive), else first."""
+    for sheet in sheetnames:
+        if (sheet or "").strip().lower() == "data":
+            return sheet
+    return sheetnames[0] if sheetnames else ""
+
+
+def _show_template_naming_hint_once(
+    parent: tk.Misc,
+    app_config: dict,
+    save_config_fn,
+    *,
+    sql_path: str | None,
+    template_path: str | None,
+) -> None:
+    """
+    Shows one-time hint about naming convention:
+      Report.sql, Report.xlsx, Report_template.xlsx
+    Has 'Don't show again' persisted in config.
+    """
+    ui_cfg = app_config.setdefault("ui", {})
+    if ui_cfg.get("hide_template_naming_hint", False):
+        return
+
+    if not sql_path or not template_path:
+        return
+
+    sql_stem = Path(sql_path).stem
+    tpl = Path(template_path)
+    recommended_tpl_stem = f"{sql_stem}_template"
+    if tpl.stem.lower() == recommended_tpl_stem.lower() and tpl.suffix.lower() == ".xlsx":
+        return
+
+    win = tk.Toplevel(parent)
+    win.title("Tip")
+    win.resizable(False, False)
+    win.transient(parent)
+    win.grab_set()
+    try:
+        win.lift()
+        win.focus_set()
+    except Exception:
+        pass
+
+    frm = ttk.Frame(win, padding=12)
+    frm.grid(row=0, column=0, sticky="nsew")
+
+    msg = (
+        "To avoid mix-ups (wrong file / wrong worksheet), we recommend keeping this convention:\n\n"
+        "  Report.sql\n"
+        "  Report.xlsx\n"
+        "  Report_template.xlsx\n\n"
+        "It helps prevent mistakes and accidental writes into the wrong sheet (e.g. 'data')."
+    )
+    lbl = ttk.Label(frm, text=msg, justify="left", wraplength=520)
+    lbl.grid(row=0, column=0, columnspan=2, sticky="w")
+
+    dont_var = tk.BooleanVar(value=False)
+    chk = ttk.Checkbutton(frm, text="Don't show again", variable=dont_var)
+    chk.grid(row=1, column=0, sticky="w", pady=(10, 0))
+
+    def _close() -> None:
+        if dont_var.get():
+            ui_cfg["hide_template_naming_hint"] = True
+            try:
+                save_config_fn(app_config)
+            except Exception:
+                pass
+        try:
+            win.grab_release()
+        except tk.TclError:
+            pass
+        win.destroy()
+
+    btn = ttk.Button(frm, text="OK", command=_close)
+    btn.grid(row=1, column=1, sticky="e", padx=(12, 0), pady=(10, 0))
+
+    win.bind("<Return>", lambda _e: _close())
+    win.bind("<Escape>", lambda _e: _close())
+    win.protocol("WM_DELETE_WINDOW", _close)
+
+    win.update_idletasks()
+    try:
+        _center_window(win, parent)
+    except Exception:
+        pass
+
+
+def _show_data_dir_notice_once(
+    parent: tk.Misc,
+    app_config: dict,
+    save_config_fn,
+    *,
+    data_dir: str,
+    base_dir: str,
+    lang: str | None = None,
+) -> None:
+    """One-time info popup: where app stores its data (with 'No' option)."""
+    notice_lang = _normalize_ui_lang(lang) or _CURRENT_LANG
+
+    def _notice_t(key: str, **kwargs) -> str:
+        s = I18N.get(notice_lang, {}).get(key) or I18N["en"].get(key) or key
+        return s.format(**kwargs) if kwargs else s
+
+    try:
+        dd = os.path.abspath(data_dir or "")
+        bd = os.path.abspath(base_dir or "")
+    except Exception:
+        dd = str(data_dir or "")
+        bd = str(base_dir or "")
+
+    # show only when data dir differs from app dir
+    if not dd or dd == bd:
+        return
+
+    ui_cfg = app_config.setdefault("ui", {})
+    if ui_cfg.get("hide_data_dir_notice", False):
+        return
+
+    win = tk.Toplevel(parent)
+    win.title(_notice_t("TITLE_DATA_DIR_NOTICE"))
+    win.resizable(False, False)
+    win.transient(parent)
+    win.grab_set()
+
+    # Best-effort: keep notice above main window and focused (esp. Windows).
+    try:
+        win.lift()
+    except Exception:
+        pass
+    try:
+        win.focus_force()
+    except Exception:
+        pass
+    try:
+        win.attributes("-topmost", True)
+        win.attributes("-topmost", False)
+    except Exception:
+        pass
+
+    frm = ttk.Frame(win, padding=12)
+    frm.grid(row=0, column=0, sticky="nsew")
+
+    msg = _notice_t("MSG_DATA_DIR_NOTICE", data_dir=dd)
+    lbl = ttk.Label(frm, text=msg, justify="left", wraplength=520)
+    lbl.grid(row=0, column=0, columnspan=2, sticky="w")
+
+    def _close() -> None:
+        try:
+            win.grab_release()
+        except tk.TclError:
+            pass
+        win.destroy()
+
+    def _dont_show_again() -> None:
+        ui_cfg["hide_data_dir_notice"] = True
+        try:
+            save_config_fn(app_config)
+        except Exception:
+            pass
+        _close()
+
+    btn_no = ttk.Button(
+        frm,
+        text=_notice_t("BTN_DONT_SHOW_AGAIN"),
+        command=_dont_show_again,
+    )
+    btn_no.grid(row=1, column=0, sticky="w", pady=(10, 0))
+
+    btn_ok = ttk.Button(frm, text=_notice_t("BTN_OK"), command=_close)
+    btn_ok.grid(row=1, column=1, sticky="e", padx=(12, 0), pady=(10, 0))
+
+    win.bind("<Return>", lambda _e: _close())
+    win.bind("<Escape>", lambda _e: _close())
+    win.protocol("WM_DELETE_WINDOW", _close)
+
+    win.update_idletasks()
+    try:
+        _center_window(win, parent)
+    except Exception:
+        pass
 
 def _get_base_dir() -> str:
     """Return the directory that should be treated as the app "home".
@@ -71,6 +280,22 @@ def _get_base_dir() -> str:
 
 
 BASE_DIR = _get_base_dir()
+DATA_DIR = BASE_DIR  # default: tak jak dziś; zmienimy tylko gdy brak praw zapisu
+
+
+def _set_data_dir(new_dir: str) -> None:
+    """Przełącz katalog danych użytkownika i przelicz globalne ścieżki."""
+    global DATA_DIR
+    global SECURE_PATH, QUERIES_PATH, APP_CONFIG_PATH, LEGACY_CSV_PROFILES_PATH, SQL_ARCHIVE_DIR
+
+    DATA_DIR = os.path.abspath(new_dir)
+
+    # przelicz ścieżki zależne od _build_path()
+    SECURE_PATH = _build_path("secure.txt")
+    QUERIES_PATH = _build_path("queries.txt")
+    APP_CONFIG_PATH = _build_path("kkr-query2xlsx.json")
+    LEGACY_CSV_PROFILES_PATH = _build_path("csv_profiles.json")
+    SQL_ARCHIVE_DIR = _build_path("sql_archive")
 
 
 _APP_ICON_PHOTO = None  # keep a reference to avoid GC in Tk
@@ -112,9 +337,201 @@ def apply_app_icon(win) -> None:
     except Exception:
         pass
 
+
+def _fmt_elapsed(seconds: float) -> str:
+    s = int(seconds)
+    if s < 60:
+        return f"{s}s"
+    m, s = divmod(s, 60)
+    if m < 60:
+        return f"{m}m {s}s"
+    h, m = divmod(m, 60)
+    if h < 24:
+        return f"{h}h {m}m"
+    d, h = divmod(h, 24)
+    return f"{d}d {h}h"
+
+
+def _coerce_seconds(seconds: Optional[float]) -> float:
+    try:
+        value = float(seconds)
+    except (TypeError, ValueError):
+        return 0.0
+    if not math.isfinite(value) or value < 0:
+        return 0.0
+    return value
+
+
+def _fmt_hms(seconds: Optional[float]) -> str:
+    total_seconds = int(_coerce_seconds(seconds))
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+class ExportProgressWindow:
+    def __init__(self, parent, title: str | None = None, on_stop=None):
+        self.parent = parent
+        self.win = tk.Toplevel(parent)
+        self.win.title(title or t("PROGRESS_WORKING_TITLE"))
+        apply_app_icon(self.win)
+        self.win.transient(parent)
+        self.win.resizable(False, False)
+        self._on_stop_callback = on_stop
+
+        self._step_var = tk.StringVar(value=t("PROGRESS_STARTING"))
+        self._elapsed_var = tk.StringVar(value="0s")
+        self._status_var = tk.StringVar(value="")
+        self._t0 = time.time()
+        self._running = True
+        self._stop_btn = None
+        self._tick_job = None
+
+        frm = ttk.Frame(self.win, padding=12)
+        frm.pack(fill="both", expand=True)
+
+        ttk.Label(frm, text=t("PROGRESS_STEP")).grid(row=0, column=0, sticky="w")
+        ttk.Label(frm, textvariable=self._step_var).grid(row=0, column=1, sticky="w")
+
+        ttk.Label(frm, text=t("PROGRESS_ELAPSED")).grid(row=1, column=0, sticky="w", pady=(6, 0))
+        ttk.Label(frm, textvariable=self._elapsed_var).grid(
+            row=1, column=1, sticky="w", pady=(6, 0)
+        )
+
+        ttk.Label(frm, textvariable=self._status_var).grid(
+            row=2, column=0, columnspan=2, sticky="w", pady=(8, 0)
+        )
+
+        self._stop_btn = ttk.Button(
+            frm,
+            text=f"{t('BTN_CANCEL_RUN')} (Esc)",
+            command=self._on_stop_clicked,
+        )
+        self._stop_btn.grid(row=3, column=0, columnspan=2, sticky="e", pady=(10, 0))
+
+        frm.columnconfigure(1, weight=1)
+
+        self._tick()
+
+        self.win.bind("<Escape>", lambda _event: self._on_stop_clicked())
+        self.win.protocol("WM_DELETE_WINDOW", self._on_stop_clicked)
+
+    def _on_stop_clicked(self):
+        if self._stop_btn is None:
+            return
+        if "disabled" in self._stop_btn.state():
+            return
+        self._status_var.set(t("MSG_CANCEL_REQUESTED"))
+        self._stop_btn.state(["disabled"])
+        if self._on_stop_callback is not None:
+            self._on_stop_callback()
+
+    def _tick(self):
+        if not self._running:
+            return
+        elapsed = time.time() - self._t0
+        self._elapsed_var.set(_fmt_elapsed(elapsed))
+        self._tick_job = self.win.after(250, self._tick)
+
+    def set_step(self, text: str):
+        self._step_var.set(text)
+
+    def close(self):
+        self._running = False
+        try:
+            if self._tick_job is not None:
+                self.win.after_cancel(self._tick_job)
+                self._tick_job = None
+        except Exception:
+            pass
+        try:
+            self.win.destroy()
+        except tk.TclError:
+            pass
+
 # --- App version -------------------------------------------------------------
 
-APP_VERSION = "0.3.8"  # bump manually for releases
+APP_VERSION = "0.3.9"  # bump manually for releases
+
+MSSQL_SAFE_SET_SQL = """\
+SET NOCOUNT ON;
+SET ANSI_NULLS ON;
+SET QUOTED_IDENTIFIER ON;
+SET ANSI_PADDING ON;
+SET ANSI_WARNINGS ON;
+SET CONCAT_NULL_YIELDS_NULL ON;
+SET ARITHABORT ON;
+SET NUMERIC_ROUNDABORT OFF;
+"""
+
+
+def _apply_mssql_safe_set(cur) -> bool:  # noqa: ANN001
+    try:
+        cur.execute(MSSQL_SAFE_SET_SQL)
+        return True
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.warning(
+            "MSSQL session prolog batch failed, retrying per-statement: %s",
+            exc,
+            exc_info=True,
+        )
+
+    ok = True
+    for stmt in MSSQL_SAFE_SET_SQL.split(";"):
+        s = stmt.strip()
+        if not s:
+            continue
+        try:
+            cur.execute(s)
+        except Exception as exc:  # noqa: BLE001
+            ok = False
+            LOGGER.warning(
+                "MSSQL session prolog statement failed: %s (stmt=%r)",
+                exc,
+                s,
+                exc_info=True,
+            )
+
+    return ok
+
+
+def _ensure_engine_mssql_set_hook(engine) -> None:
+    if getattr(engine, "_kkr_mssql_set_hook_installed", False):
+        return
+
+    @event.listens_for(engine, "connect")
+    def _kkr_mssql_connect(dbapi_conn, conn_record):  # noqa: ANN001
+        # pyodbc.Connection nie ma __dict__ -> nie można doklejać atrybutów setattr().
+        # Stan trzymamy w SQLAlchemy ConnectionRecord.info (per-connection w puli).
+        info = None
+        try:
+            info = getattr(conn_record, "info", None)
+        except Exception:
+            info = None
+        if isinstance(info, dict) and info.get("kkr_mssql_safe_set_done"):
+            return
+        cur = None
+        try:
+            cur = dbapi_conn.cursor()
+        except Exception as exc:  # noqa: BLE001
+            # Nie blokuj całego połączenia, jeśli nie uda się utworzyć kursora.
+            LOGGER.warning("MSSQL session prolog: cannot create cursor: %s", exc, exc_info=True)
+            return
+        try:
+            if _apply_mssql_safe_set(cur) and isinstance(info, dict):
+                info["kkr_mssql_safe_set_done"] = True
+        except Exception as exc:  # noqa: BLE001
+            # _apply_mssql_safe_set() loguje standardowe ścieżki failover.
+            # Tu logujemy tylko naprawdę niespodziewane wyjątki.
+            LOGGER.warning("MSSQL session prolog unexpected error: %s", exc, exc_info=True)
+        finally:
+            try:
+                if cur is not None:
+                    cur.close()
+            except Exception:
+                pass
+
+    setattr(engine, "_kkr_mssql_set_hook_installed", True)
 
 GITHUB_ISSUE_CHOOSER_URL = (
     "https://github.com/kkrysztofczyk/kkr-query2xlsx/issues/new/choose"
@@ -292,7 +709,7 @@ def _is_windows_image_running(image_name: str) -> bool:
         )
         return image_name.lower() in proc.stdout.lower()
     except Exception as exc:  # noqa: BLE001
-        LOGGER.warning("Process check failed: %s", exc, exc_info=exc)
+        LOGGER.warning("Process check failed: %s", exc, exc_info=True)
         return False
 
 
@@ -311,18 +728,25 @@ def _apply_pending_updater_update() -> None:
     if not getattr(sys, "frozen", False):
         return
 
-    cfg = load_app_config()
-    updates = cfg.get("_updates")
-    pending = updates.get("pending_updater") if isinstance(updates, dict) else None
-    staged_name = None
-    if isinstance(pending, dict):
-        staged_name = pending.get("file")
-    if not isinstance(staged_name, str) or not staged_name.strip():
-        staged_name = UPDATER_STAGED_EXE_NAME
+    staged_path = Path(BASE_DIR) / UPDATER_STAGED_EXE_NAME
+    cfg = None
+    updates = None
+    cfg_loaded_for_staged_lookup = False
 
-    staged_path = Path(BASE_DIR) / staged_name
     if not staged_path.exists():
-        return
+        try:
+            cfg = load_app_config()
+            cfg_loaded_for_staged_lookup = True
+            updates = cfg.get("_updates") if isinstance(cfg, dict) else None
+            pending = updates.get("pending_updater") if isinstance(updates, dict) else None
+            staged_name = pending.get("file") if isinstance(pending, dict) else None
+            if isinstance(staged_name, str) and staged_name.strip():
+                staged_path = Path(BASE_DIR) / staged_name.strip()
+        except Exception:
+            return
+
+        if not staged_path.exists():
+            return
 
     if _is_windows_image_running(UPDATER_EXE_NAME):
         if not _wait_for_windows_image_exit(UPDATER_EXE_NAME, timeout_s=5.0):
@@ -335,24 +759,30 @@ def _apply_pending_updater_update() -> None:
     try:
         os.replace(staged_path, target_path)
     except Exception as exc:  # noqa: BLE001
-        LOGGER.warning("Failed to replace updater: %s", exc, exc_info=exc)
+        LOGGER.warning("Failed to replace updater: %s", exc, exc_info=True)
         return
 
-    if isinstance(updates, dict) and "pending_updater" in updates:
+    # Sprzątanie configu tylko best-effort.
+    if not cfg_loaded_for_staged_lookup:
+        try:
+            cfg = load_app_config()
+            updates = cfg.get("_updates") if isinstance(cfg, dict) else None
+        except Exception:
+            cfg = None
+            updates = None
+
+    if isinstance(cfg, dict) and isinstance(updates, dict) and "pending_updater" in updates:
         updates.pop("pending_updater", None)
         if updates:
             cfg["_updates"] = updates
         else:
             cfg.pop("_updates", None)
-        save_app_config(cfg)
+        try:
+            save_app_config(cfg)
+        except Exception:
+            pass
 
-    try:
-        LOGGER.info("Updater updated successfully")
-        LOGGER.info(
-            "Updater updated: %s -> %s", staged_path.name, target_path.name
-        )
-    except Exception:
-        pass
+    LOGGER.info("Updater updated successfully")
 
 
 def apply_native_ttk_theme(root: tk.Tk) -> None:
@@ -572,7 +1002,6 @@ def _classify_mssql_conn_error(
 def _build_mssql_error_message(
     *,
     exc: BaseException,
-    title: str,
     hints: list[str],
     pyodbc_ok: bool,
     drivers: list[str],
@@ -594,11 +1023,11 @@ def _build_mssql_error_message(
         text.append(t("CONN_SQLSTATE_LINE", sqlstate=sqlstate))
         text.append("")
     if hints:
-        text.append("Most common causes:")
+        text.append(t("CONN_MOST_COMMON_CAUSES"))
         for hint in hints:
             text.append(f"- {hint}")
         text.append("")
-    text.append("Diagnostics:")
+    text.append(t("CONN_DIAGNOSTICS"))
     text.extend(diagnostics_lines)
     return "\n".join(text)
 
@@ -839,6 +1268,12 @@ def _format_connection_error(
     exc: BaseException,
     details: dict,
 ) -> tuple[str, str]:
+    if isinstance(exc, PasswordRequiredError):
+        name = getattr(exc, "name", "")
+        return (
+            t("ERR_PASSWORD_REQUIRED_TITLE"),
+            t("ERR_PASSWORD_REQUIRED_BODY", name=name),
+        )
     base_diagnostics = [
         f"exe={sys.executable}",
         f"python={sys.version.split()[0]} ({'frozen' if _is_frozen_exe() else 'source'})",
@@ -894,7 +1329,6 @@ def _format_connection_error(
         )
         msg = _build_mssql_error_message(
             exc=exc,
-            title=title,
             hints=hints,
             pyodbc_ok=pyodbc_ok,
             drivers=drivers,
@@ -1005,15 +1439,27 @@ I18N: dict[str, dict[str, str]] = {
         "BTN_RUN": "Run",
         "BTN_EXPORT": "Export",
         "BTN_BROWSE": "Browse...",
+        "BTN_CANCEL_RUN": "Stop",
         "BTN_ODBC_DIAGNOSTICS": "ODBC diagnostics",
         "LBL_SQL_FILE": "SQL file",
         "LBL_DB": "Database",
         "LBL_OUTPUT": "Output",
+        "LBL_SAVE_AS": "Save as (optional):",
+        "BTN_SAVE_AS": "Save as...",
+        "BTN_CLEAR": "Clear",
+        "LBL_SAVE_AS_HINT": "Leave empty to save into {dir} with the default file name.",
+        "INFO_SAVE_AS_EXT_FIXED_TITLE": "Adjusted extension",
+        "INFO_SAVE_AS_EXT_FIXED_BODY": "The chosen name had a different extension. It will be saved as:\n{path}",
         "LBL_LANGUAGE": "Language",
         "CHK_ARCHIVE_SQL": "Archive SQL (save query + metadata)",
+        "LBL_DB_TIMEOUT_MIN": "DB timeout (minutes) - execution + fetch",
+        "LBL_EXPORT_TIMEOUT_MIN": "Export timeout (minutes) - XLSX/CSV generation",
+        "LBL_TIMEOUT_NOTE": "0 = no limit. Defaults: 3 minutes each.",
         "CHK_SQL_HIGHLIGHT": "Syntax highlighting (Chlorophyll)",
         "LBL_SQL_DIALECT": "SQL dialect",
         "MSG_DONE": "Done.",
+        "MSG_CANCEL_REQUESTED": "Stopping...",
+        "MSG_CONFIRM_CANCEL_AND_EXIT": "Export is running. Cancel and exit?",
         "ERR_TITLE": "Error",
         "WARN_TITLE": "Warning",
         "APP_TITLE_FULL": "KKr SQL to XLSX/CSV",
@@ -1032,6 +1478,9 @@ I18N: dict[str, dict[str, str]] = {
             "Cannot connect to PostgreSQL. Required Python library (e.g. psycopg2) "
             "is not installed. Install the missing library and try again."
         ),
+        "ERR_QUERY_TIMEOUT": "DB timeout exceeded (>{minutes} min). Query was interrupted.",
+        "ERR_EXPORT_TIMEOUT": "Export timeout exceeded (>{minutes} min). Export was interrupted.",
+        "ERR_CANCELLED_BY_USER": "Cancelled by user.",
         "ERR_MYSQL_MISSING_TITLE": "Missing MySQL library",
         "ERR_MYSQL_MISSING_BODY": (
             "Cannot connect to MySQL. Required Python library (e.g. pymysql) "
@@ -1050,6 +1499,8 @@ I18N: dict[str, dict[str, str]] = {
             "...\n(Trimmed in UI, full details in kkr-query2xlsx.log)"
         ),
         "CONN_SQLSTATE_LINE": "SQLSTATE: {sqlstate}",
+        "CONN_MOST_COMMON_CAUSES": "Most common causes:",
+        "CONN_DIAGNOSTICS": "Diagnostics:",
         "CONSOLE_AVAILABLE_FILES": "Available SQL query files:",
         "CONSOLE_CUSTOM_PATH": "0: [Custom path]",
         "CONSOLE_PROMPT_SELECT": (
@@ -1076,6 +1527,7 @@ I18N: dict[str, dict[str, str]] = {
         "CONSOLE_TOTAL_TIME": "Total time: {seconds:.2f} seconds",
         "CONSOLE_PROMPT_PASSWORD": "Password for connection '{name}': ",
         "CLI_DIAG_ODBC_HELP": "Print ODBC diagnostics and exit.",
+        "CLI_SELF_TEST_HELP": "Run internal smoke tests and exit.",
         "DEFAULT_MSSQL_NAME": "Default MSSQL",
         "FRAME_MSSQL": "MSSQL (ODBC)",
         "LBL_ODBC_DRIVER": "ODBC driver",
@@ -1115,6 +1567,15 @@ I18N: dict[str, dict[str, str]] = {
         "ERR_FILL_SQLITE": "Provide the SQLite database file path.",
         "PROMPT_PASSWORD_TITLE": "Password required",
         "PROMPT_PASSWORD_BODY": "Enter password for connection:\n{name}",
+        "ERR_PASSWORD_REQUIRED_TITLE": "Password required",
+        "ERR_PASSWORD_REQUIRED_BODY": (
+            "Password was not provided, so the connection was not attempted.\n\n"
+            "What to do:\n"
+            "- Enter the password when prompted.\n"
+            "- Or click 'Manage connections...' and set the password for: {name}\n"
+            "- If this is Windows authentication, enable 'Windows authentication (Trusted_Connection)' "
+            "and leave login/password empty."
+        ),
         "WARN_REMEMBER_PASSWORD_TITLE": "Store password?",
         "WARN_REMEMBER_PASSWORD_BODY": (
             "The password will be saved in plain text in:\n{path}\n\n"
@@ -1164,6 +1625,23 @@ I18N: dict[str, dict[str, str]] = {
         "ERR_QUERY_TITLE": "Query error",
         "BTN_COPY": "Copy",
         "BTN_CLOSE": "Close",
+        "BTN_COPY_ALL": "Copy all",
+        "BTN_COPY_SUMMARY": "Copy summary",
+        "BTN_COPY_SQL": "Copy SQL",
+        "BTN_OPEN_SQL": "Open SQL",
+        "BTN_OPEN_LOG": "Open log",
+        "ERR_TAB_SUMMARY": "Summary",
+        "ERR_TAB_SQL": "SQL",
+        "ERR_TAB_DETAILS": "Details",
+        "PROGRESS_WORKING_TITLE": "Working...",
+        "PROGRESS_STARTING": "Starting...",
+        "PROGRESS_STEP": "Step:",
+        "PROGRESS_ELAPSED": "Elapsed:",
+        "PROGRESS_TITLE": "Export in progress",
+        "PROGRESS_GETTING_DATA": "Getting data from database...",
+        "PROGRESS_EXPORTING_XLSX_TEMPLATE": "Exporting to XLSX (template)...",
+        "PROGRESS_EXPORTING_XLSX": "Exporting to XLSX...",
+        "PROGRESS_EXPORTING_CSV": "Exporting to CSV...",
         "ERR_NO_CONNECTION_TITLE": "No connection",
         "ERR_NO_CONNECTION_BODY": "No saved connections. Create and save a new connection.",
         "ERR_NO_CONNECTION_DELETE": "No connection to delete.",
@@ -1180,6 +1658,7 @@ I18N: dict[str, dict[str, str]] = {
         "FILETYPE_SQL": "SQL files",
         "TITLE_SELECT_TEMPLATE": "Select XLSX template file",
         "FILETYPE_EXCEL": "Excel files",
+        "FILETYPE_CSV": "CSV files",
         "ERR_TEMPLATE_TITLE": "Template error",
         "ERR_TEMPLATE_SHEETS": (
             "Cannot read sheets from the template file.\n\nTechnical details:\n{error}"
@@ -1221,12 +1700,14 @@ I18N: dict[str, dict[str, str]] = {
         "MSG_SAVED_DETAILS": (
             "Saved: {path}\n"
             "Rows: {rows}\n"
-            "SQL time: {sql_time:.2f} s\n"
-            "Export time: {export_time:.2f} s\n"
-            "Total time: {total_time:.2f} s"
+            "SQL time: {sql_time_hms} ({sql_time:.2f} s)\n"
+            "Export time: {export_time_hms} ({export_time:.2f} s)\n"
+            "Total time: {total_time_hms} ({total_time:.2f} s)"
         ),
         "MSG_SAVED_DETAILS_CSV": "CSV profile: {profile}",
-        "MSG_NO_ROWS": "Query returned no rows.\nSQL time: {sql_time:.2f} s",
+        "MSG_NO_ROWS": (
+            "Query returned no rows.\nSQL time: {sql_time_hms} ({sql_time:.2f} s)"
+        ),
         "ERR_XLSX_TOO_LARGE": (
             "XLSX export skipped because the result would exceed Excel limits. "
             "Result: {rows} rows, {cols} columns. "
@@ -1359,6 +1840,7 @@ I18N: dict[str, dict[str, str]] = {
         "UPD_START_FAILED": "Failed to start updater.",
         "STATUS_NO_CONNECTION": "No connection. Create a new connection.",
         "STATUS_CONNECTION_ERROR": "Connection error. Create a new connection.",
+        "STATUS_PASSWORD_REQUIRED": "Password required.",
         "ERR_CONNECTION_TITLE": "Connection error",
         "ERR_CONNECTION_BODY": (
             "Failed to establish a connection.\n\nTechnical details:\n{error}"
@@ -1373,6 +1855,11 @@ I18N: dict[str, dict[str, str]] = {
         "CLI_DESC": "Run SQL files and export results to XLSX/CSV.",
         "CLI_LANG_HELP": "UI language (en/pl).",
         "CLI_CONSOLE_HELP": "Run in console mode.",
+        "CLI_OUTPUT_HELP": (
+            "Optional output file or directory. A directory may be existing or a new path "
+            "without an extension. Use a trailing slash/backslash to force directory "
+            "interpretation."
+        ),
         "CLI_NO_CONNECTIONS": (
             "No saved connections. Create a connection in GUI mode to run console."
         ),
@@ -1387,6 +1874,7 @@ I18N: dict[str, dict[str, str]] = {
             "No permission to write the output file or the path is unavailable. "
             "Check the file location."
         ),
+        "ERR_SQL_SOURCE": "SQL source:",
         "ERR_DB_MESSAGE": "Database message (excerpt):",
         "ERR_SQL_PREVIEW": "SQL (start):",
         "ERR_FULL_LOG": "Full error saved in kkr-query2xlsx.log",
@@ -1408,6 +1896,14 @@ I18N: dict[str, dict[str, str]] = {
         ),
         "INFO_ICON": "i",
         "BTN_OK": "OK",
+        "TITLE_DATA_DIR_NOTICE": "Data folder",
+        "MSG_DATA_DIR_NOTICE": (
+            "This app stores its data in:\n\n"
+            "{data_dir}\n\n"
+            "This includes config files (secure.txt, queries.txt, kkr-query2xlsx.json) "
+            "and folders like generated_reports/ and sql_archive/."
+        ),
+        "BTN_DONT_SHOW_AGAIN": "Don't show again",
         "FORMAT_XLSX": "XLSX",
         "FORMAT_CSV": "CSV",
         "CSV_PROFILE_DIALOG_TITLE": "CSV profiles",
@@ -1498,15 +1994,27 @@ I18N: dict[str, dict[str, str]] = {
         "BTN_RUN": "Uruchom",
         "BTN_EXPORT": "Eksportuj",
         "BTN_BROWSE": "Wybierz...",
+        "BTN_CANCEL_RUN": "Wstrzymaj wykonywanie",
         "BTN_ODBC_DIAGNOSTICS": "Diagnostyka ODBC",
         "LBL_SQL_FILE": "Plik SQL",
         "LBL_DB": "Baza danych",
         "LBL_OUTPUT": "Wyjście",
+        "LBL_SAVE_AS": "Zapisz jako (opcjonalnie):",
+        "BTN_SAVE_AS": "Zapisz jako...",
+        "BTN_CLEAR": "Wyczyść",
+        "LBL_SAVE_AS_HINT": "Zostaw puste, aby zapisać w {dir} pod domyślną nazwą.",
+        "INFO_SAVE_AS_EXT_FIXED_TITLE": "Poprawiono rozszerzenie",
+        "INFO_SAVE_AS_EXT_FIXED_BODY": "Wybrana nazwa miała inne rozszerzenie. Zapiszę jako:\n{path}",
         "LBL_LANGUAGE": "Język",
         "CHK_ARCHIVE_SQL": "Archiwizuj SQL (zapisz zapytanie + metadane)",
+        "LBL_DB_TIMEOUT_MIN": "Limit czasu DB (minuty) - wykonanie + pobieranie",
+        "LBL_EXPORT_TIMEOUT_MIN": "Limit czasu eksportu (minuty) - generowanie XLSX/CSV",
+        "LBL_TIMEOUT_NOTE": "0 = brak limitu. Domyślnie: po 3 minuty.",
         "CHK_SQL_HIGHLIGHT": "Podświetlanie składni (Chlorophyll)",
         "LBL_SQL_DIALECT": "Dialekt SQL",
         "MSG_DONE": "Gotowe.",
+        "MSG_CANCEL_REQUESTED": "Zatrzymywanie...",
+        "MSG_CONFIRM_CANCEL_AND_EXIT": "Eksport trwa. Przerwać i zamknąć?",
         "ERR_TITLE": "Błąd",
         "WARN_TITLE": "Uwaga",
         "APP_TITLE_FULL": "KKr SQL to XLSX/CSV",
@@ -1525,6 +2033,9 @@ I18N: dict[str, dict[str, str]] = {
             "Nie można połączyć z PostgreSQL. Wymagana biblioteka Pythona (np. psycopg2) "
             "nie jest zainstalowana. Zainstaluj brakującą bibliotekę i spróbuj ponownie."
         ),
+        "ERR_QUERY_TIMEOUT": "Przekroczono limit czasu DB (>{minutes} min). Zapytanie przerwano.",
+        "ERR_EXPORT_TIMEOUT": "Przekroczono limit czasu eksportu (>{minutes} min). Eksport przerwano.",
+        "ERR_CANCELLED_BY_USER": "Przerwano na żądanie użytkownika.",
         "ERR_MYSQL_MISSING_TITLE": "Brak biblioteki MySQL",
         "ERR_MYSQL_MISSING_BODY": (
             "Nie można połączyć z MySQL. Wymagana biblioteka Pythona (np. pymysql) "
@@ -1544,6 +2055,8 @@ I18N: dict[str, dict[str, str]] = {
             "...\n(Przycięto w UI, pełna treść w kkr-query2xlsx.log)"
         ),
         "CONN_SQLSTATE_LINE": "SQLSTATE: {sqlstate}",
+        "CONN_MOST_COMMON_CAUSES": "Najczęstsze przyczyny:",
+        "CONN_DIAGNOSTICS": "Diagnostyka:",
         "CONSOLE_AVAILABLE_FILES": "Dostępne pliki zapytań SQL:",
         "CONSOLE_CUSTOM_PATH": "0: [Własna ścieżka]",
         "CONSOLE_PROMPT_SELECT": (
@@ -1570,6 +2083,7 @@ I18N: dict[str, dict[str, str]] = {
         "CONSOLE_TOTAL_TIME": "Czas łączny: {seconds:.2f} s",
         "CONSOLE_PROMPT_PASSWORD": "Hasło dla połączenia '{name}': ",
         "CLI_DIAG_ODBC_HELP": "Wypisz diagnostykę ODBC i zakończ.",
+        "CLI_SELF_TEST_HELP": "Uruchom wewnętrzne testy (smoke tests) i zakończ.",
         "DEFAULT_MSSQL_NAME": "Domyślne MSSQL",
         "FRAME_MSSQL": "MSSQL (ODBC)",
         "LBL_ODBC_DRIVER": "Sterownik ODBC",
@@ -1608,6 +2122,15 @@ I18N: dict[str, dict[str, str]] = {
         "ERR_FILL_SQLITE": "Podaj ścieżkę do pliku bazy SQLite.",
         "PROMPT_PASSWORD_TITLE": "Wymagane hasło",
         "PROMPT_PASSWORD_BODY": "Podaj hasło dla połączenia:\n{name}",
+        "ERR_PASSWORD_REQUIRED_TITLE": "Wymagane hasło",
+        "ERR_PASSWORD_REQUIRED_BODY": (
+            "Nie podano hasła, więc połączenie nie zostało wykonane.\n\n"
+            "Co zrobić:\n"
+            "- Podaj hasło w oknie, które się pojawia.\n"
+            "- Albo kliknij 'Zarządzaj połączeniami...' i ustaw hasło dla: {name}\n"
+            "- Jeśli to logowanie Windows, zaznacz 'Logowanie Windows (Trusted_Connection)' "
+            "i zostaw login/hasło puste."
+        ),
         "WARN_REMEMBER_PASSWORD_TITLE": "Zapisać hasło?",
         "WARN_REMEMBER_PASSWORD_BODY": (
             "Hasło zostanie zapisane jawnym tekstem w pliku:\n{path}\n\n"
@@ -1655,6 +2178,23 @@ I18N: dict[str, dict[str, str]] = {
         "ERR_QUERY_TITLE": "Błąd zapytania",
         "BTN_COPY": "Kopiuj",
         "BTN_CLOSE": "Zamknij",
+        "BTN_COPY_ALL": "Kopiuj wszystko",
+        "BTN_COPY_SUMMARY": "Kopiuj podsumowanie",
+        "BTN_COPY_SQL": "Kopiuj SQL",
+        "BTN_OPEN_SQL": "Otwórz SQL",
+        "BTN_OPEN_LOG": "Otwórz log",
+        "ERR_TAB_SUMMARY": "Podsumowanie",
+        "ERR_TAB_SQL": "SQL",
+        "ERR_TAB_DETAILS": "Szczegóły",
+        "PROGRESS_WORKING_TITLE": "Trwa praca...",
+        "PROGRESS_STARTING": "Startowanie...",
+        "PROGRESS_STEP": "Krok:",
+        "PROGRESS_ELAPSED": "Upłynęło:",
+        "PROGRESS_TITLE": "Trwa eksport",
+        "PROGRESS_GETTING_DATA": "Pobieranie danych z bazy...",
+        "PROGRESS_EXPORTING_XLSX_TEMPLATE": "Eksport do XLSX (template)...",
+        "PROGRESS_EXPORTING_XLSX": "Eksport do XLSX...",
+        "PROGRESS_EXPORTING_CSV": "Eksport do CSV...",
         "ERR_NO_CONNECTION_TITLE": "Brak połączenia",
         "ERR_NO_CONNECTION_BODY": "Brak zapisanych połączeń. Utwórz i zapisz nowe połączenie.",
         "ERR_NO_CONNECTION_DELETE": "Brak połączenia do usunięcia.",
@@ -1671,6 +2211,7 @@ I18N: dict[str, dict[str, str]] = {
         "FILETYPE_SQL": "Pliki SQL",
         "TITLE_SELECT_TEMPLATE": "Wybierz plik template XLSX",
         "FILETYPE_EXCEL": "Pliki Excel",
+        "FILETYPE_CSV": "Pliki CSV",
         "ERR_TEMPLATE_TITLE": "Błąd template",
         "ERR_TEMPLATE_SHEETS": (
             "Nie można odczytać arkuszy z pliku template.\n\n"
@@ -1731,12 +2272,15 @@ I18N: dict[str, dict[str, str]] = {
         "MSG_SAVED_DETAILS": (
             "Zapisano: {path}\n"
             "Wiersze: {rows}\n"
-            "Czas SQL: {sql_time:.2f} s\n"
-            "Czas eksportu: {export_time:.2f} s\n"
-            "Czas łączny: {total_time:.2f} s"
+            "Czas SQL: {sql_time_hms} ({sql_time:.2f} s)\n"
+            "Czas eksportu: {export_time_hms} ({export_time:.2f} s)\n"
+            "Czas łączny: {total_time_hms} ({total_time:.2f} s)"
         ),
         "MSG_SAVED_DETAILS_CSV": "Profil CSV: {profile}",
-        "MSG_NO_ROWS": "Zapytanie nie zwróciło wierszy.\nCzas SQL: {sql_time:.2f} s",
+        "MSG_NO_ROWS": (
+            "Zapytanie nie zwróciło wierszy.\n"
+            "Czas SQL: {sql_time_hms} ({sql_time:.2f} s)"
+        ),
         "ERR_XLSX_TOO_LARGE": (
             "Eksport XLSX pominięty, ponieważ wynik przekracza limity Excela. "
             "Wynik: {rows} wierszy, {cols} kolumn. "
@@ -1849,6 +2393,7 @@ I18N: dict[str, dict[str, str]] = {
         "UPD_START_FAILED": "Nie udało się uruchomić updatera.",
         "STATUS_NO_CONNECTION": "Brak połączenia. Utwórz nowe połączenie.",
         "STATUS_CONNECTION_ERROR": "Błąd połączenia. Utwórz nowe połączenie.",
+        "STATUS_PASSWORD_REQUIRED": "Wymagane hasło.",
         "ERR_CONNECTION_TITLE": "Błąd połączenia",
         "ERR_CONNECTION_BODY": (
             "Nie udało się nawiązać połączenia.\n\nSzczegóły techniczne:\n{error}"
@@ -1863,6 +2408,10 @@ I18N: dict[str, dict[str, str]] = {
         "CLI_DESC": "Uruchamiaj pliki SQL i eksportuj wyniki do XLSX/CSV.",
         "CLI_LANG_HELP": "Język interfejsu (en/pl).",
         "CLI_CONSOLE_HELP": "Uruchom w trybie konsolowym.",
+        "CLI_OUTPUT_HELP": (
+            "Opcjonalny plik lub katalog docelowy. Katalog może być istniejący lub nowy "
+            "(ścieżka bez rozszerzenia). Aby wymusić katalog, dodaj na końcu / lub \\."
+        ),
         "CLI_NO_CONNECTIONS": (
             "Brak zapisanych połączeń. Utwórz połączenie w trybie GUI, aby uruchomić konsolę."
         ),
@@ -1877,6 +2426,7 @@ I18N: dict[str, dict[str, str]] = {
             "Brak uprawnień do zapisu pliku docelowego lub ścieżka jest niedostępna. "
             "Sprawdź lokalizację pliku."
         ),
+        "ERR_SQL_SOURCE": "Źródło SQL:",
         "ERR_DB_MESSAGE": "Komunikat bazy (fragment):",
         "ERR_SQL_PREVIEW": "SQL (początek):",
         "ERR_FULL_LOG": "Pełny błąd zapisany w pliku kkr-query2xlsx.log",
@@ -1898,6 +2448,14 @@ I18N: dict[str, dict[str, str]] = {
         ),
         "INFO_ICON": "i",
         "BTN_OK": "OK",
+        "TITLE_DATA_DIR_NOTICE": "Katalog danych",
+        "MSG_DATA_DIR_NOTICE": (
+            "Aplikacja używa katalogu danych:\n\n"
+            "{data_dir}\n\n"
+            "Tu trzymane są m.in. pliki konfiguracyjne (secure.txt, queries.txt, kkr-query2xlsx.json) "
+            "oraz foldery typu generated_reports/ i sql_archive/."
+        ),
+        "BTN_DONT_SHOW_AGAIN": "Nie pokazuj ponownie",
         "FORMAT_XLSX": "XLSX",
         "FORMAT_CSV": "CSV",
         "CSV_PROFILE_DIALOG_TITLE": "Profile CSV",
@@ -2017,7 +2575,7 @@ def t(key: str, **kwargs) -> str:
 
 
 def _build_path(name: str) -> str:
-    return os.path.join(BASE_DIR, name)
+    return os.path.join(DATA_DIR, name)
 
 
 def _center_window(win, parent=None):
@@ -2050,6 +2608,46 @@ def _center_window(win, parent=None):
         y = vroot_y + vroot_h - h
     x = max(x, vroot_x)
     y = max(y, vroot_y)
+    win.geometry(f"+{x}+{y}")
+
+
+def _center_toplevel_on_parent(win: "tk.Toplevel", parent: "tk.Misc") -> None:
+    """Center `win` on `parent` (or screen) and clamp to visible bounds."""
+    win.update_idletasks()
+
+    # IMPORTANT: before map, winfo_width/height can be 1 -> use req sizes as fallback
+    ww = win.winfo_width() or win.winfo_reqwidth()
+    wh = win.winfo_height() or win.winfo_reqheight()
+
+    # Visible desktop bounds (multi-monitor safe-ish)
+    vroot_x = win.winfo_vrootx()
+    vroot_y = win.winfo_vrooty()
+    vroot_w = win.winfo_vrootwidth()
+    vroot_h = win.winfo_vrootheight()
+
+    x = vroot_x + max((vroot_w - ww) // 2, 0)
+    y = vroot_y + max((vroot_h - wh) // 2, 0)
+
+    try:
+        parent.update_idletasks()
+        if parent.winfo_viewable():
+            pw = parent.winfo_width() or parent.winfo_reqwidth()
+            ph = parent.winfo_height() or parent.winfo_reqheight()
+            px = parent.winfo_rootx()
+            py = parent.winfo_rooty()
+            x = px + (pw - ww) // 2
+            y = py + (ph - wh) // 2
+    except Exception:
+        pass
+
+    # Clamp to visible area
+    if x + ww > vroot_x + vroot_w:
+        x = vroot_x + vroot_w - ww
+    if y + wh > vroot_y + vroot_h:
+        y = vroot_y + vroot_h - wh
+    x = max(x, vroot_x)
+    y = max(y, vroot_y)
+
     win.geometry(f"+{x}+{y}")
 
 
@@ -2288,8 +2886,8 @@ UI_CONFIG_FILENAME = "kkr-query2xlsx.user.json"
 LEGACY_CSV_PROFILES_PATH = _build_path("csv_profiles.json")
 SQL_ARCHIVE_DIR = _build_path("sql_archive")
 
-SECURE_SAMPLE_PATH = _build_path("secure.sample.json")
-QUERIES_SAMPLE_PATH = _build_path("queries.sample.txt")
+SECURE_SAMPLE_PATH = os.path.join(BASE_DIR, "secure.sample.json")
+QUERIES_SAMPLE_PATH = os.path.join(BASE_DIR, "queries.sample.txt")
 
 
 BUILTIN_CSV_PROFILES = [
@@ -2333,6 +2931,8 @@ def _default_ui_config() -> dict:
     return {
         "ui": {
             "sql_highlight_enabled": False,
+            "hide_template_naming_hint": False,
+            "hide_data_dir_notice": False,
         }
     }
 
@@ -2358,6 +2958,16 @@ def load_ui_config(app_dir: Path) -> dict:
             cfg["ui"]["sql_highlight_enabled"] = raw_val
         elif isinstance(raw_val, int) and raw_val in (0, 1):
             cfg["ui"]["sql_highlight_enabled"] = bool(raw_val)
+        raw_hint = ui_section.get("hide_template_naming_hint")
+        if isinstance(raw_hint, bool):
+            cfg["ui"]["hide_template_naming_hint"] = raw_hint
+        elif isinstance(raw_hint, int) and raw_hint in (0, 1):
+            cfg["ui"]["hide_template_naming_hint"] = bool(raw_hint)
+        raw_data_dir = ui_section.get("hide_data_dir_notice")
+        if isinstance(raw_data_dir, bool):
+            cfg["ui"]["hide_data_dir_notice"] = raw_data_dir
+        elif isinstance(raw_data_dir, int) and raw_data_dir in (0, 1):
+            cfg["ui"]["hide_data_dir_notice"] = bool(raw_data_dir)
     return cfg
 
 
@@ -2374,6 +2984,16 @@ def save_ui_config(app_dir: Path, data: dict) -> None:
             normalized["ui"]["sql_highlight_enabled"] = raw_enabled
         elif isinstance(raw_enabled, int) and raw_enabled in (0, 1):
             normalized["ui"]["sql_highlight_enabled"] = bool(raw_enabled)
+        raw_hint = ui_section.get("hide_template_naming_hint")
+        if isinstance(raw_hint, bool):
+            normalized["ui"]["hide_template_naming_hint"] = raw_hint
+        elif isinstance(raw_hint, int) and raw_hint in (0, 1):
+            normalized["ui"]["hide_template_naming_hint"] = bool(raw_hint)
+        raw_data_dir = ui_section.get("hide_data_dir_notice")
+        if isinstance(raw_data_dir, bool):
+            normalized["ui"]["hide_data_dir_notice"] = raw_data_dir
+        elif isinstance(raw_data_dir, int) and raw_data_dir in (0, 1):
+            normalized["ui"]["hide_data_dir_notice"] = bool(raw_data_dir)
 
         path = Path(app_dir) / UI_CONFIG_FILENAME
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -2508,6 +3128,72 @@ def persist_archive_sql(enabled: bool) -> None:
     save_app_config(app_config)
 
 
+# --- Timeouts (persisted, GUI + CLI) -----------------------------------------
+
+# Defaults: 3 minutes for DB execution/fetch + 3 minutes for export generation.
+DEFAULT_DB_TIMEOUT_SECONDS = 3 * 60
+DEFAULT_EXPORT_TIMEOUT_SECONDS = 3 * 60
+
+
+def _normalize_timeout_seconds(value, default_seconds: int) -> int:
+    """Parse timeout from config. Accepts int/float/str, clamps to >=0."""
+    if value is None:
+        return int(default_seconds)
+    try:
+        if isinstance(value, bool):
+            return int(default_seconds)
+        if isinstance(value, (int, float)):
+            seconds = int(value)
+        else:
+            s = str(value).strip()
+            if not s:
+                return int(default_seconds)
+            seconds = int(float(s))
+        return max(0, seconds)
+    except Exception:  # noqa: BLE001
+        return int(default_seconds)
+
+
+def load_persisted_db_timeout_seconds() -> int:
+    app_config = load_app_config()
+    timeouts = app_config.get("timeouts", {})
+    if not isinstance(timeouts, dict):
+        return DEFAULT_DB_TIMEOUT_SECONDS
+    raw = timeouts.get("db_seconds")
+    return _normalize_timeout_seconds(raw, DEFAULT_DB_TIMEOUT_SECONDS)
+
+
+def persist_db_timeout_seconds(seconds: int) -> None:
+    seconds = max(0, int(seconds))
+    app_config = load_app_config()
+    timeouts = app_config.get("timeouts")
+    if not isinstance(timeouts, dict):
+        timeouts = {}
+    timeouts["db_seconds"] = seconds
+    app_config["timeouts"] = timeouts
+    save_app_config(app_config)
+
+
+def load_persisted_export_timeout_seconds() -> int:
+    app_config = load_app_config()
+    timeouts = app_config.get("timeouts", {})
+    if not isinstance(timeouts, dict):
+        return DEFAULT_EXPORT_TIMEOUT_SECONDS
+    raw = timeouts.get("export_seconds")
+    return _normalize_timeout_seconds(raw, DEFAULT_EXPORT_TIMEOUT_SECONDS)
+
+
+def persist_export_timeout_seconds(seconds: int) -> None:
+    seconds = max(0, int(seconds))
+    app_config = load_app_config()
+    timeouts = app_config.get("timeouts")
+    if not isinstance(timeouts, dict):
+        timeouts = {}
+    timeouts["export_seconds"] = seconds
+    app_config["timeouts"] = timeouts
+    save_app_config(app_config)
+
+
 def _dialect_from_db_kind(db_kind: str) -> str:
     kind = (db_kind or "").strip().lower()
     if "sqlite" in kind:
@@ -2561,6 +3247,7 @@ def _apply_codeview_pygments_style(w: tk.Text, style_name: str = "vs") -> None:
         fg="black",
         insertbackground="black",
         selectbackground="#cce8ff",
+        selectforeground="black",
         inactiveselectbackground="#cce8ff",
     )
 
@@ -2583,7 +3270,8 @@ def _apply_codeview_pygments_style(w: tk.Text, style_name: str = "vs") -> None:
                 pass
 
     # Light theme tweaks (readability on white background):
-    # - brackets/punctuation slightly darker so quotes like '' are visible
+    # - operators (incl. MSSQL [ ]) forced to black for consistency
+    # - punctuation slightly darker so quotes like '' are visible
     # - functions use a subtle accent (not pure black)
     # - types (VARCHAR/NVARCHAR/INT...) and keywords strong blue
     # - strings in readable red
@@ -2594,6 +3282,12 @@ def _apply_codeview_pygments_style(w: tk.Text, style_name: str = "vs") -> None:
         if "punctuation" in lt:
             try:
                 w.tag_configure(tag, foreground="#404040")
+            except Exception:
+                pass
+
+        if "operator" in lt:
+            try:
+                w.tag_configure(tag, foreground="#000000")
             except Exception:
                 pass
 
@@ -2782,15 +3476,37 @@ def validate_report_basename(name: str) -> tuple[bool, str, str]:
 
 
 def _looks_binary(data: bytes) -> bool:
-    # Heurystyka: NUL albo dużo nie-tekstowych bajtów
     if not data:
         return False
+
+    # BOM -> tekst (nawet jesli potem beda NUL-e)
+    if data.startswith(b"\xef\xbb\xbf"):  # UTF-8 BOM
+        return False
+    if data.startswith((b"\xff\xfe", b"\xfe\xff")):  # UTF-16 BOM
+        return False
+    if data.startswith((b"\xff\xfe\x00\x00", b"\x00\x00\xfe\xff")):  # UTF-32 BOM
+        return False
+
+    # NUL zwykle oznacza binarke, ale dopusc UTF-16 bez BOM (NUL glownie na parzystych albo nieparzystych)
     if b"\x00" in data:
+        nul_positions = [i for i, b in enumerate(data) if b == 0]
+        if nul_positions:
+            even = sum(1 for i in nul_positions if i % 2 == 0)
+            odd = len(nul_positions) - even
+            if max(even, odd) / len(nul_positions) >= 0.90:
+                return False
         return True
-    # policz "dziwne" bajty (poza whitespace + printable ASCII)
-    printable = set(bytes(string.printable, "ascii"))
-    weird = sum(1 for b in data if b not in printable)
-    return (weird / max(1, len(data))) > 0.30
+
+    # Zbyt duzo znakow kontrolnych (poza whitespace) -> binarka
+    allowed_controls = {0x09, 0x0A, 0x0D, 0x0C}  # \t \n \r \f
+    control_bytes = sum(
+        1
+        for b in data
+        if (b < 32 and b not in allowed_controls) or b == 0x7F
+    )
+
+    # Lagodny prog (benefit of doubt)
+    return (control_bytes / len(data)) > 0.10
 
 
 def validate_sql_text_file(path: str) -> tuple[bool, str]:
@@ -2805,33 +3521,29 @@ def validate_sql_text_file(path: str) -> tuple[bool, str]:
 
     ext = os.path.splitext(path)[1].lower()
 
-    # Najczęstsze pomyłki po rozszerzeniu
+    # Oczywiste pomylki po rozszerzeniu
     if ext in {".db", ".sqlite", ".sqlite3"}:
         return False, t("ERR_SQLFILE_IS_SQLITE_EXT")
-    if ext in {".xlsx", ".xls", ".csv"}:
-        # CSV bywa OK jako tekst, ale w kontekście "SQL file" to zwykle pomyłka
+    if ext in {".xlsx", ".xls"}:
         return False, t("ERR_SQLFILE_IS_SPREADSHEET", ext=ext)
 
     try:
         with open(path, "rb") as f:
-            head = f.read(4096)
+            head = f.read(8192)
     except OSError as e:
         return False, t("ERR_CANNOT_OPEN_FILE", error=e)
 
-    # Magic bytes - częste przypadki
+    # Oczywiste binarki po magic bytes
     if head.startswith(b"SQLite format 3\x00"):
         return False, t("ERR_SQLFILE_IS_SQLITE_EXT")
     if head.startswith(b"PK\x03\x04"):
-        # ZIP container (często .xlsx, ale też inne)
         return False, t("ERR_SQLFILE_IS_ZIP")
     if head.startswith(b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1"):
-        # stary Office (xls/doc)
         return False, t("ERR_SQLFILE_IS_OLD_OFFICE")
 
     if _looks_binary(head):
         return False, t("ERR_SQLFILE_IS_BINARY")
 
-    # Jeśli dotarliśmy tu - wygląda jak tekst (nie gwarantuje, że to SQL, ale o to chodzi)
     return True, ""
 
 
@@ -2872,7 +3584,7 @@ def remove_bom(content: bytes) -> str:
         LOGGER.error(
             "Failed to decode bytes with UTF-8 and Windows fallbacks. "
             "Replacing invalid bytes.",
-            exc_info=exc,
+            exc_info=True,
         )
         return content.decode("utf-8", errors="replace")
 
@@ -2956,7 +3668,8 @@ def _normalize_connections(data):
     }
 
 
-def load_connections(path=SECURE_PATH):
+def load_connections(path: str | None = None):
+    path = path or SECURE_PATH
     if not os.path.exists(path):
         return _normalize_connections({})
 
@@ -2974,7 +3687,8 @@ def load_connections(path=SECURE_PATH):
     return _normalize_connections(data)
 
 
-def save_connections(store, path=SECURE_PATH):
+def save_connections(store, path: str | None = None):
+    path = path or SECURE_PATH
     normalized = _normalize_connections(store)
     normalized.pop("ui_lang", None)
     with open(path, "w", encoding="utf-8") as file:
@@ -2991,7 +3705,8 @@ def save_connections(store, path=SECURE_PATH):
         json.dump(safe, file, ensure_ascii=False, indent=2)
 
 
-def load_query_paths(queries_file=QUERIES_PATH):
+def load_query_paths(queries_file: str | None = None):
+    queries_file = queries_file or QUERIES_PATH
     paths = []
     if not os.path.exists(queries_file):
         return paths
@@ -3004,7 +3719,8 @@ def load_query_paths(queries_file=QUERIES_PATH):
     return paths
 
 
-def save_query_paths(paths, queries_file=QUERIES_PATH):
+def save_query_paths(paths, queries_file: str | None = None):
+    queries_file = queries_file or QUERIES_PATH
     with open(queries_file, "w", encoding="utf-8") as f:
         for path in paths:
             f.write(f"{path}\n")
@@ -3026,27 +3742,21 @@ def bootstrap_local_files():
         try:
             shutil.copyfile(SECURE_SAMPLE_PATH, SECURE_PATH)
             created.append(os.path.basename(SECURE_PATH))
-        except Exception as exc:  # noqa: BLE001
-            try:
-                LOGGER.exception(
-                    "Failed to create secure.txt from secure.sample.json",
-                    exc_info=exc,
-                )
-            except Exception:
-                pass
+        except Exception:  # noqa: BLE001
+            LOGGER.exception(
+                "Failed to create secure.txt from secure.sample.json",
+                exc_info=True,
+            )
 
     if not os.path.exists(QUERIES_PATH) and os.path.exists(QUERIES_SAMPLE_PATH):
         try:
             shutil.copyfile(QUERIES_SAMPLE_PATH, QUERIES_PATH)
             created.append(os.path.basename(QUERIES_PATH))
-        except Exception as exc:  # noqa: BLE001
-            try:
-                LOGGER.exception(
-                    "Failed to create queries.txt from queries.sample.txt",
-                    exc_info=exc,
-                )
-            except Exception:
-                pass
+        except Exception:  # noqa: BLE001
+            LOGGER.exception(
+                "Failed to create queries.txt from queries.sample.txt",
+                exc_info=True,
+            )
 
     return created
 
@@ -3070,34 +3780,143 @@ XLSX_MAX_COLS = 16_384
 
 # --- Logging setup ----------------------------------------------------------
 
+LOG_DIR: str | None = None
+LOG_FILE_PATH: str | None = None
+
 
 def _setup_logger():
     """
-    Prosty globalny logger zapisujący błędy do pliku logs/kkr-query2xlsx.log.
-    Log ma rotację (ok. 1 MB na plik, 3 backupy).
+    Prosty globalny logger z rotacją (ok. 1 MB na plik, 3 backupy).
+    Ścieżka logu może być w katalogu aplikacji albo w katalogu użytkownika (fallback).
     """
-    log_dir = os.path.join(BASE_DIR, "logs")
-    os.makedirs(log_dir, exist_ok=True)
-
     logger = logging.getLogger("kkr-query2xlsx")
     logger.setLevel(logging.INFO)
+    logger.propagate = False
 
     # Nie dodawaj handlerów ponownie przy imporcie
     if not logger.handlers:
-        log_path = os.path.join(log_dir, "kkr-query2xlsx.log")
-        handler = RotatingFileHandler(
-            log_path,
-            maxBytes=1_000_000,
-            backupCount=3,
-            encoding="utf-8",
-        )
-        formatter = logging.Formatter(
-            "%(asctime)s [%(levelname)s] %(name)s - %(message)s"
-        )
+        global LOG_DIR, LOG_FILE_PATH
+        formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s - %(message)s")
+        handler: logging.Handler | None = None
+
+        # 1) Kandydaci - user dirs najpierw (lepsze dla PyInstaller i braku praw zapisu).
+        candidates: list[str] = []
+
+        # 2) Fallback: katalog użytkownika (zawsze writable).
+        try:
+            if sys.platform == "win32":
+                base = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA")
+                if base:
+                    candidates.append(os.path.join(base, "kkr-query2xlsx", "logs"))
+            elif sys.platform == "darwin":
+                candidates.append(os.path.join(str(Path.home()), "Library", "Logs", "kkr-query2xlsx"))
+            else:
+                base = os.environ.get("XDG_STATE_HOME") or os.environ.get("XDG_CACHE_HOME")
+                if not base:
+                    base = os.path.join(str(Path.home()), ".local", "state")
+                candidates.append(os.path.join(base, "kkr-query2xlsx", "logs"))
+        except Exception:
+            pass
+
+        # 3) Jeśli nie jesteśmy w trybie "frozen", to trzymaj logi przy projekcie jako opcję.
+        if not getattr(sys, "frozen", False):
+            candidates.append(os.path.join(BASE_DIR, "logs"))
+
+        # 4) Ostateczny fallback: temp.
+        try:
+            import tempfile
+
+            candidates.append(os.path.join(tempfile.gettempdir(), "kkr-query2xlsx", "logs"))
+        except Exception:
+            pass
+
+        # 5) Tworzenie handlera z pierwszego katalogu, który działa.
+        for log_dir in candidates:
+            try:
+                os.makedirs(log_dir, exist_ok=True)
+                log_path = os.path.join(log_dir, "kkr-query2xlsx.log")
+                handler = RotatingFileHandler(
+                    log_path,
+                    maxBytes=1_000_000,
+                    backupCount=3,
+                    encoding="utf-8",
+                )
+                LOG_DIR = log_dir
+                LOG_FILE_PATH = log_path
+                break
+            except Exception:
+                handler = None
+
+        # 6) Jeśli wszystko zawiodło (np. ekstremalne restrykcje) - nie wywalaj aplikacji.
+        if handler is None:
+            LOG_DIR = None
+            LOG_FILE_PATH = None
+            if sys.stderr is not None:
+                handler = logging.StreamHandler(sys.stderr)
+            else:
+                handler = logging.NullHandler()
+
         handler.setFormatter(formatter)
         logger.addHandler(handler)
 
     return logger
+
+
+def _startup_ask_yes_no(title: str, message: str) -> bool:
+    stdin = getattr(sys, "stdin", None)
+    # Non-interactive runs (CI/scheduled jobs) must not block or open GUI prompts.
+    try:
+        if stdin is None or not getattr(stdin, "isatty", lambda: False)():
+            return False
+    except Exception:
+        return False
+
+    try:
+        import tkinter as _tk
+        from tkinter import messagebox as _mb
+
+        r = _tk.Tk()
+        r.withdraw()
+        ans = _mb.askyesno(title, message, parent=r)
+        r.destroy()
+        return bool(ans)
+    except Exception:
+        # fallback konsolowy
+        try:
+            print(f"{title}\n{message}", file=sys.stderr)
+            resp = input("Use user folder? [y/N]: ").strip().lower()
+            return resp in ("y", "yes")
+        except Exception:
+            return False
+
+
+def _suggest_user_data_dir() -> str:
+    app_name = "kkr-query2xlsx"
+    if sys.platform == "win32":
+        base = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA") or str(Path.home())
+        return os.path.join(base, app_name)
+    if sys.platform == "darwin":
+        return os.path.join(str(Path.home()), "Library", "Application Support", app_name)
+    base = os.environ.get("XDG_DATA_HOME") or os.path.join(str(Path.home()), ".local", "share")
+    return os.path.join(base, app_name)
+
+
+def _startup_show_error(title: str, message: str) -> None:
+    """Best-effort popup (dla .exe bez konsoli)."""
+    try:
+        import tkinter as _tk
+        from tkinter import messagebox as _mb
+
+        r = _tk.Tk()
+        r.withdraw()
+        _mb.showerror(title, message, parent=r)
+        r.destroy()
+    except Exception:
+        try:
+            if sys.stderr is not None:
+                print(f"{title}: {message}", file=sys.stderr)
+        except Exception:
+            pass
 
 
 LOGGER = _setup_logger()
@@ -3122,8 +3941,45 @@ def _log_unhandled_exception(exc_type, exc_value, exc_traceback):
         exc_info=(exc_type, exc_value, exc_traceback),
     )
 
+    # Jeśli uruchomione z konsoli (python.exe) - pokaż traceback na stderr,
+    # bo inaczej wygląda jak "normalne zamknięcie".
+    try:
+        if sys.stderr is not None:
+            sys.__excepthook__(exc_type, exc_value, exc_traceback)
+    except Exception:
+        pass
+
 
 sys.excepthook = _log_unhandled_exception
+
+_ORIG_SYS_EXIT = sys.exit
+
+
+def _install_debug_sys_exit_hook() -> None:
+    """DEBUG: pokaż stacktrace dla sys.exit (SystemExit nie przechodzi przez sys.excepthook)."""
+    def _exit(code=0):  # noqa: ANN001
+        import traceback
+        try:
+            print(f"[DEBUG] sys.exit({code}) called", file=sys.stderr)
+            traceback.print_stack()
+        except Exception:
+            pass
+        _ORIG_SYS_EXIT(code)
+
+    sys.exit = _exit
+
+
+def _debug_enabled() -> bool:
+    return os.environ.get("KKR_DEBUG_EXIT") == "1"
+
+
+def _dbg(msg: str) -> None:
+    if not _debug_enabled():
+        return
+    try:
+        print(f"[DEBUG] {msg}", file=sys.stderr, flush=True)
+    except Exception:
+        pass
 
 
 def handle_db_driver_error(exc, db_type, profile_name=None, show_message=None):
@@ -3132,11 +3988,13 @@ def handle_db_driver_error(exc, db_type, profile_name=None, show_message=None):
     Returns True when the error was recognized and presented to the user.
     """
 
-    LOGGER.exception(
-        "Database driver or library issue (type=%s, profile=%s)",
+    # Log the *passed* exception reliably (even if this function is called outside an except block)
+    LOGGER.error(
+        "Database driver or library issue (type=%s, profile=%s): %s",
         db_type,
         profile_name,
-        exc_info=exc,
+        exc,
+        exc_info=(type(exc), exc, exc.__traceback__),
     )
 
     show = show_message or messagebox.showerror
@@ -3168,7 +4026,6 @@ def handle_db_driver_error(exc, db_type, profile_name=None, show_message=None):
             )
             msg = _build_mssql_error_message(
                 exc=exc,
-                title=title,
                 hints=hints,
                 pyodbc_ok=False,
                 drivers=[],
@@ -3367,32 +4224,151 @@ def remember_last_used_csv_profile(
     try:
         save_csv_profiles(new_config)
     except OSError as exc:
-        try:
-            LOGGER.warning(
-                "Nie udało się zapisać domyślnego profilu CSV (%s): %s",
-                profile_name,
-                exc,
-            )
-        except Exception:  # noqa: BLE001
-            pass
+        LOGGER.warning(
+            "Nie udało się zapisać domyślnego profilu CSV (%s): %s",
+            profile_name,
+            exc,
+        )
         return config
 
     try:
         return load_csv_profiles()
     except Exception as exc:  # noqa: BLE001
-        try:
-            LOGGER.warning(
-                "Nie udało się ponownie wczytać kkr-query2xlsx.json: %s",
-                exc,
-            )
-        except Exception:  # noqa: BLE001
-            pass
+        LOGGER.warning(
+            "Nie udało się ponownie wczytać kkr-query2xlsx.json: %s",
+            exc,
+        )
         return new_config
 
 
 def ensure_directories(paths):
     for path in paths:
         os.makedirs(path, exist_ok=True)
+
+
+def _required_work_dirs(output_dir: str) -> list[str]:
+    """Single source of truth for required working directories.
+
+    NOTE: compute subpaths via ``_build_path`` to avoid stale import-time globals
+    after a runtime DATA_DIR switch.
+    """
+    return [
+        output_dir,
+        _build_path("sql_archive"),
+        _build_path("templates"),
+        _build_path("queries"),
+    ]
+
+
+def _ensure_required_work_dirs(output_dir: str) -> None:
+    """Create all required working directories for the current DATA_DIR."""
+    ensure_directories(_required_work_dirs(output_dir))
+
+
+def bootstrap_data_dir_and_workdirs_or_exit() -> str:
+    """Ensure working directories are ready, fallback to user dir, or exit with code 1."""
+    output_dir = _build_path("generated_reports")
+    try:
+        _ensure_required_work_dirs(output_dir)
+        return output_dir
+    except OSError as exc:
+        suggested = _suggest_user_data_dir()
+        msg = (
+            "App cannot create its working folders under:\n"
+            f"{BASE_DIR}\n\n"
+            "Do you want to store app data in your user folder instead?\n"
+            f"{suggested}\n\n"
+            f"Error: {exc}"
+        )
+        if _startup_ask_yes_no("No write permission", msg):
+            _set_data_dir(suggested)
+            output_dir = _build_path("generated_reports")
+            try:
+                _ensure_required_work_dirs(output_dir)
+                return output_dir
+            except OSError as exc2:
+                _startup_show_error(
+                    "No write permission",
+                    "Still cannot create working folders in:\n"
+                    f"{DATA_DIR}\n\n"
+                    f"Error: {exc2}",
+                )
+                sys.exit(1)
+        else:
+            _startup_show_error(
+                "No write permission",
+                "App cannot create its working folders under:\n"
+                f"{BASE_DIR}\n\n"
+                "Move the app to a writable folder (e.g. Desktop/Documents) and try again.\n\n"
+                f"Error: {exc}",
+            )
+            sys.exit(1)
+
+
+def _expected_output_extension(output_format: str) -> str:
+    return ".xlsx" if (output_format or "").lower() == "xlsx" else ".csv"
+
+
+def _looks_like_directory(path: str) -> bool:
+    if not path:
+        return False
+    if path.endswith(os.sep) or (os.altsep and path.endswith(os.altsep)):
+        return True
+    resolved = resolve_path(path)
+    return os.path.isdir(resolved)
+
+
+def _looks_like_new_directory_override(path: str) -> bool:
+    if not path:
+        return False
+    if path.endswith(os.sep) or (os.altsep and path.endswith(os.altsep)):
+        return False
+    resolved = resolve_path(path)
+    if os.path.exists(resolved):
+        return False
+    _, ext = os.path.splitext(path)
+    if ext:
+        return False
+    return True
+
+
+def normalize_output_file_path(
+    *,
+    output_directory: str,
+    default_file_name: str,
+    output_format: str,
+    override_path: str | None = None,
+    prefer_dir_for_extensionless_nonexistent: bool = False,
+) -> tuple[str, bool]:
+    """Normalize output file path and detect extension mismatch.
+
+    Creates output_dir if missing.
+    """
+    expected_ext = _expected_output_extension(output_format)
+    override = (override_path or "").strip()
+    ext_mismatch = False
+
+    if override:
+        resolved = resolve_path(override)
+        if _looks_like_directory(override) or (
+            prefer_dir_for_extensionless_nonexistent
+            and _looks_like_new_directory_override(override)
+        ):
+            output_dir = resolved
+            output_file_path = os.path.join(output_dir, default_file_name)
+        else:
+            root, ext = os.path.splitext(resolved)
+            ext_mismatch = bool(ext) and ext.lower() != expected_ext
+            output_file_path = (
+                root + expected_ext if ext.lower() != expected_ext else resolved
+            )
+            output_dir = os.path.dirname(output_file_path) or output_directory
+    else:
+        output_dir = output_directory
+        output_file_path = os.path.join(output_directory, default_file_name)
+
+    os.makedirs(output_dir, exist_ok=True)
+    return output_file_path, ext_mismatch
 
 
 def _sanitize_filename_part(value: str, max_len: int = 80) -> str:
@@ -3477,43 +4453,20 @@ def get_csv_profile(config, name):
     return None
 
 
-def csv_profile_to_kwargs(profile):
-    quoting_map = {
-        "all": csv.QUOTE_ALL,
-        "none": csv.QUOTE_NONE,
-        "minimal": csv.QUOTE_MINIMAL,
-        "nonnumeric": csv.QUOTE_NONNUMERIC,
-    }
-
-    quoting_value = quoting_map.get(
-        (profile.get("quoting") or DEFAULT_CSV_PROFILE["quoting"]).lower(),
-        csv.QUOTE_MINIMAL,
-    )
-
-    line_terminator_value = (
-        profile.get("line_terminator")
-        or profile.get("lineterminator")
-        or DEFAULT_CSV_PROFILE["lineterminator"]
-    )
-
-    return {
-        "sep": profile.get("delimiter") or DEFAULT_CSV_PROFILE["delimiter"],
-        "encoding": profile.get("encoding") or DEFAULT_CSV_PROFILE["encoding"],
-        "decimal": profile.get("decimal") or DEFAULT_CSV_PROFILE["decimal"],
-        # pandas expects the keyword "lineterminator" (without underscore)
-        "lineterminator": line_terminator_value,
-        "quotechar": profile.get("quotechar") or DEFAULT_CSV_PROFILE["quotechar"],
-        "quoting": quoting_value,
-        "escapechar": profile.get("escapechar") or None,
-        "doublequote": bool(
-            profile.get("doublequote", DEFAULT_CSV_PROFILE["doublequote"])
-        ),
-        "date_format": profile.get("date_format") or None,
-    }
-
-
 class XlsxSizeError(ValueError):
     pass
+
+
+class UserCancelledError(RuntimeError):
+    pass
+
+
+class PasswordRequiredError(UserCancelledError):
+    def __init__(self, *, name: str, conn_type: str):
+        super().__init__("Password required.")
+        self.name = str(name or "")
+        self.conn_type = str(conn_type or "")
+
 
 
 def _ensure_xlsx_limits(
@@ -3560,26 +4513,725 @@ def _ensure_xlsx_limits(
         )
 
 
-def _run_query_to_rows(engine, sql_query):
+class QueryTimeoutError(RuntimeError):
+    pass
+
+
+class ExportTimeoutError(RuntimeError):
+    pass
+
+
+def _engine_backend_name(engine) -> str:
+    try:
+        return str(engine.url.get_backend_name() or "").lower()
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _ensure_engine_timeout_hook(engine) -> None:
+    """Install a per-engine hook that can set driver-level cursor timeouts (best-effort)."""
+    if getattr(engine, "_kkr_timeout_hook_installed", False):
+        return
+    try:
+
+        @event.listens_for(engine, "before_cursor_execute")
+        def _kkr_before_cursor_execute(
+            conn, cursor, statement, parameters, context, executemany
+        ):  # noqa: ANN001
+            seconds = int(getattr(engine, "_kkr_db_timeout_seconds", 0) or 0)
+            try:
+                if hasattr(cursor, "timeout"):
+                    # Important: set to 0 as well, so pooled/reused cursors don't keep old timeout.
+                    cursor.timeout = max(0, seconds)
+            except Exception:
+                pass
+
+    except Exception:
+        pass
+
+    setattr(engine, "_kkr_timeout_hook_installed", True)
+
+
+def set_engine_db_timeout(engine, timeout_seconds: int) -> None:
+    """Set current DB timeout on engine (used by the cursor hook)."""
+    if engine is None:
+        return
+    _ensure_engine_timeout_hook(engine)
+    setattr(engine, "_kkr_db_timeout_seconds", max(0, int(timeout_seconds)))
+
+
+def _extract_dbapi_connection(sqlalchemy_connection):
+    """Best-effort: extract the underlying DBAPI connection from a SQLAlchemy Connection."""
+    if sqlalchemy_connection is None:
+        return None
+    try:
+        if hasattr(sqlalchemy_connection, "driver_connection"):
+            dbapi_conn = sqlalchemy_connection.driver_connection
+        else:
+            dbapi_conn = getattr(sqlalchemy_connection, "connection", None)
+        if dbapi_conn is not None:
+            if hasattr(dbapi_conn, "driver_connection"):
+                dbapi_conn = dbapi_conn.driver_connection
+            elif hasattr(dbapi_conn, "connection"):
+                dbapi_conn = dbapi_conn.connection
+        return dbapi_conn
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _cancel_db_operation(dbapi_conn) -> None:
+    """Best-effort cancel across DBAPIs."""
+    if dbapi_conn is None:
+        return
+    try:
+        if hasattr(dbapi_conn, "cancel"):
+            dbapi_conn.cancel()
+            return
+    except Exception:
+        pass
+    try:
+        if hasattr(dbapi_conn, "interrupt"):
+            dbapi_conn.interrupt()
+            return
+    except Exception:
+        pass
+    try:
+        dbapi_conn.close()
+    except Exception:
+        pass
+
+
+def _apply_server_side_timeout_if_possible(
+    backend: str, sqlalchemy_connection, timeout_seconds: int
+) -> None:
+    """Apply server-enforced timeouts when they exist (best-effort, per session)."""
+    backend = (backend or "").lower()
+
+    # Important: when timeout_seconds == 0 ("no limit"), explicitly reset session values.
+    # Otherwise pooled connections can keep a previous non-zero value.
+
+    if backend in ("postgresql", "postgres"):
+        ms = int(timeout_seconds * 1000) if timeout_seconds and timeout_seconds > 0 else 0
+        try:
+            sqlalchemy_connection.exec_driver_sql(f"SET statement_timeout = {ms}")
+        except Exception:
+            pass
+    if backend in ("mysql", "mariadb"):
+        ms = int(timeout_seconds * 1000) if timeout_seconds and timeout_seconds > 0 else 0
+        try:
+            sqlalchemy_connection.exec_driver_sql(
+                f"SET SESSION max_execution_time = {ms}"
+            )
+        except Exception:
+            pass
+
+
+def _deadline(timeout_seconds: int):
+    if timeout_seconds and int(timeout_seconds) > 0:
+        return time.monotonic() + int(timeout_seconds)
+    return None
+
+
+def _check_deadline(deadline, exc_type, message: str) -> None:
+    if deadline is not None and time.monotonic() > deadline:
+        raise exc_type(message)
+
+def _sql_excerpt_preserve_lines(
+    sql: str,
+    *,
+    max_chars: int = 1200,
+    max_lines: int = 60,
+) -> str:
+    """
+    UI-friendly excerpt that preserves original newlines/indentation.
+    Avoids turning SQL into one line (which is unreadable and hard to debug).
+    """
+    s = (sql or "").rstrip()
+    if not s:
+        return ""
+
+    lines = s.splitlines()
+    trimmed = False
+    if len(lines) > max_lines:
+        lines = lines[:max_lines]
+        trimmed = True
+
+    out = "\n".join(lines).rstrip()
+    if len(out) > max_chars:
+        out = out[:max_chars].rstrip()
+        trimmed = True
+
+    if trimmed:
+        out += "\n...\n(Trimmed in UI, full query in kkr-query2xlsx.log)"
+    return out
+
+def _limit_text_for_widget(text: str, max_chars: int = 50000) -> str:
+    s = text or ""
+    if len(s) <= max_chars:
+        return s
+    return s[:max_chars] + "\n...\n(Trimmed in UI)"
+
+
+def _dbapi_conn_from_raw_connection(raw_conn):
+    """
+    engine.raw_connection() returns a SQLAlchemy wrapper (e.g. ConnectionFairy).
+    For cancel()/close fallback we want the underlying DBAPI connection object.
+    """
+    if raw_conn is None:
+        return None
+    for attr in ("driver_connection", "connection"):
+        try:
+            value = getattr(raw_conn, attr, None)
+            if value is not None:
+                return value
+        except Exception:
+            pass
+    return raw_conn
+
+
+def _mssql_dbapi_from_raw_connection(raw_conn):
+    """Backward-compatible alias for legacy call sites."""
+    return _dbapi_conn_from_raw_connection(raw_conn)
+
+
+def _split_sql_statements(sql: str, backend: str) -> list[str]:
+    """
+    Split SQL script into statements by ';' while respecting:
+    - single/double quotes
+    - MySQL backticks
+    - -- line comments, /* */ block comments, MySQL # comments
+    - PostgreSQL dollar-quoted blocks ($$...$$ or $tag$...$tag$)
+    """
+    s = sql or ""
+    if not s.strip():
+        return []
+
+    backend = (backend or "").lower()
+    out: list[str] = []
+    buf: list[str] = []
+
+    in_sq = False
+    in_dq = False
+    in_bt = False
+    in_line_comment = False
+    in_block_comment = False
+    dollar_tag: str | None = None
+
+    i = 0
+    n = len(s)
+
+    while i < n:
+        if in_line_comment:
+            ch = s[i]
+            buf.append(ch)
+            i += 1
+            if ch == "\n":
+                in_line_comment = False
+            continue
+
+        if in_block_comment:
+            if i + 1 < n and s[i] == "*" and s[i + 1] == "/":
+                buf.append("*/")
+                i += 2
+                in_block_comment = False
+            else:
+                buf.append(s[i])
+                i += 1
+            continue
+
+        if dollar_tag is not None:
+            if s.startswith(dollar_tag, i):
+                buf.append(dollar_tag)
+                i += len(dollar_tag)
+                dollar_tag = None
+            else:
+                buf.append(s[i])
+                i += 1
+            continue
+
+        ch = s[i]
+        nxt = s[i + 1] if i + 1 < n else ""
+
+        if not (in_sq or in_dq or in_bt):
+            if ch == "-" and nxt == "-":
+                buf.append("--")
+                i += 2
+                in_line_comment = True
+                continue
+            if ch == "/" and nxt == "*":
+                buf.append("/*")
+                i += 2
+                in_block_comment = True
+                continue
+            if backend in ("mysql", "mariadb") and ch == "#":
+                buf.append("#")
+                i += 1
+                in_line_comment = True
+                continue
+
+            if backend in ("postgresql", "postgres") and ch == "$":
+                m = re.match(r"^\$[A-Za-z_][A-Za-z0-9_]*\$", s[i:]) or re.match(
+                    r"^\$\$", s[i:]
+                )
+                if m:
+                    tag = m.group(0)
+                    buf.append(tag)
+                    i += len(tag)
+                    dollar_tag = tag
+                    continue
+
+        if in_sq:
+            if backend in ("mysql", "mariadb") and ch == "\\" and nxt:
+                buf.append(ch)
+                buf.append(nxt)
+                i += 2
+                continue
+            if ch == "'" and nxt == "'":
+                buf.append("''")
+                i += 2
+                continue
+            if ch == "'":
+                in_sq = False
+            buf.append(ch)
+            i += 1
+            continue
+
+        if in_dq:
+            if ch == '"' and nxt == '"':
+                buf.append('""')
+                i += 2
+                continue
+            if ch == '"':
+                in_dq = False
+            buf.append(ch)
+            i += 1
+            continue
+
+        if in_bt:
+            if ch == "`":
+                in_bt = False
+            buf.append(ch)
+            i += 1
+            continue
+
+        if ch == "'":
+            in_sq = True
+            buf.append(ch)
+            i += 1
+            continue
+        if ch == '"':
+            in_dq = True
+            buf.append(ch)
+            i += 1
+            continue
+        if backend in ("mysql", "mariadb") and ch == "`":
+            in_bt = True
+            buf.append(ch)
+            i += 1
+            continue
+
+        if ch == ";":
+            stmt = "".join(buf).strip()
+            if stmt:
+                out.append(stmt)
+            buf = []
+            i += 1
+            continue
+
+        buf.append(ch)
+        i += 1
+
+    tail = "".join(buf).strip()
+    if tail:
+        out.append(tail)
+
+    return out
+
+
+def has_multiple_statements(sql_query: str, backend: str) -> bool:
+    """Return True only when SQL contains more than one non-empty statement."""
+    return len(_split_sql_statements(sql_query, backend)) > 1
+
+
+def _apply_server_side_timeout_dbapi(backend: str, cur, timeout_seconds: int) -> None:
+    """Best-effort server-side timeouts for DBAPI cursor sessions."""
+    backend = (backend or "").lower()
+    ms = int(timeout_seconds * 1000) if timeout_seconds and timeout_seconds > 0 else 0
+    try:
+        if backend in ("postgresql", "postgres"):
+            cur.execute(f"SET statement_timeout = {ms}")
+        elif backend in ("mysql", "mariadb"):
+            cur.execute(f"SET SESSION max_execution_time = {ms}")
+    except Exception:
+        pass
+
+
+def _run_dbapi_batch_fetch_last_select(
+    engine,
+    sql_query: str,
+    *,
+    backend: str,
+    timeout_seconds: int,
+    cancel_event: threading.Event | None,
+    timed_out_flag: dict,
+    dbapi_conn_holder: dict,
+) -> tuple[list, list]:
+    """
+    Generic batch runner for Postgres/MySQL/SQLite:
+    - split script into statements
+    - execute sequentially on one DBAPI cursor/session
+    - return rows/cols from the LAST statement that returns rows
+    """
+    raw = engine.raw_connection()
+    cur = None
+    try:
+        cur = raw.cursor()
+        # Keep a cancellable object: prefer cursor.cancel() when available,
+        # otherwise use the underlying DBAPI connection.
+        dbapi_conn_holder["conn"] = (
+            cur if hasattr(cur, "cancel") else _dbapi_conn_from_raw_connection(raw)
+        )
+
+        try:
+            if hasattr(cur, "timeout"):
+                cur.timeout = max(0, int(timeout_seconds or 0))
+        except Exception:
+            pass
+
+        _apply_server_side_timeout_dbapi(backend, cur, int(timeout_seconds or 0))
+
+        stmts = _split_sql_statements(sql_query or "", backend)
+        if not stmts:
+            return [], []
+
+        last_rows: list = []
+        last_cols: list = []
+        fetch_size = 2000
+
+        def _raise_timeout():
+            raise QueryTimeoutError(
+                t(
+                    "ERR_QUERY_TIMEOUT",
+                    minutes=max(1, int(math.ceil(max(0, int(timeout_seconds or 0)) / 60))),
+                )
+            )
+
+        for stmt in stmts:
+            if cancel_event is not None and cancel_event.is_set():
+                raise UserCancelledError(t("ERR_CANCELLED_BY_USER"))
+            if timed_out_flag.get("flag"):
+                _raise_timeout()
+
+            try:
+                cur.execute(stmt)
+            except (UserCancelledError, QueryTimeoutError):
+                raise
+            except Exception as exc:  # noqa: BLE001
+                raise DBAPIError(
+                    statement=stmt,
+                    params=None,
+                    orig=exc,
+                    connection_invalidated=False,
+                ) from exc
+
+            if cur.description is not None:
+                cols = [str(c[0]) for c in (cur.description or [])]
+                rows: list = []
+                while True:
+                    if cancel_event is not None and cancel_event.is_set():
+                        raise UserCancelledError(t("ERR_CANCELLED_BY_USER"))
+                    if timed_out_flag.get("flag"):
+                        _raise_timeout()
+                    try:
+                        chunk = cur.fetchmany(fetch_size)
+                    except Exception as exc:  # noqa: BLE001
+                        raise DBAPIError(
+                            statement=stmt,
+                            params=None,
+                            orig=exc,
+                            connection_invalidated=False,
+                        ) from exc
+                    if not chunk:
+                        break
+                    rows.extend(chunk)
+
+                last_cols = cols
+                last_rows = rows
+
+        try:
+            raw.commit()
+        except Exception:
+            pass
+
+        return last_rows, last_cols
+
+    finally:
+        try:
+            if cur is not None:
+                cur.close()
+        except Exception:
+            pass
+        try:
+            raw.close()
+        except Exception:
+            pass
+
+
+def _run_mssql_batch_fetch_last_select(
+    engine,
+    sql_query: str,
+    *,
+    timeout_seconds: int,
+    cancel_event: threading.Event | None,
+    timed_out_flag: dict,
+    dbapi_conn_holder: dict,
+) -> tuple[list, list]:
+    """
+    MSSQL: execute a multi-statement batch on one DBAPI cursor/session,
+    walk result sets with nextset() and return rows/columns from the LAST SELECT.
+
+    Returns: (rows, columns)
+    """
+    raw = engine.raw_connection()
+    cur = None
+    try:
+        cur = raw.cursor()
+        # Keep a cancellable object: prefer cursor.cancel() when available,
+        # otherwise use the underlying DBAPI connection.
+        dbapi_conn_holder["conn"] = (
+            cur if hasattr(cur, "cancel") else _dbapi_conn_from_raw_connection(raw)
+        )
+
+        try:
+            if hasattr(cur, "timeout"):
+                cur.timeout = max(0, int(timeout_seconds or 0))
+        except Exception:
+            pass
+
+        batch = "SET NOCOUNT ON;\n" + (sql_query or "")
+
+        if cancel_event is not None and cancel_event.is_set():
+            raise UserCancelledError(t("ERR_CANCELLED_BY_USER"))
+
+        try:
+            cur.execute(batch)
+        except (UserCancelledError, QueryTimeoutError):
+            raise
+        except Exception as exc:  # noqa: BLE001
+            # Wrap raw DBAPI errors so _run_query_to_rows keeps retry/timeout logic
+            raise DBAPIError(
+                statement=batch,
+                params=None,
+                orig=exc,
+                connection_invalidated=False,
+            ) from exc
+
+        last_rows: list = []
+        last_cols: list = []
+
+        while True:
+            if cancel_event is not None and cancel_event.is_set():
+                raise UserCancelledError(t("ERR_CANCELLED_BY_USER"))
+            if timed_out_flag.get("flag"):
+                raise QueryTimeoutError(
+                    t(
+                        "ERR_QUERY_TIMEOUT",
+                        minutes=max(
+                            1,
+                            int(
+                                math.ceil(
+                                    max(0, int(timeout_seconds or 0)) / 60
+                                )
+                            ),
+                        ),
+                    )
+                )
+
+            if cur.description is not None:
+                cols = [str(c[0]) for c in (cur.description or [])]
+                rows: list = []
+                fetch_size = 2000
+
+                while True:
+                    if cancel_event is not None and cancel_event.is_set():
+                        raise UserCancelledError(t("ERR_CANCELLED_BY_USER"))
+                    if timed_out_flag.get("flag"):
+                        raise QueryTimeoutError(
+                            t(
+                                "ERR_QUERY_TIMEOUT",
+                                minutes=max(
+                                    1,
+                                    int(
+                                        math.ceil(
+                                            max(0, int(timeout_seconds or 0)) / 60
+                                        )
+                                    ),
+                                ),
+                            )
+                        )
+                    try:
+                        chunk = cur.fetchmany(fetch_size)
+                    except (UserCancelledError, QueryTimeoutError):
+                        raise
+                    except Exception as exc:  # noqa: BLE001
+                        raise DBAPIError(
+                            statement=batch,
+                            params=None,
+                            orig=exc,
+                            connection_invalidated=False,
+                        ) from exc
+                    if not chunk:
+                        break
+                    rows.extend(chunk)
+
+                last_cols = cols
+                last_rows = rows
+
+            try:
+                has_next = cur.nextset()
+            except (UserCancelledError, QueryTimeoutError):
+                raise
+            except Exception as exc:  # noqa: BLE001
+                raise DBAPIError(
+                    statement=batch,
+                    params=None,
+                    orig=exc,
+                    connection_invalidated=False,
+                ) from exc
+
+            if not has_next:
+                break
+
+        try:
+            raw.commit()
+        except Exception:
+            pass
+
+        return last_rows, last_cols
+
+    finally:
+        try:
+            if cur is not None:
+                cur.close()
+        except Exception:
+            pass
+        try:
+            raw.close()
+        except Exception:
+            pass
+
+
+def _run_query_to_rows(
+    engine,
+    sql_query,
+    timeout_seconds: int = 0,
+    cancel_event: threading.Event | None = None,
+):
     """
     Execute SQL with retry/deadlock handling and return:
     rows, columns, sql_duration, sql_start.
+
+    timeout_seconds applies to the full DB phase (execute + fetch).
+    0 disables the timeout.
     """
     max_retries = 3
     last_exception = None
+    timeout_seconds = max(0, int(timeout_seconds or 0))
+    backend = _engine_backend_name(engine)
 
     for attempt in range(1, max_retries + 1):
+        done = None
+        timed_out = {"flag": False}
+        cancelled = {"flag": False}
+        dbapi_conn_holder = {"conn": None}
         try:
-            sql_start = time.perf_counter()
-            with engine.connect() as connection:
-                result = connection.execute(text(sql_query))
 
-                if result.returns_rows:
-                    rows = result.fetchall()
-                    columns = result.keys()
-                else:
-                    rows = []
-                    columns = []
+            def watchdog():
+                if timeout_seconds <= 0:
+                    return
+                if not done.wait(timeout_seconds):  # type: ignore[union-attr]
+                    timed_out["flag"] = True
+                    _cancel_db_operation(dbapi_conn_holder.get("conn"))
+
+            def canceller():
+                if cancel_event is None:
+                    return
+                cancel_event.wait()
+                cancelled["flag"] = True
+
+                while True:
+                    if done.wait(0.05):  # type: ignore[union-attr]
+                        return
+                    conn = dbapi_conn_holder.get("conn")
+                    if conn is not None:
+                        _cancel_db_operation(conn)
+                        return
+
+            done = threading.Event()
+            t_watchdog = threading.Thread(target=watchdog, daemon=True)
+            t_watchdog.start()
+            t_canceller = threading.Thread(target=canceller, daemon=True)
+            t_canceller.start()
+
+            sql_start = time.perf_counter()
+
+            if backend == "mssql":
+                rows, columns = _run_mssql_batch_fetch_last_select(
+                    engine,
+                    sql_query,
+                    timeout_seconds=timeout_seconds,
+                    cancel_event=cancel_event,
+                    timed_out_flag=timed_out,
+                    dbapi_conn_holder=dbapi_conn_holder,
+                )
+            elif backend in ("postgresql", "postgres", "mysql", "mariadb", "sqlite") and has_multiple_statements(
+                sql_query, backend
+            ):
+                rows, columns = _run_dbapi_batch_fetch_last_select(
+                    engine,
+                    sql_query,
+                    backend=backend,
+                    timeout_seconds=timeout_seconds,
+                    cancel_event=cancel_event,
+                    timed_out_flag=timed_out,
+                    dbapi_conn_holder=dbapi_conn_holder,
+                )
+            else:
+                with engine.connect() as connection:
+                    if cancel_event is not None and cancel_event.is_set():
+                        raise UserCancelledError(t("ERR_CANCELLED_BY_USER"))
+                    set_engine_db_timeout(engine, timeout_seconds)
+                    _apply_server_side_timeout_if_possible(
+                        backend, connection, timeout_seconds
+                    )
+                    dbapi_conn_holder["conn"] = _extract_dbapi_connection(connection)
+                    result = connection.execution_options(stream_results=True).execute(
+                        text(sql_query)
+                    )
+
+                    if result.returns_rows:
+                        rows = []
+                        columns = list(result.keys())
+                        fetch_size = 2000
+                        while True:
+                            if cancel_event is not None and cancel_event.is_set():
+                                raise UserCancelledError(t("ERR_CANCELLED_BY_USER"))
+                            chunk = result.fetchmany(fetch_size)
+                            if not chunk:
+                                break
+                            rows.extend(chunk)
+                            if timed_out["flag"]:
+                                raise QueryTimeoutError(
+                                    t(
+                                        "ERR_QUERY_TIMEOUT",
+                                        minutes=max(
+                                            1, int(math.ceil(timeout_seconds / 60))
+                                        ),
+                                    )
+                                )
+                    else:
+                        rows = []
+                        columns = []
             sql_end = time.perf_counter()
             sql_duration = sql_end - sql_start
 
@@ -3590,21 +5242,71 @@ def _run_query_to_rows(engine, sql_query):
             msg_lower = msg.lower()
             last_exception = e
 
+            if cancelled.get("flag"):
+                raise UserCancelledError(t("ERR_CANCELLED_BY_USER")) from e
+
+            if timed_out.get("flag"):
+                raise QueryTimeoutError(
+                    t(
+                        "ERR_QUERY_TIMEOUT",
+                        minutes=max(1, int(math.ceil(timeout_seconds / 60))),
+                    )
+                ) from e
+
+            if timeout_seconds > 0:
+                timeout_error_signatures = (
+                    # PostgreSQL
+                    "statement timeout",
+                    "canceling statement due to statement timeout",
+                    "query canceled",
+                    "query cancelled",
+                    "57014",
+                    # MySQL / MariaDB
+                    "max_execution_time",
+                    "maximum statement execution time exceeded",
+                    "query execution was interrupted",
+                    "execution time exceeded",
+                    # ODBC / SQL Server
+                    "query timeout",
+                    "timeout expired",
+                    "operation timed out",
+                    "hyt00",
+                    "hyt01",
+                )
+                if any(
+                    signature in msg_lower for signature in timeout_error_signatures
+                ):
+                    raise QueryTimeoutError(
+                        t(
+                            "ERR_QUERY_TIMEOUT",
+                            minutes=max(1, int(math.ceil(timeout_seconds / 60))),
+                        )
+                    ) from e
+
+            # Keep this as a safe superset (avoid regressions across backends).
             retryable_error_signatures = (
-                # SQL Server deadlocks/serialization failures (existing behavior)
+                # SQL Server
                 "1205",
+                "deadlock victim",
+                "lock request time out period exceeded",
+                # Generic / SQLSTATE-ish
                 "40001",
-                "deadlocked on lock",
-                # PostgreSQL messages for deadlocks/serialization failures
+                "serialization failure",
+                # PostgreSQL (common messages)
                 "deadlock detected",
                 "could not serialize access due to",
-                # MySQL messages for deadlocks/lock timeouts
+                "could not serialize access",
+                # MySQL / MariaDB (common messages / codes)
                 "1213",
                 "deadlock found when trying to get lock",
                 "lock wait timeout exceeded",
+                # Older SQL Server phrasing
+                "deadlocked on lock",
             )
 
-            if any(signature in msg_lower for signature in retryable_error_signatures) and attempt < max_retries:
+            if any(
+                signature in msg_lower for signature in retryable_error_signatures
+            ) and attempt < max_retries:
                 wait_seconds = 2 ** attempt
                 LOGGER.warning(
                     "Deadlock-like DBAPIError while executing SQL "
@@ -3617,38 +5319,73 @@ def _run_query_to_rows(engine, sql_query):
                 time.sleep(wait_seconds)
                 continue
 
-            LOGGER.exception(
-                "DBAPIError while executing SQL. Query:\n%s",
-                sql_query,
-            )
+            LOGGER.exception("DBAPIError while executing SQL. Query:\n%s", sql_query)
             raise
 
-        except Exception:
+        except (UserCancelledError, QueryTimeoutError) as e:
+            # Expected control-flow (user stop / timeout) -> do not log as "Unexpected error".
+            last_exception = e
+            if isinstance(e, UserCancelledError):
+                LOGGER.info(
+                    "SQL execution cancelled by user (attempt %s/%s).",
+                    attempt,
+                    max_retries,
+                )
+            else:
+                LOGGER.warning(
+                    "SQL execution timed out (timeout=%ss, attempt %s/%s).",
+                    int(timeout_seconds or 0),
+                    attempt,
+                    max_retries,
+                )
+            raise
+
+        except Exception:  # noqa: BLE001
             last_exception = sys.exc_info()[1]
             LOGGER.exception(
                 "Unexpected error while executing SQL. Query:\n%s",
                 sql_query,
             )
             raise
+        finally:
+            try:
+                if done is not None:
+                    done.set()
+            except Exception:
+                pass
 
     if last_exception:
         raise last_exception
+    raise RuntimeError("Unknown SQL execution error")
 
 
-def format_error_for_ui(exc: Exception, sql_query: str, max_chars: int = 2000) -> str:
+def format_error_for_ui(
+    exc: Exception,
+    sql_query: str,
+    sql_source_path: str | None = None,
+    max_chars: int = 2000,
+) -> str:
     """Log full error and return a shortened message for UI display."""
     # pełny traceback + SQL tylko do loga
     LOGGER.exception("Błąd podczas wykonywania zapytania SQL. Query:\n%s", sql_query)
 
-    full_tb = traceback.format_exc()
-    first_line = full_tb.strip().splitlines()[0] if full_tb else str(exc)
+    orig = getattr(exc, "orig", exc)
+    orig_s = str(orig).strip() if orig is not None else ""
+    first_line = (
+        f"{type(orig).__name__}: {orig_s.splitlines()[0]}"
+        if orig_s
+        else type(exc).__name__
+    )
 
-    # pierwsza linia komunikatu z bazy
-    db_msg_first_line = str(exc).splitlines()[0] if str(exc) else ""
+    # pierwsza linia komunikatu z bazy (preferuj exc.orig)
+    db_msg_first_line = orig_s.splitlines()[0] if orig_s else ""
 
-    # SQL w jednej linii + skrócenie
-    sql_one_line = " ".join(sql_query.split())
-    sql_preview = textwrap.shorten(sql_one_line, width=600, placeholder=" ...")
+    # SQL: preserve original formatting (no forced one-line flattening)
+    sql_preview = _sql_excerpt_preserve_lines(sql_query, max_chars=1200, max_lines=60)
+
+    src_line = ""
+    if sql_source_path:
+        src_line = f"{t('ERR_SQL_SOURCE')}\n{shorten_path(sql_source_path, max_len=220)}\n\n"
 
     hints: list[str] = []
     if isinstance(exc, PermissionError):
@@ -3669,6 +5406,7 @@ def format_error_for_ui(exc: Exception, sql_query: str, max_chars: int = 2000) -
     msg = (
         f"{first_line}\n\n"
         f"{t('ERR_DB_MESSAGE')}\n{db_msg_first_line}\n\n"
+        f"{src_line}"
         f"{t('ERR_SQL_PREVIEW')}\n{sql_preview}\n\n"
         f"{t('ERR_FULL_LOG')}"
     )
@@ -3682,9 +5420,176 @@ def format_error_for_ui(exc: Exception, sql_query: str, max_chars: int = 2000) -
     return msg
 
 
-def run_export(engine, sql_query, output_file_path, output_format, csv_profile=None):
+def _safe_remove(path: str) -> None:
+    try:
+        if path and os.path.exists(path):
+            os.remove(path)
+    except Exception:
+        pass
+
+
+def _csv_quoting_value(quoting_name: str):
+    mapping = {
+        "minimal": csv.QUOTE_MINIMAL,
+        "all": csv.QUOTE_ALL,
+        "nonnumeric": csv.QUOTE_NONNUMERIC,
+        "none": csv.QUOTE_NONE,
+    }
+    return mapping.get((quoting_name or "minimal").lower(), csv.QUOTE_MINIMAL)
+
+
+def _coerce_csv_value(value, *, decimal_sep: str, date_format: Optional[str]):
+    if value is None:
+        return ""
+    if isinstance(value, datetime):
+        return value.strftime(date_format) if date_format else value.isoformat(sep=" ")
+    try:
+        import datetime as _dt
+
+        if isinstance(value, _dt.date) and not isinstance(value, _dt.datetime):
+            return value.strftime(date_format) if date_format else value.isoformat()
+    except Exception:
+        pass
+
+    if isinstance(value, (float, decimal.Decimal)):
+        s = str(value)
+        if decimal_sep and decimal_sep != ".":
+            s = s.replace(".", decimal_sep)
+        return s
+
+    return str(value)
+
+
+def _export_rows_to_csv(
+    output_file_path: str,
+    columns: list,
+    rows: list,
+    profile: dict,
+    timeout_seconds: int,
+    cancel_event: threading.Event | None = None,
+) -> None:
+    deadline = _deadline(timeout_seconds)
+    profile = profile or DEFAULT_CSV_PROFILE
+
+    encoding = profile.get("encoding") or DEFAULT_CSV_PROFILE["encoding"]
+    delimiter = profile.get("delimiter") or DEFAULT_CSV_PROFILE["delimiter"]
+    delimiter_replacement = profile.get("delimiter_replacement", "")
+    quotechar = profile.get("quotechar") or DEFAULT_CSV_PROFILE["quotechar"]
+    quoting = _csv_quoting_value(profile.get("quoting") or DEFAULT_CSV_PROFILE["quoting"])
+    escapechar = profile.get("escapechar") or None
+    doublequote = bool(profile.get("doublequote", DEFAULT_CSV_PROFILE["doublequote"]))
+    lineterminator = (
+        profile.get("line_terminator")
+        or profile.get("lineterminator")
+        or DEFAULT_CSV_PROFILE["lineterminator"]
+    )
+    decimal_sep = profile.get("decimal") or DEFAULT_CSV_PROFILE["decimal"]
+    date_format = profile.get("date_format") or None
+
+    with open(output_file_path, "w", encoding=encoding, newline="") as f:
+        writer = csv.writer(
+            f,
+            delimiter=delimiter,
+            quotechar=quotechar,
+            quoting=quoting,
+            escapechar=escapechar,
+            doublequote=doublequote,
+            lineterminator=lineterminator,
+        )
+
+        writer.writerow([str(c) for c in (columns or [])])
+
+        for idx, row in enumerate(rows or [], start=1):
+            if idx % 100 == 0:
+                if cancel_event is not None and cancel_event.is_set():
+                    raise UserCancelledError(t("ERR_CANCELLED_BY_USER"))
+                _check_deadline(
+                    deadline,
+                    ExportTimeoutError,
+                    t(
+                        "ERR_EXPORT_TIMEOUT",
+                        minutes=max(1, int(math.ceil(timeout_seconds / 60))),
+                    ),
+                )
+
+            values = list(row)
+            if delimiter and delimiter_replacement:
+                values = [
+                    (v.replace(delimiter, delimiter_replacement) if isinstance(v, str) else v)
+                    for v in values
+                ]
+
+            writer.writerow(
+                [
+                    _coerce_csv_value(v, decimal_sep=decimal_sep, date_format=date_format)
+                    for v in values
+                ]
+            )
+
+    _check_deadline(
+        deadline,
+        ExportTimeoutError,
+        t("ERR_EXPORT_TIMEOUT", minutes=max(1, int(math.ceil(timeout_seconds / 60)))),
+    )
+
+
+def _export_rows_to_xlsx(
+    output_file_path: str,
+    columns: list,
+    rows: list,
+    timeout_seconds: int,
+    cancel_event: threading.Event | None = None,
+) -> None:
+    deadline = _deadline(timeout_seconds)
+
+    wb = Workbook(write_only=True)
+    ws = wb.create_sheet(title="Results")
+    ws.append([str(c) for c in (columns or [])])
+
+    for idx, row in enumerate(rows or [], start=1):
+        if idx % 100 == 0:
+            if cancel_event is not None and cancel_event.is_set():
+                raise UserCancelledError(t("ERR_CANCELLED_BY_USER"))
+            _check_deadline(
+                deadline,
+                ExportTimeoutError,
+                t(
+                    "ERR_EXPORT_TIMEOUT",
+                    minutes=max(1, int(math.ceil(timeout_seconds / 60))),
+                ),
+            )
+        ws.append(list(row))
+
+    try:
+        wb.save(output_file_path)
+    finally:
+        # Avoid leaving open zip/file handles (notably visible on Python 3.13 at shutdown).
+        try:
+            wb.close()
+        except Exception:
+            pass
+
+    _check_deadline(
+        deadline,
+        ExportTimeoutError,
+        t("ERR_EXPORT_TIMEOUT", minutes=max(1, int(math.ceil(timeout_seconds / 60)))),
+    )
+
+
+def run_export(
+    engine,
+    sql_query,
+    output_file_path,
+    output_format,
+    csv_profile=None,
+    *,
+    db_timeout_seconds: int = 0,
+    export_timeout_seconds: int = 0,
+):
     """Execute SQL, export the result, and return timing + row count details."""
-    rows, columns, sql_duration, sql_start = _run_query_to_rows(engine, sql_query)
+    rows, columns, sql_duration, sql_start = _run_query_to_rows(
+        engine, sql_query, timeout_seconds=db_timeout_seconds
+    )
     rows_count = len(rows)
     columns_count = len(columns)
     if output_format == "xlsx":
@@ -3700,27 +5605,27 @@ def run_export(engine, sql_query, output_file_path, output_format, csv_profile=N
 
     export_duration = 0.0
     if rows_count:
-        df = pd.DataFrame(rows, columns=columns)
-
         export_start = time.perf_counter()
-        if output_format == "xlsx":
-            df.to_excel(output_file_path, index=False)
-        else:
-            profile = csv_profile or DEFAULT_CSV_PROFILE
-            delimiter = profile.get("delimiter") or DEFAULT_CSV_PROFILE["delimiter"]
-            delimiter_replacement = profile.get("delimiter_replacement", "")
-
-            export_df = df
-            if delimiter and delimiter_replacement:
-                # Intentionally replace delimiters globally in all string values
-                # to match current CSV profile behaviour and avoid escaping.
-                export_df = df.applymap(
-                    lambda value: value.replace(delimiter, delimiter_replacement)
-                    if isinstance(value, str)
-                    else value
+        try:
+            if output_format == "xlsx":
+                _export_rows_to_xlsx(
+                    output_file_path,
+                    columns=list(columns),
+                    rows=rows,
+                    timeout_seconds=int(export_timeout_seconds or 0),
                 )
-
-            export_df.to_csv(output_file_path, index=False, **csv_profile_to_kwargs(profile))
+            else:
+                profile = csv_profile or DEFAULT_CSV_PROFILE
+                _export_rows_to_csv(
+                    output_file_path,
+                    columns=list(columns),
+                    rows=rows,
+                    profile=profile,
+                    timeout_seconds=int(export_timeout_seconds or 0),
+                )
+        except Exception:
+            _safe_remove(output_file_path)
+            raise
         export_end = time.perf_counter()
         export_duration = export_end - export_start
         total_duration = export_end - sql_start
@@ -3738,6 +5643,10 @@ def run_export_to_template(
     sheet_name,
     start_cell,
     include_header,
+    *,
+    db_timeout_seconds: int = 0,
+    export_timeout_seconds: int = 0,
+    cancel_event: Optional[threading.Event] = None,
 ):
     """
     Execute SQL, copy XLSX template and paste data into given sheet starting at start_cell.
@@ -3745,7 +5654,12 @@ def run_export_to_template(
     Returns the same tuple as run_export:
     (sql_duration, export_duration, total_duration, rows_count).
     """
-    rows, columns, sql_duration, sql_start = _run_query_to_rows(engine, sql_query)
+    rows, columns, sql_duration, sql_start = _run_query_to_rows(
+        engine,
+        sql_query,
+        timeout_seconds=db_timeout_seconds,
+        cancel_event=cancel_event,
+    )
     rows_count = len(rows)
     columns_count = len(columns)
 
@@ -3761,37 +5675,84 @@ def run_export_to_template(
     )
 
     export_start = time.perf_counter()
-    # Zawsze kopiujemy template, nawet jeśli nie ma wierszy z SQL
-    shutil.copyfile(template_path, output_file_path)
+    try:
+        # Zawsze kopiujemy template, nawet jeśli nie ma wierszy z SQL
+        shutil.copyfile(template_path, output_file_path)
 
-    if rows_count:
-        df = pd.DataFrame(rows, columns=columns)
+        wb = None
+        try:
+            if rows_count:
+                deadline = _deadline(int(export_timeout_seconds or 0))
+                wb = load_workbook(output_file_path)
+                if sheet_name not in wb.sheetnames:
+                    raise ValueError(t("ERR_TEMPLATE_MISSING_SHEET", sheet=sheet_name))
 
-        wb = load_workbook(output_file_path)
-        if sheet_name not in wb.sheetnames:
-            wb.close()
-            raise ValueError(
-                t("ERR_TEMPLATE_MISSING_SHEET", sheet=sheet_name)
-            )
+                ws = wb[sheet_name]
 
-        ws = wb[sheet_name]
+                data_start_row = start_row
+                if include_header:
+                    if cancel_event is not None and cancel_event.is_set():
+                        raise UserCancelledError(t("ERR_CANCELLED_BY_USER"))
+                    for c_offset, col_name in enumerate(list(columns)):
+                        if c_offset % 50 == 0:
+                            if cancel_event is not None and cancel_event.is_set():
+                                raise UserCancelledError(t("ERR_CANCELLED_BY_USER"))
+                            _check_deadline(
+                                deadline,
+                                ExportTimeoutError,
+                                t(
+                                    "ERR_EXPORT_TIMEOUT",
+                                    minutes=max(
+                                        1,
+                                        int(
+                                            math.ceil(
+                                                int(export_timeout_seconds or 0) / 60
+                                            )
+                                        ),
+                                    ),
+                                ),
+                            )
+                        cell = ws.cell(row=start_row, column=start_col + c_offset)
+                        cell.value = col_name
+                    data_start_row = start_row + 1
 
-        data_start_row = start_row
-        if include_header:
-            for c_offset, col_name in enumerate(df.columns):
-                cell = ws.cell(row=start_row, column=start_col + c_offset)
-                cell.value = col_name
-            data_start_row = start_row + 1
-
-        for r_offset, row in enumerate(df.itertuples(index=False)):
-            for c_offset, value in enumerate(row):
-                cell = ws.cell(
-                    row=data_start_row + r_offset,
-                    column=start_col + c_offset,
-                )
-                cell.value = value
-
-        wb.save(output_file_path)
+                for r_offset, row in enumerate(rows):
+                    if r_offset % 100 == 0:
+                        if cancel_event is not None and cancel_event.is_set():
+                            raise UserCancelledError(t("ERR_CANCELLED_BY_USER"))
+                        _check_deadline(
+                            deadline,
+                            ExportTimeoutError,
+                            t(
+                                "ERR_EXPORT_TIMEOUT",
+                                minutes=max(
+                                    1,
+                                    int(
+                                        math.ceil(
+                                            int(export_timeout_seconds or 0) / 60
+                                        )
+                                    ),
+                                ),
+                            ),
+                        )
+                    for c_offset, value in enumerate(list(row)):
+                        cell = ws.cell(
+                            row=data_start_row + r_offset,
+                            column=start_col + c_offset,
+                        )
+                        cell.value = value
+                if cancel_event is not None and cancel_event.is_set():
+                    raise UserCancelledError(t("ERR_CANCELLED_BY_USER"))
+                wb.save(output_file_path)
+        finally:
+            if wb is not None:
+                try:
+                    wb.close()
+                except Exception:
+                    pass
+    except Exception:
+        _safe_remove(output_file_path)
+        raise
 
     export_end = time.perf_counter()
     export_duration = export_end - export_start
@@ -3800,9 +5761,18 @@ def run_export_to_template(
     return sql_duration, export_duration, total_duration, rows_count
 
 
-def run_console(engine, output_directory, selected_connection, archive_sql: bool):
+def run_console(
+    engine,
+    output_directory,
+    selected_connection,
+    archive_sql: bool,
+    output_override: str | None = None,
+):
     sql_query_file_paths = load_query_paths()
     csv_config = load_csv_profiles()
+
+    db_timeout_seconds = load_persisted_db_timeout_seconds()
+    export_timeout_seconds = load_persisted_export_timeout_seconds()
 
     sql_query_file_path = None
     if sql_query_file_paths:
@@ -3909,23 +5879,34 @@ def run_console(engine, output_directory, selected_connection, archive_sql: bool
         content = file.read()
 
     sql_query = remove_bom(content).strip()
-    if selected_connection.get("type") == "mssql_odbc" and sql_query:
-        sql_query = (
-            "SET ARITHABORT ON;\n"
-            "SET NOCOUNT ON;\n"
-            "SET ANSI_WARNINGS OFF;\n"
-            + sql_query
-        )
 
     base_name = os.path.basename(sql_query_file_path)
     output_file_name = os.path.splitext(base_name)[0] + (".xlsx" if output_format == "xlsx" else ".csv")
-    output_file_path = os.path.join(output_directory, output_file_name)
+    output_file_path, _ = normalize_output_file_path(
+        output_directory=output_directory,
+        default_file_name=output_file_name,
+        output_format=output_format,
+        override_path=(output_override.strip() if output_override else None),
+        prefer_dir_for_extensionless_nonexistent=True,
+    )
 
     try:
         sql_dur, export_dur, total_dur, rows_count = run_export(
-            engine, sql_query, output_file_path, output_format, csv_profile=selected_csv_profile
+            engine,
+            sql_query,
+            output_file_path,
+            output_format,
+            csv_profile=selected_csv_profile,
+            db_timeout_seconds=db_timeout_seconds,
+            export_timeout_seconds=export_timeout_seconds,
         )
     except XlsxSizeError as exc:
+        print(str(exc))
+        return
+    except QueryTimeoutError as exc:
+        print(str(exc))
+        return
+    except ExportTimeoutError as exc:
         print(str(exc))
         return
 
@@ -3945,7 +5926,7 @@ def run_console(engine, output_directory, selected_connection, archive_sql: bool
                 connection_type=selected_connection.get("type", ""),
             )
         except Exception as exc:  # noqa: BLE001
-            LOGGER.warning("SQL archive failed: %s", exc, exc_info=exc)
+            LOGGER.warning("SQL archive failed: %s", exc, exc_info=True)
 
     if rows_count > 0:
         print(t("CONSOLE_SAVED_PATH", path=output_file_path))
@@ -4764,13 +6745,20 @@ def _build_and_test_connection_entry(
         with engine.connect() as connection:
             connection.execute(text("SELECT 1"))
     except Exception as exc:  # noqa: BLE001
+        if isinstance(exc, PasswordRequiredError):
+            messagebox.showwarning(
+                t("ERR_PASSWORD_REQUIRED_TITLE"),
+                t("ERR_PASSWORD_REQUIRED_BODY", name=exc.name or name),
+                parent=parent,
+            )
+            return None
         if handle_db_driver_error(exc, conn_type, name):
             return None
         LOGGER.exception(
             "Connection creation failed for %s (%s)",
             name,
             conn_type,
-            exc_info=exc,
+            exc_info=True,
         )
         title, msg = _format_connection_error(
             conn_type=conn_type,
@@ -5797,7 +7785,9 @@ def run_gui(connection_store, output_directory):
         "combobox": None,
     }
 
+    _dbg("run_gui(): start")
     root = tk.Tk()
+    _dbg("run_gui(): Tk root created")
     root.title(f"{t('APP_TITLE_FULL')} {get_app_version_label()}")
     apply_app_icon(root)
     apply_native_ttk_theme(root)
@@ -5807,6 +7797,7 @@ def run_gui(connection_store, output_directory):
     format_var = tk.StringVar(value="xlsx")
     selected_csv_profile_var = tk.StringVar(value="")
     default_csv_label_var = tk.StringVar(value="")
+    save_as_path_var = tk.StringVar(value="")
     result_info_var = tk.StringVar(value="")
     last_output_path = {"path": None}
     engine_holder = {"engine": None}
@@ -5817,6 +7808,8 @@ def run_gui(connection_store, output_directory):
     connection_status_state = {"key": None, "params": {}}
     secure_edit_state = {"button": None}
     start_button_holder = {"widget": None}
+    cancel_state = {"event": None}
+    close_state = {"after_cancel": False}
     error_display = {"widget": None}
     selected_connection_var = tk.StringVar(
         value=connections_state["store"].get("last_selected") or ""
@@ -5826,7 +7819,19 @@ def run_gui(connection_store, output_directory):
         value=_CURRENT_LANG.upper()
     )
     archive_sql_var = tk.BooleanVar(value=load_persisted_archive_sql())
-    ui_config = load_ui_config(Path(BASE_DIR))
+    db_timeout_min_var = tk.IntVar(value=int(load_persisted_db_timeout_seconds() / 60))
+    export_timeout_min_var = tk.IntVar(
+        value=int(load_persisted_export_timeout_seconds() / 60)
+    )
+    ui_config = load_ui_config(Path(DATA_DIR))
+    _show_data_dir_notice_once(
+        root,
+        ui_config,
+        lambda cfg: save_ui_config(Path(DATA_DIR), cfg),
+        data_dir=DATA_DIR,
+        base_dir=BASE_DIR,
+        lang=(lang_var.get() or "").lower(),
+    )
     sql_highlight_enabled = bool(
         (ui_config.get("ui") or {}).get("sql_highlight_enabled", False)
     )
@@ -5855,15 +7860,25 @@ def run_gui(connection_store, output_directory):
         try:
             persist_archive_sql(bool(archive_sql_var.get()))
         except Exception as exc:  # noqa: BLE001
-            LOGGER.warning("Persist archive_sql failed: %s", exc, exc_info=exc)
+            LOGGER.warning("Persist archive_sql failed: %s", exc, exc_info=True)
+
+    def persist_timeouts_from_ui():  # noqa: ANN001
+        """Persist GUI timeout fields into app config (minutes -> seconds)."""
+        try:
+            db_seconds = max(0, int(db_timeout_min_var.get() or 0)) * 60
+            export_seconds = max(0, int(export_timeout_min_var.get() or 0)) * 60
+            persist_db_timeout_seconds(db_seconds)
+            persist_export_timeout_seconds(export_seconds)
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning("Persist timeouts failed: %s", exc, exc_info=True)
 
     def _sql_highlight_available() -> bool:
         return CodeView is not None and bool(SQL_LEXER_CLASSES)
 
     def persist_sql_highlight_setting(enabled: bool) -> None:
-        config = load_ui_config(Path(BASE_DIR))
+        config = load_ui_config(Path(DATA_DIR))
         config.setdefault("ui", {})["sql_highlight_enabled"] = bool(enabled)
-        save_ui_config(Path(BASE_DIR), config)
+        save_ui_config(Path(DATA_DIR), config)
 
     def reset_sql_dialect_for_connection(conn_type: str) -> None:
         sql_dialect_var.set(_dialect_from_db_kind(conn_type))
@@ -5987,12 +8002,17 @@ def run_gui(connection_store, output_directory):
         # MSSQL trusted auth: no password prompt
         if conn_type == "mssql_odbc" and bool(details.get("trusted")):
             url = _build_runtime_url(conn_type, details, None)
-            return create_engine(url, **engine_kwargs)
+            engine = create_engine(url, **engine_kwargs)
+            _ensure_engine_mssql_set_hook(engine)
+            return engine
 
         stored_pwd = str(details.get("password") or "")
         if stored_pwd:
             url = _build_runtime_url(conn_type, details, stored_pwd)
-            return create_engine(url, **engine_kwargs)
+            engine = create_engine(url, **engine_kwargs)
+            if conn_type == "mssql_odbc":
+                _ensure_engine_mssql_set_hook(engine)
+            return engine
 
         # Not stored -> use cache or prompt once per session
         cache_key = _password_cache_key(entry)
@@ -6005,12 +8025,15 @@ def run_gui(connection_store, output_directory):
                 parent=parent or root,
             )
             if pwd is None or not str(pwd):
-                raise ValueError("Password required.")
+                raise PasswordRequiredError(name=name, conn_type=conn_type)
             cached = str(pwd)
             password_cache[cache_key] = cached
 
         url = _build_runtime_url(conn_type, details, cached)
-        return create_engine(url, **engine_kwargs)
+        engine = create_engine(url, **engine_kwargs)
+        if conn_type == "mssql_odbc":
+            _ensure_engine_mssql_set_hook(engine)
+        return engine
 
     def apply_selected_connection(show_success=False):
         conn = get_connection_by_name(selected_connection_var.get())
@@ -6025,6 +8048,13 @@ def run_gui(connection_store, output_directory):
                 connection.execute(text("SELECT 1"))
             apply_engine(engine)
         except Exception as exc:  # noqa: BLE001
+            if isinstance(exc, PasswordRequiredError):
+                set_connection_status(connected=False, key="STATUS_PASSWORD_REQUIRED")
+                messagebox.showwarning(
+                    t("ERR_PASSWORD_REQUIRED_TITLE"),
+                    t("ERR_PASSWORD_REQUIRED_BODY", name=exc.name or conn.get("name", "")),
+                )
+                return
             set_connection_status(connected=False, key="STATUS_CONNECTION_ERROR")
             if handle_db_driver_error(exc, conn.get("type"), conn.get("name")):
                 return
@@ -6032,7 +8062,7 @@ def run_gui(connection_store, output_directory):
                 "Connection test failed for %s (%s)",
                 conn.get("name"),
                 conn.get("type"),
-                exc_info=exc,
+                exc_info=True,
             )
             title, msg = _format_connection_error(
                 conn_type=str(conn.get("type") or ""),
@@ -6065,7 +8095,36 @@ def run_gui(connection_store, output_directory):
             widget.see(tk.END)
         widget.config(state="disabled")
 
-    def show_error_popup(ui_msg):
+    def request_cancel():
+        ev = cancel_state.get("event")
+        if ev and not ev.is_set():
+            ev.set()
+            result_info_var.set(t("MSG_CANCEL_REQUESTED"))
+            btn_cancel.config(state=tk.DISABLED)
+
+    def on_close():  # noqa: ANN001
+        ev = cancel_state.get("event")
+        if ev is not None and not ev.is_set():
+            if messagebox.askyesno(
+                t("WARN_TITLE"),
+                t("MSG_CONFIRM_CANCEL_AND_EXIT"),
+            ):
+                close_state["after_cancel"] = True
+                ev.set()
+                result_info_var.set(t("MSG_CANCEL_REQUESTED"))
+                try:
+                    btn_cancel.config(state=tk.DISABLED)
+                except Exception:  # noqa: BLE001
+                    pass
+            return
+
+        # If user confirmed "Cancel+Exit" and cancel is already in progress,
+        # ignore subsequent WM_DELETE requests; _reset_run_state() will close.
+        if ev is not None and ev.is_set() and close_state.get("after_cancel"):
+            return
+        root.destroy()
+
+    def show_error_popup(ui_msg, *, sql_query: str | None = None, sql_source_path: str | None = None):
         # --- helper: split the rendered error into nicer sections (best-effort) ---
         def _split_error_ui_msg(msg: str) -> dict:
             db_lbl = t("ERR_DB_MESSAGE")
@@ -6129,6 +8188,15 @@ def run_gui(connection_store, output_directory):
             }
 
         parts = _split_error_ui_msg(ui_msg)
+
+        sql_tab_text = parts.get("sql", "") or ""
+        if sql_query:
+            src = (sql_source_path or "").strip()
+            header = ""
+            if src:
+                header = f"{t('ERR_SQL_SOURCE')}\n{src}\n\n"
+            sql_tab_text = header + (sql_query.rstrip() + "\n")
+        sql_tab_text = _limit_text_for_widget(sql_tab_text, max_chars=80000)
 
         popup = tk.Toplevel(root)
         apply_app_icon(popup)
@@ -6200,9 +8268,9 @@ def run_gui(connection_store, output_directory):
             nb.add(frame, text=name)
             return txt
 
-        summary_txt = _make_text_tab("Summary", parts.get("summary", ""), wrap="word")
-        sql_txt = _make_text_tab("SQL", parts.get("sql", ""), wrap="none")
-        full_txt = _make_text_tab("Details", parts.get("full", ""), wrap="none")
+        summary_txt = _make_text_tab(t("ERR_TAB_SUMMARY"), parts.get("summary", ""), wrap="word")
+        sql_txt = _make_text_tab(t("ERR_TAB_SQL"), sql_tab_text, wrap="none")
+        full_txt = _make_text_tab(t("ERR_TAB_DETAILS"), parts.get("full", ""), wrap="none")
 
         # Buttons
         btns = ttk.Frame(popup, padding=(12, 0, 12, 12))
@@ -6217,13 +8285,25 @@ def run_gui(connection_store, output_directory):
             _copy_to_clipboard(parts.get("summary", ""))
 
         def copy_sql():
-            _copy_to_clipboard(parts.get("sql", ""))
+            if sql_query:
+                _copy_to_clipboard(sql_query)
+            else:
+                _copy_to_clipboard(parts.get("sql", ""))
 
         def copy_all():
             _copy_to_clipboard(ui_msg)
 
+        def open_sql_file():
+            src = (sql_source_path or "").strip()
+            if not src or src.startswith("<pasted:"):
+                return
+            if not os.path.exists(src):
+                messagebox.showwarning(t("WARN_TITLE"), f"{t('ERR_FILE_PATH', path=src)}")
+                return
+            _open_path(src)
+
         def open_log():
-            log_path = os.path.join(BASE_DIR, "logs", "kkr-query2xlsx.log")
+            log_path = LOG_FILE_PATH or ""
             if not os.path.exists(log_path):
                 messagebox.showwarning(t("WARN_TITLE"), f"{t('ERR_FILE_PATH', path=log_path)}")
                 return
@@ -6240,10 +8320,16 @@ def run_gui(connection_store, output_directory):
         left = ttk.Frame(btns)
         left.grid(row=0, column=0, sticky="w")
 
-        ttk.Button(left, text="Copy summary", command=copy_summary).pack(side="left", padx=(0, 8))
-        ttk.Button(left, text="Copy SQL", command=copy_sql).pack(side="left", padx=(0, 8))
-        ttk.Button(left, text="Copy all", command=copy_all).pack(side="left", padx=(0, 8))
-        ttk.Button(left, text="Open log", command=open_log).pack(side="left")
+        ttk.Button(left, text=t("BTN_COPY_SUMMARY"), command=copy_summary).pack(side="left", padx=(0, 8))
+        ttk.Button(left, text=t("BTN_COPY_SQL"), command=copy_sql).pack(side="left", padx=(0, 8))
+        ttk.Button(left, text=t("BTN_COPY_ALL"), command=copy_all).pack(side="left", padx=(0, 8))
+        btn_open_sql = ttk.Button(left, text=t("BTN_OPEN_SQL"), command=open_sql_file)
+        btn_open_sql.pack(side="left", padx=(0, 8))
+        ttk.Button(left, text=t("BTN_OPEN_LOG"), command=open_log).pack(side="left")
+
+        src_for_btn = (sql_source_path or "").strip()
+        if (not src_for_btn) or src_for_btn.startswith("<pasted:") or (not os.path.exists(src_for_btn)):
+            btn_open_sql.state(["disabled"])
 
         right = ttk.Frame(btns)
         right.grid(row=0, column=1, sticky="e")
@@ -6633,6 +8719,7 @@ def run_gui(connection_store, output_directory):
         options_frame = tk.Frame(dlg)
         options_frame.grid(row=3, column=0, sticky="we", padx=12)
         options_frame.columnconfigure(2, weight=1)
+        chk_sql_highlight = None
 
         def update_dialect_controls_state():
             combo_state = "readonly" if sql_highlight_var.get() else "disabled"
@@ -6655,20 +8742,7 @@ def run_gui(connection_store, output_directory):
             editor_container.columnconfigure(0, weight=1)
             editor_container.rowconfigure(0, weight=1)
 
-            if sql_highlight_var.get() and _sql_highlight_available():
-                lexer_cls = (
-                    SQL_LEXER_CLASSES.get(sql_dialect_var.get())
-                    or SQL_LEXER_CLASSES.get("SQLite")
-                )
-                sql_widget = CodeView(  # type: ignore[call-arg]
-                    editor_container,
-                    lexer=lexer_cls,
-                    wrap="none",
-                    height=10,
-                )
-                sql_widget.grid(row=0, column=0, sticky="nsew")
-                _apply_codeview_pygments_style(sql_widget, "vs")
-            else:
+            def _build_plain_editor() -> tk.Text:
                 sql_widget = tk.Text(editor_container, wrap="none", height=10)
 
                 y_scroll = ttk.Scrollbar(
@@ -6684,6 +8758,41 @@ def run_gui(connection_store, output_directory):
                 sql_widget.grid(row=0, column=0, sticky="nsew")
                 y_scroll.grid(row=0, column=1, sticky="ns")
                 x_scroll.grid(row=1, column=0, sticky="we")
+                return sql_widget
+
+            if sql_highlight_var.get() and _sql_highlight_available():
+                try:
+                    lexer_cls = (
+                        SQL_LEXER_CLASSES.get(sql_dialect_var.get())
+                        or SQL_LEXER_CLASSES.get("SQLite")
+                    )
+                    sql_widget = CodeView(  # type: ignore[call-arg]
+                        editor_container,
+                        lexer=lexer_cls,
+                        wrap="none",
+                        height=10,
+                    )
+                    sql_widget.grid(row=0, column=0, sticky="nsew")
+                    _apply_codeview_pygments_style(sql_widget, "vs")
+                except Exception as exc:  # noqa: BLE001
+                    LOGGER.warning(
+                        "SQL highlighting failed; falling back to plain editor: %s",
+                        exc,
+                        exc_info=True,
+                    )
+                    messagebox.showinfo(
+                        t("INFO_SQL_HIGHLIGHT_TITLE"),
+                        t("INFO_SQL_HIGHLIGHT_BODY"),
+                        parent=dlg,
+                    )
+                    sql_highlight_var.set(False)
+                    persist_sql_highlight_setting(False)
+                    update_dialect_controls_state()
+                    if chk_sql_highlight is not None:
+                        chk_sql_highlight.config(state=tk.DISABLED)
+                    sql_widget = _build_plain_editor()
+            else:
+                sql_widget = _build_plain_editor()
 
             if current_text:
                 sql_widget.insert("1.0", current_text)
@@ -6790,6 +8899,8 @@ def run_gui(connection_store, output_directory):
 
     def update_template_controls_state():
         enabled = use_template_var.get()
+        tpl_path = (template_path_var.get() or "").strip()
+        tpl_ok = enabled and tpl_path and Path(tpl_path).exists()
 
         choose_btn = template_state.get("choose_button")
         if choose_btn is not None:
@@ -6798,7 +8909,7 @@ def run_gui(connection_store, output_directory):
 
         sheet_combo = template_state.get("sheet_combobox")
         if sheet_combo is not None:
-            sheet_state = "readonly" if enabled else "disabled"
+            sheet_state = "readonly" if tpl_ok else "disabled"
             sheet_combo.config(state=sheet_state)
 
         start_cell_entry = template_state.get("start_cell_entry")
@@ -6810,6 +8921,36 @@ def run_gui(connection_store, output_directory):
         if include_header_check is not None:
             include_header_state = tk.NORMAL if enabled else tk.DISABLED
             include_header_check.config(state=include_header_state)
+
+    def _refresh_template_ui() -> None:
+        use_tpl = bool(use_template_var.get())
+        tpl_path = (template_path_var.get() or "").strip()
+        tpl_ok = use_tpl and tpl_path and Path(tpl_path).exists()
+
+        sheet_combo = template_state.get("sheet_combobox")
+        if sheet_combo is None:
+            return
+
+        if not tpl_ok:
+            sheet_combo.configure(state="disabled", values=[])
+            sheet_name_var.set("")
+            return
+
+        sheetnames = _xlsx_get_sheetnames(tpl_path)
+        sheet_combo.configure(values=sheetnames)
+
+        if not sheetnames:
+            sheet_combo.configure(state="disabled")
+            sheet_name_var.set("")
+            return
+
+        sheet_combo.configure(state="readonly")
+
+        current = (sheet_name_var.get() or "").strip()
+        if current and current in sheetnames:
+            return
+
+        sheet_name_var.set(_pick_default_sheet(sheetnames))
 
     def update_csv_profile_controls_state():
         enabled = format_var.get() == "csv"
@@ -6831,6 +8972,25 @@ def run_gui(connection_store, output_directory):
 
         update_template_controls_state()
         update_csv_profile_controls_state()
+        _refresh_template_ui()
+
+    def _sync_save_as_extension(show_info: bool = False) -> None:
+        raw = (save_as_path_var.get() or "").strip()
+        if not raw:
+            return
+        if _looks_like_directory(raw):
+            return
+        expected_ext = _expected_output_extension(format_var.get())
+        root, ext = os.path.splitext(raw)
+        if ext.lower() == expected_ext:
+            return
+        adjusted_path = root + expected_ext
+        save_as_path_var.set(adjusted_path)
+        if show_info and ext:
+            messagebox.showinfo(
+                t("INFO_SAVE_AS_EXT_FIXED_TITLE"),
+                t("INFO_SAVE_AS_EXT_FIXED_BODY", path=resolve_path(adjusted_path)),
+            )
 
     def on_format_change(*_):
         """Keep template option consistent with selected output format."""
@@ -6839,6 +8999,7 @@ def run_gui(connection_store, output_directory):
 
         update_template_controls_state()
         update_csv_profile_controls_state()
+        _sync_save_as_extension(show_info=False)
 
     def choose_template_file():
         path = filedialog.askopenfilename(
@@ -6852,32 +9013,36 @@ def run_gui(connection_store, output_directory):
         template_label_var.set(shorten_path(path))
         use_template_var.set(True)
         on_toggle_template()
+        _refresh_template_ui()
+        _show_template_naming_hint_once(
+            root,
+            ui_config,
+            lambda cfg: save_ui_config(Path(DATA_DIR), cfg),
+            sql_path=selected_sql_path_full.get() or None,
+            template_path=template_path_var.get(),
+        )
 
-        wb = None
-        try:
-            wb = load_workbook(path, read_only=True)
-            sheetnames = wb.sheetnames
-        except Exception as e:  # noqa: BLE001
-            messagebox.showerror(
-                t("ERR_TEMPLATE_TITLE"),
-                t("ERR_TEMPLATE_SHEETS", error=e),
-            )
-            sheetnames = []
-        finally:
-            try:
-                if wb is not None:
-                    wb.close()
-            except Exception:
-                pass
+    def choose_save_as_path():
+        output_format = format_var.get()
+        default_ext = _expected_output_extension(output_format)
+        filetypes = (
+            [(t("FILETYPE_CSV"), "*.csv"), (t("FILETYPE_ALL"), "*.*")]
+            if output_format == "csv"
+            else [(t("FILETYPE_EXCEL"), "*.xlsx"), (t("FILETYPE_ALL"), "*.*")]
+        )
+        path = filedialog.asksaveasfilename(
+            title=t("BTN_SAVE_AS"),
+            defaultextension=default_ext,
+            initialdir=output_directory,
+            filetypes=filetypes,
+        )
+        if not path:
+            return
+        save_as_path_var.set(path)
+        _sync_save_as_extension(show_info=True)
 
-        combo = template_state.get("sheet_combobox")
-        if combo is not None:
-            combo["values"] = sheetnames
-
-        if sheetnames:
-            sheet_name_var.set(sheetnames[0])
-        else:
-            sheet_name_var.set("")
+    def clear_save_as_path():
+        save_as_path_var.set("")
 
     def refresh_csv_profile_controls(selected_name=None):
         config = csv_profile_state.get("config", {"profiles": []})
@@ -7279,12 +9444,6 @@ def run_gui(connection_store, output_directory):
             )
             return None
 
-        if current_connection.get("type") == "mssql_odbc" and sql_query:
-            sql_query = (
-                "SET ARITHABORT ON;\nSET NOCOUNT ON;\nSET ANSI_WARNINGS OFF;\n"
-                + sql_query
-            )
-
         output_format = format_var.get()
         use_template = use_template_var.get()
 
@@ -7318,7 +9477,23 @@ def run_gui(connection_store, output_directory):
                 output_file_name = f"{base_name}.xlsx"
             else:
                 output_file_name = os.path.splitext(base_name)[0] + ".xlsx"
-            output_file_path = os.path.join(output_directory, output_file_name)
+            output_override = (save_as_path_var.get() or "").strip()
+            output_file_path, ext_mismatch = normalize_output_file_path(
+                output_directory=output_directory,
+                default_file_name=output_file_name,
+                output_format=output_format,
+                override_path=(output_override or None),
+            )
+            if (
+                ext_mismatch
+                and output_override
+                and not _looks_like_directory(output_override)
+            ):
+                messagebox.showinfo(
+                    t("INFO_SAVE_AS_EXT_FIXED_TITLE"),
+                    t("INFO_SAVE_AS_EXT_FIXED_BODY", path=output_file_path),
+                )
+                save_as_path_var.set(output_file_path)
 
             return {
                 "engine": engine,
@@ -7345,7 +9520,23 @@ def run_gui(connection_store, output_directory):
             output_file_name = os.path.splitext(base_name)[0] + (
                 ".xlsx" if output_format == "xlsx" else ".csv"
             )
-        output_file_path = os.path.join(output_directory, output_file_name)
+        output_override = (save_as_path_var.get() or "").strip()
+        output_file_path, ext_mismatch = normalize_output_file_path(
+            output_directory=output_directory,
+            default_file_name=output_file_name,
+            output_format=output_format,
+            override_path=(output_override or None),
+        )
+        if (
+            ext_mismatch
+            and output_override
+            and not _looks_like_directory(output_override)
+        ):
+            messagebox.showinfo(
+                t("INFO_SAVE_AS_EXT_FIXED_TITLE"),
+                t("INFO_SAVE_AS_EXT_FIXED_BODY", path=output_file_path),
+            )
+            save_as_path_var.set(output_file_path)
 
         return {
             "engine": engine,
@@ -7360,45 +9551,126 @@ def run_gui(connection_store, output_directory):
             "use_template": False,
         }
 
+    def _reset_run_state():
+        cancel_state["event"] = None
+        try:
+            btn_cancel.config(state=tk.DISABLED)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            btn_cancel.grid()
+            lbl_export_info.grid()
+            lbl_export_info_value.grid()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            btn_start.config(state=tk.NORMAL)
+        except Exception:  # noqa: BLE001
+            pass
+        if close_state.get("after_cancel"):
+            root.after(0, root.destroy)
+
+
     def run_export_gui():
         sql_query = ""
-        params = None
-
+        params: dict | None = None
+        db_timeout_seconds = 0
+        export_timeout_seconds = 0
+    
         try:
             params = _build_export_params()
             if not params:
                 return
-
-            result_info_var.set(t("MSG_RUNNING"))
-            btn_start.config(state=tk.DISABLED)
-            root.update_idletasks()
-
-            sql_query = params["sql_query"]
-            output_format = params["output_format"]
-            csv_profile = params.get("csv_profile")
-
-            if params.get("use_template"):
-                template = params["template"]
-                sql_dur, export_dur, total_dur, rows_count = run_export_to_template(
-                    params["engine"],
-                    sql_query,
-                    template_path=template["template_path"],
-                    output_file_path=params["output_file_path"],
-                    sheet_name=template["sheet_name"],
-                    start_cell=template["start_cell"],
-                    include_header=template["include_header"],
-                )
+    
+            sql_query = params.get("sql_query", "") or ""
+            db_timeout_seconds = max(0, int(db_timeout_min_var.get() or 0)) * 60
+            export_timeout_seconds = max(0, int(export_timeout_min_var.get() or 0)) * 60
+        except Exception as exc:  # noqa: BLE001
+            sql_src = (params or {}).get("sql_source_path", "") if isinstance(params, dict) else ""
+            ui_msg = format_error_for_ui(
+                exc,
+                sql_query,
+                sql_source_path=sql_src,
+            )
+            result_info_var.set(t("ERR_EXPORT"))
+            update_error_display(ui_msg)
+            show_error_popup(
+                ui_msg,
+                sql_query=sql_query,
+                sql_source_path=sql_src,
+            )
+            try:
+                btn_start.config(state=tk.NORMAL)
+            except Exception:
+                pass
+            return
+    
+        try:
+            persist_db_timeout_seconds(db_timeout_seconds)
+            persist_export_timeout_seconds(export_timeout_seconds)
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning("Persist timeouts failed: %s", exc, exc_info=True)
+    
+        result_info_var.set(t("MSG_RUNNING"))
+        cancel_state["event"] = threading.Event()
+        btn_cancel.config(state=tk.NORMAL)
+        try:
+            btn_cancel.grid_remove()
+            lbl_export_info.grid_remove()
+            lbl_export_info_value.grid_remove()
+        except Exception:  # noqa: BLE001
+            pass
+        btn_start.config(state=tk.DISABLED)
+        root.update_idletasks()
+    
+        output_format = params["output_format"]
+        csv_profile = params.get("csv_profile")
+    
+        def _handle_export_error(exc: Exception):
+            if isinstance(exc, XlsxSizeError):
+                msg = str(exc)
+                result_info_var.set(msg)
+                update_error_display("")
+                messagebox.showwarning(t("WARN_TITLE"), msg)
+            elif isinstance(exc, QueryTimeoutError):
+                msg = str(exc)
+                result_info_var.set(msg)
+                update_error_display("")
+                messagebox.showwarning(t("WARN_TITLE"), msg)
+            elif isinstance(exc, ExportTimeoutError):
+                msg = str(exc)
+                result_info_var.set(msg)
+                update_error_display("")
+                messagebox.showwarning(t("WARN_TITLE"), msg)
+            elif isinstance(exc, UserCancelledError):
+                msg = str(exc)
+                result_info_var.set(msg)
+                update_error_display("")
+                if not close_state.get("after_cancel"):
+                    messagebox.showinfo(t("WARN_TITLE"), msg)
             else:
-                sql_dur, export_dur, total_dur, rows_count = run_export(
-                    params["engine"],
+                ui_msg = format_error_for_ui(
+                    exc,
                     sql_query,
-                    params["output_file_path"],
-                    output_format,
-                    csv_profile=csv_profile,
+                    sql_source_path=params.get("sql_source_path", ""),
                 )
-
+                result_info_var.set(t("ERR_EXPORT"))
+                update_error_display(ui_msg)
+                show_error_popup(
+                    ui_msg,
+                    sql_query=sql_query,
+                    sql_source_path=params.get("sql_source_path", ""),
+                )
+            _reset_run_state()
+    
+        def _handle_export_success(result: dict):
+            sql_dur = result["sql_duration"]
+            export_dur = result["export_duration"]
+            total_dur = result["total_duration"]
+            rows_count = result["rows_count"]
+    
             last_output_path["path"] = params["output_file_path"]
-
+    
             if archive_sql_var.get():
                 try:
                     write_sql_archive_entry(
@@ -7415,8 +9687,8 @@ def run_gui(connection_store, output_directory):
                         connection_type=params.get("connection_type", ""),
                     )
                 except Exception as exc:  # noqa: BLE001
-                    LOGGER.warning("SQL archive failed: %s", exc, exc_info=exc)
-
+                    LOGGER.warning("SQL archive failed: %s", exc, exc_info=True)
+    
             if output_format == "csv" and csv_profile:
                 prof_name = (csv_profile.get("name") or "").strip()
                 if prof_name:
@@ -7425,47 +9697,232 @@ def run_gui(connection_store, output_directory):
                         csv_profile_state["config"],
                     )
                     refresh_csv_profile_controls(prof_name)
-
+    
             if rows_count > 0:
+                safe_sql_dur = _coerce_seconds(sql_dur)
+                safe_export_dur = _coerce_seconds(export_dur)
+                safe_total_dur = _coerce_seconds(total_dur)
                 msg = t(
                     "MSG_SAVED_DETAILS",
                     path=params["output_file_path"],
                     rows=rows_count,
-                    sql_time=sql_dur,
-                    export_time=export_dur,
-                    total_time=total_dur,
+                    sql_time=safe_sql_dur,
+                    sql_time_hms=_fmt_hms(safe_sql_dur),
+                    export_time=safe_export_dur,
+                    export_time_hms=_fmt_hms(safe_export_dur),
+                    total_time=safe_total_dur,
+                    total_time_hms=_fmt_hms(safe_total_dur),
                 )
                 if output_format == "csv" and csv_profile:
-                    msg += "\n" + t(
-                        "MSG_SAVED_DETAILS_CSV",
-                        profile=csv_profile.get("name", ""),
-                    )
+                    msg += "\n" + t("MSG_SAVED_DETAILS_CSV", profile=csv_profile.get("name", ""))
             else:
-                msg = t("MSG_NO_ROWS", sql_time=sql_dur)
+                safe_sql_dur = _coerce_seconds(sql_dur)
+                msg = t(
+                    "MSG_NO_ROWS",
+                    sql_time=safe_sql_dur,
+                    sql_time_hms=_fmt_hms(safe_sql_dur),
+                )
                 if output_format == "csv" and csv_profile:
-                    msg += "\n" + t(
-                        "MSG_SAVED_DETAILS_CSV",
-                        profile=csv_profile.get("name", ""),
-                    )
-
+                    msg += "\n" + t("MSG_SAVED_DETAILS_CSV", profile=csv_profile.get("name", ""))
+    
             result_info_var.set(msg)
             messagebox.showinfo(t("MSG_DONE"), msg)
             btn_open_file.config(state=tk.NORMAL)
             btn_open_folder.config(state=tk.NORMAL)
             update_error_display("")
-
-        except XlsxSizeError as exc:
-            msg = str(exc)
-            result_info_var.set(msg)
-            update_error_display("")
-            messagebox.showwarning(t("WARN_TITLE"), msg)
-        except Exception as exc:  # noqa: BLE001
-            ui_msg = format_error_for_ui(exc, sql_query)
-            result_info_var.set(t("ERR_EXPORT"))
-            update_error_display(ui_msg)
-            show_error_popup(ui_msg)
-        finally:
-            btn_start.config(state=tk.NORMAL)
+            _reset_run_state()
+    
+        def _run_export_in_background(work_fn):
+            q = queue.Queue()
+            progress = ExportProgressWindow(
+                root,
+                title=t("PROGRESS_TITLE"),
+                on_stop=request_cancel,
+            )
+            progress.win.after(0, lambda: _center_toplevel_on_parent(progress.win, root))
+            try:
+                progress.win.lift()
+                progress.win.focus_set()
+            except Exception:
+                pass
+    
+            def _worker():
+                try:
+                    def report_step(msg: str):
+                        q.put(("step", msg))
+    
+                    result = work_fn(report_step)
+                    q.put(("done", result))
+                except Exception as exc:  # noqa: BLE001
+                    q.put(("error", exc))
+    
+            threading.Thread(target=_worker, daemon=True).start()
+    
+            def _poll():
+                should_stop = False
+                try:
+                    while True:
+                        kind, payload = q.get_nowait()
+                        if kind == "step":
+                            progress.set_step(str(payload))
+                        elif kind == "done":
+                            progress.close()
+                            _handle_export_success(payload)
+                            should_stop = True
+                        elif kind == "error":
+                            progress.close()
+                            _handle_export_error(payload)
+                            should_stop = True
+                except queue.Empty:
+                    pass
+                if should_stop:
+                    return
+                root.after(200, _poll)
+    
+            root.after(200, _poll)
+    
+        def _work(report_step):
+            engine = params["engine"]
+            report_step(t("PROGRESS_GETTING_DATA"))
+    
+            rows, columns, sql_duration, sql_start = _run_query_to_rows(
+                engine,
+                sql_query,
+                timeout_seconds=db_timeout_seconds,
+                cancel_event=cancel_state["event"],
+            )
+            rows_count = len(rows)
+            columns_count = len(columns)
+    
+            if params.get("use_template"):
+                template = params["template"]
+                start_row, start_col = coordinate_to_tuple(template["start_cell"])
+                _ensure_xlsx_limits(
+                    rows_count,
+                    columns_count,
+                    header_rows=(1 if (template["include_header"] and rows_count) else 0),
+                    start_row=start_row,
+                    start_col=start_col,
+                )
+                report_step(t("PROGRESS_EXPORTING_XLSX_TEMPLATE"))
+    
+                export_start = time.perf_counter()
+                try:
+                    shutil.copyfile(template["template_path"], params["output_file_path"])
+    
+                    wb = None
+                    try:
+                        if rows_count:
+                            deadline = _deadline(int(export_timeout_seconds or 0))
+                            wb = load_workbook(params["output_file_path"])
+                            if template["sheet_name"] not in wb.sheetnames:
+                                raise ValueError(
+                                    t("ERR_TEMPLATE_MISSING_SHEET", sheet=template["sheet_name"])
+                                )
+    
+                            ws = wb[template["sheet_name"]]
+    
+                            data_start_row = start_row
+                            if template["include_header"]:
+                                for c_offset, col_name in enumerate(list(columns)):
+                                    if c_offset % 50 == 0:
+                                        if cancel_state["event"] is not None and cancel_state["event"].is_set():
+                                            raise UserCancelledError(t("ERR_CANCELLED_BY_USER"))
+                                        _check_deadline(
+                                            deadline,
+                                            ExportTimeoutError,
+                                            t(
+                                                "ERR_EXPORT_TIMEOUT",
+                                                minutes=max(1, int(math.ceil(int(export_timeout_seconds or 0) / 60))),
+                                            ),
+                                        )
+                                    ws.cell(row=start_row, column=start_col + c_offset).value = col_name
+                                data_start_row = start_row + 1
+    
+                            for r_offset, row in enumerate(rows):
+                                if r_offset % 100 == 0:
+                                    if cancel_state["event"] is not None and cancel_state["event"].is_set():
+                                        raise UserCancelledError(t("ERR_CANCELLED_BY_USER"))
+                                    _check_deadline(
+                                        deadline,
+                                        ExportTimeoutError,
+                                        t(
+                                            "ERR_EXPORT_TIMEOUT",
+                                            minutes=max(1, int(math.ceil(int(export_timeout_seconds or 0) / 60))),
+                                        ),
+                                    )
+                                for c_offset, value in enumerate(list(row)):
+                                    ws.cell(
+                                        row=data_start_row + r_offset,
+                                        column=start_col + c_offset,
+                                    ).value = value
+                            if cancel_state["event"] is not None and cancel_state["event"].is_set():
+                                raise UserCancelledError(t("ERR_CANCELLED_BY_USER"))
+                            wb.save(params["output_file_path"])
+                    finally:
+                        if wb is not None:
+                            try:
+                                wb.close()
+                            except Exception:
+                                pass
+                except Exception:
+                    _safe_remove(params["output_file_path"])
+                    raise
+    
+                export_end = time.perf_counter()
+                export_duration = export_end - export_start
+                total_duration = export_end - sql_start
+            else:
+                if output_format == "xlsx":
+                    _ensure_xlsx_limits(
+                        rows_count,
+                        columns_count,
+                        header_rows=(1 if rows_count else 0),
+                        start_row=1,
+                        start_col=1,
+                    )
+    
+                report_step(t("PROGRESS_EXPORTING_CSV") if output_format == "csv" else t("PROGRESS_EXPORTING_XLSX"))
+    
+                export_duration = 0.0
+                if rows_count:
+                    export_start = time.perf_counter()
+                    try:
+                        if output_format == "xlsx":
+                            _export_rows_to_xlsx(
+                                params["output_file_path"],
+                                columns=list(columns),
+                                rows=rows,
+                                timeout_seconds=int(export_timeout_seconds or 0),
+                                cancel_event=cancel_state["event"],
+                            )
+                        else:
+                            profile = csv_profile or DEFAULT_CSV_PROFILE
+                            _export_rows_to_csv(
+                                params["output_file_path"],
+                                columns=list(columns),
+                                rows=rows,
+                                profile=profile,
+                                timeout_seconds=int(export_timeout_seconds or 0),
+                                cancel_event=cancel_state["event"],
+                            )
+                    except Exception:
+                        _safe_remove(params["output_file_path"])
+                        raise
+                    export_end = time.perf_counter()
+                    export_duration = export_end - export_start
+                    total_duration = export_end - sql_start
+                else:
+                    total_duration = sql_duration
+    
+            return {
+                "sql_duration": sql_duration,
+                "export_duration": export_duration,
+                "total_duration": total_duration,
+                "rows_count": rows_count,
+            }
+    
+        _run_export_in_background(_work)
 
     def _open_path(target):
         if not target or not os.path.exists(target):
@@ -7490,10 +9947,16 @@ def run_gui(connection_store, output_directory):
             folder = os.path.dirname(path)
             _open_path(folder)
 
-    logs_dir = os.path.join(BASE_DIR, "logs")
-
     def open_logs_folder():
-        _open_path(logs_dir)
+        target = LOG_DIR
+        if not target and LOG_FILE_PATH:
+            try:
+                target = os.path.dirname(LOG_FILE_PATH)
+            except Exception:
+                target = None
+        if not target:
+            target = os.path.join(BASE_DIR, "logs")
+        _open_path(target)
 
     def show_help_window():
         # Help == README viewer (no nested modal windows).
@@ -7534,7 +9997,7 @@ def run_gui(connection_store, output_directory):
         try:
             info = get_update_info()
         except Exception as exc:  # noqa: BLE001
-            LOGGER.warning("Update check failed: %s", exc, exc_info=exc)
+            LOGGER.warning("Update check failed: %s", exc, exc_info=True)
             messagebox.showerror(t("UPD_TITLE"), t("UPD_CHECK_FAILED"))
             return
         finally:
@@ -7542,34 +10005,6 @@ def run_gui(connection_store, output_directory):
                 set_connection_status(key=prev_key, **prev_params)
             else:
                 connection_status_var.set(prev_status)
-
-        git_status_line = None
-        if mode == "git":
-            local_sha = _get_git_full_sha()
-            remote_sha = None
-            try:
-                remote_sha = _fetch_remote_main_sha()
-            except Exception:
-                remote_sha = None
-            if local_sha and remote_sha:
-                local_short = local_sha[:7]
-                remote_short = remote_sha[:7]
-                relation = _classify_git_relation(local_sha, remote_sha)
-                if relation == "match":
-                    key = "UPD_GIT_STATUS_MATCH"
-                elif relation == "remote_ahead":
-                    key = "UPD_GIT_STATUS_AHEAD"
-                elif relation == "local_ahead":
-                    key = "UPD_GIT_STATUS_LOCAL_AHEAD"
-                elif relation == "diverged":
-                    key = "UPD_GIT_STATUS_DIVERGED"
-                elif relation == "different_unverified":
-                    key = "UPD_GIT_STATUS_DIFFERENT_UNVERIFIED"
-                else:
-                    key = "UPD_GIT_STATUS_DIFFERENT"
-                git_status_line = t(
-                    key, local=local_short, remote=remote_short
-                )
 
         latest_tag = info.get("latest_tag") or ""
         current_tag = info.get("current_tag") or f"v{APP_VERSION}"
@@ -7588,8 +10023,6 @@ def run_gui(connection_store, output_directory):
                 if git_status_line:
                     message_lines.append(git_status_line)
                 message_lines.append(t("UPD_GIT_MODE", command="git pull"))
-                if git_status_line:
-                    message_lines.append(git_status_line)
             elif mode == "source":
                 message_lines.append(t("UPD_SOURCE_MODE"))
             messagebox.showinfo(
@@ -7605,8 +10038,6 @@ def run_gui(connection_store, output_directory):
                 if git_status_line:
                     message_lines.append(git_status_line)
                 message_lines.append(t("UPD_GIT_MODE", command="git pull"))
-                if git_status_line:
-                    message_lines.append(git_status_line)
             else:
                 message_lines.append(t("UPD_SOURCE_MODE"))
             messagebox.showinfo(t("UPD_TITLE"), "\n\n".join(message_lines))
@@ -7627,7 +10058,7 @@ def run_gui(connection_store, output_directory):
                 messagebox.showerror(t("UPD_TITLE"), t("UPD_START_FAILED"))
                 return
         except Exception as exc:  # noqa: BLE001
-            LOGGER.warning("Failed to start updater: %s", exc, exc_info=exc)
+            LOGGER.warning("Failed to start updater: %s", exc, exc_info=True)
             messagebox.showerror(t("UPD_TITLE"), t("UPD_START_FAILED"))
             return
         root.destroy()
@@ -7716,7 +10147,6 @@ def run_gui(connection_store, output_directory):
         connection_frame, text=t("FRAME_ADVANCED"), padding=(10, 8)
     )
     advanced_frame.grid(row=2, column=0, sticky="we", pady=(8, 0))
-    advanced_frame.columnconfigure(0, weight=1)
     i18n_widgets["advanced_frame"] = advanced_frame
 
     chk_archive_sql = ttk.Checkbutton(
@@ -7725,8 +10155,49 @@ def run_gui(connection_store, output_directory):
         variable=archive_sql_var,
         command=on_archive_sql_toggle,
     )
-    chk_archive_sql.grid(row=0, column=0, sticky="w")
+    chk_archive_sql.grid(row=0, column=0, columnspan=2, sticky="w")
     i18n_widgets["chk_archive_sql"] = chk_archive_sql
+
+    advanced_frame.columnconfigure(0, weight=1)
+    advanced_frame.columnconfigure(1, weight=0)
+
+    lbl_db_timeout = ttk.Label(advanced_frame, text=t("LBL_DB_TIMEOUT_MIN"))
+    lbl_db_timeout.grid(row=1, column=0, sticky="w", pady=(6, 0))
+    i18n_widgets["lbl_db_timeout"] = lbl_db_timeout
+
+    sp_db_timeout = ttk.Spinbox(
+        advanced_frame,
+        from_=0,
+        to=1440,
+        textvariable=db_timeout_min_var,
+        width=6,
+        command=persist_timeouts_from_ui,
+    )
+    sp_db_timeout.grid(row=1, column=1, sticky="e", pady=(6, 0))
+    sp_db_timeout.bind("<FocusOut>", lambda *_: persist_timeouts_from_ui())
+    sp_db_timeout.bind("<Return>", lambda *_: persist_timeouts_from_ui())
+
+    lbl_export_timeout = ttk.Label(advanced_frame, text=t("LBL_EXPORT_TIMEOUT_MIN"))
+    lbl_export_timeout.grid(row=2, column=0, sticky="w", pady=(6, 0))
+    i18n_widgets["lbl_export_timeout"] = lbl_export_timeout
+
+    sp_export_timeout = ttk.Spinbox(
+        advanced_frame,
+        from_=0,
+        to=1440,
+        textvariable=export_timeout_min_var,
+        width=6,
+        command=persist_timeouts_from_ui,
+    )
+    sp_export_timeout.grid(row=2, column=1, sticky="e", pady=(6, 0))
+    sp_export_timeout.bind("<FocusOut>", lambda *_: persist_timeouts_from_ui())
+    sp_export_timeout.bind("<Return>", lambda *_: persist_timeouts_from_ui())
+
+    lbl_timeout_note = ttk.Label(
+        advanced_frame, text=t("LBL_TIMEOUT_NOTE"), foreground="gray40"
+    )
+    lbl_timeout_note.grid(row=3, column=0, columnspan=2, sticky="w", pady=(6, 0))
+    i18n_widgets["lbl_timeout_note"] = lbl_timeout_note
 
     source_frame = ttk.LabelFrame(root, text=t("FRAME_SQL_SOURCE"), padding=(10, 10))
     source_frame.pack(fill=tk.X, padx=10, pady=(10, 5))
@@ -7748,6 +10219,7 @@ def run_gui(connection_store, output_directory):
 
     source_frame.columnconfigure(1, weight=1)
     source_frame.columnconfigure(2, weight=0)
+    format_frame.columnconfigure(1, weight=1)
     template_frame.columnconfigure(1, weight=1)
     result_frame.columnconfigure(1, weight=1)
     result_frame.rowconfigure(3, weight=1)
@@ -7836,8 +10308,33 @@ def run_gui(connection_store, output_directory):
     i18n_widgets["csv_profile_manage_btn"] = csv_profile_manage_btn
 
     ttk.Label(format_frame, textvariable=default_csv_label_var, justify="left", wraplength=600).grid(
-        row=2, column=0, columnspan=3, sticky="w", pady=(5, 0)
+        row=2, column=0, columnspan=4, sticky="w", pady=(5, 0)
     )
+
+    lbl_save_as = ttk.Label(format_frame, text=t("LBL_SAVE_AS"))
+    lbl_save_as.grid(row=3, column=0, sticky="w", pady=(8, 0))
+    i18n_widgets["lbl_save_as"] = lbl_save_as
+
+    ent_save_as = ttk.Entry(format_frame, textvariable=save_as_path_var)
+    ent_save_as.grid(row=3, column=1, sticky="we", pady=(8, 0))
+    ent_save_as.bind("<FocusOut>", lambda *_: _sync_save_as_extension(show_info=False))
+    ent_save_as.bind("<Return>", lambda *_: _sync_save_as_extension(show_info=False))
+
+    btn_save_as = ttk.Button(format_frame, text=t("BTN_SAVE_AS"), command=choose_save_as_path)
+    btn_save_as.grid(row=3, column=2, padx=(10, 0), pady=(8, 0), sticky="w")
+    i18n_widgets["btn_save_as"] = btn_save_as
+
+    btn_clear_save_as = ttk.Button(format_frame, text=t("BTN_CLEAR"), command=clear_save_as_path)
+    btn_clear_save_as.grid(row=3, column=3, padx=(8, 0), pady=(8, 0), sticky="w")
+    i18n_widgets["btn_clear_save_as"] = btn_clear_save_as
+
+    lbl_save_as_hint = ttk.Label(
+        format_frame,
+        text=t("LBL_SAVE_AS_HINT", dir=shorten_path(output_directory, max_len=60)),
+        foreground="gray40",
+    )
+    lbl_save_as_hint.grid(row=4, column=0, columnspan=4, sticky="w", pady=(4, 0))
+    i18n_widgets["lbl_save_as_hint"] = lbl_save_as_hint
 
     refresh_csv_profile_controls(csv_profile_state["config"].get("default_profile"))
 
@@ -7895,37 +10392,46 @@ def run_gui(connection_store, output_directory):
     i18n_widgets["include_header_check"] = include_header_check
 
     update_template_controls_state()
+    _refresh_template_ui()
     update_csv_profile_controls_state()
 
     btn_start = ttk.Button(result_frame, text=t("BTN_START"), command=run_export_gui)
     btn_start.grid(row=0, column=0, pady=(0, 10), sticky="w")
     start_button_holder["widget"] = btn_start
     i18n_widgets["btn_start"] = btn_start
+    btn_cancel = ttk.Button(
+        result_frame,
+        text=t("BTN_CANCEL_RUN"),
+        command=request_cancel,
+        state=tk.DISABLED,
+    )
+    btn_cancel.grid(row=0, column=1, padx=(10, 0), pady=(0, 10), sticky="w")
+    i18n_widgets["btn_cancel"] = btn_cancel
     btn_report_issue = ttk.Button(
         result_frame,
         text=t("BTN_REPORT_ISSUE"),
         command=lambda: open_github_issue_chooser(parent=root),
     )
-    btn_report_issue.grid(row=0, column=1, padx=(10, 0), pady=(0, 10), sticky="w")
+    btn_report_issue.grid(row=0, column=2, padx=(10, 0), pady=(0, 10), sticky="w")
     i18n_widgets["btn_report_issue"] = btn_report_issue
     btn_check_updates = ttk.Button(
         result_frame,
         text=t("BTN_CHECK_UPDATES"),
         command=check_updates_gui,
     )
-    btn_check_updates.grid(row=0, column=2, padx=(10, 0), pady=(0, 10), sticky="w")
+    btn_check_updates.grid(row=0, column=3, padx=(10, 0), pady=(0, 10), sticky="w")
     i18n_widgets["btn_check_updates"] = btn_check_updates
     btn_help = ttk.Button(
         result_frame,
         text=t("BTN_HELP"),
         command=show_help_window,
     )
-    btn_help.grid(row=0, column=3, padx=(10, 0), pady=(0, 10), sticky="w")
+    btn_help.grid(row=0, column=4, padx=(10, 0), pady=(0, 10), sticky="w")
     i18n_widgets["btn_help"] = btn_help
     btn_open_logs = ttk.Button(
         result_frame, text=t("BTN_OPEN_LOGS"), command=open_logs_folder
     )
-    btn_open_logs.grid(row=0, column=4, padx=(10, 0), pady=(0, 10), sticky="w")
+    btn_open_logs.grid(row=0, column=5, padx=(10, 0), pady=(0, 10), sticky="w")
     i18n_widgets["btn_open_logs"] = btn_open_logs
 
     lbl_project_page = tk.Label(
@@ -7938,7 +10444,7 @@ def run_gui(connection_store, output_directory):
         "<Button-1>", lambda *_: webbrowser.open(REPO_URL)
     )
     lbl_project_page.grid(
-        row=0, column=5, padx=(10, 0), pady=(2, 10), sticky="w"
+        row=0, column=6, padx=(10, 0), pady=(2, 10), sticky="w"
     )
     i18n_widgets["lbl_project_page"] = lbl_project_page
 
@@ -7952,9 +10458,13 @@ def run_gui(connection_store, output_directory):
     lbl_export_info = ttk.Label(result_frame, text=t("LBL_EXPORT_INFO"))
     lbl_export_info.grid(row=1, column=0, sticky="nw")
     i18n_widgets["lbl_export_info"] = lbl_export_info
-    ttk.Label(result_frame, textvariable=result_info_var, justify="left", wraplength=600).grid(
-        row=1, column=1, columnspan=3, sticky="w"
+    lbl_export_info_value = ttk.Label(
+        result_frame,
+        textvariable=result_info_var,
+        justify="left",
+        wraplength=600,
     )
+    lbl_export_info_value.grid(row=1, column=1, columnspan=3, sticky="w")
 
     btn_open_file = ttk.Button(result_frame, text=t("BTN_OPEN_FILE"), command=open_file)
     btn_open_file.grid(row=2, column=0, pady=5, sticky="w")
@@ -8014,6 +10524,12 @@ def run_gui(connection_store, output_directory):
         radio_csv.config(text=t("FORMAT_CSV"))
         lbl_csv_profile.config(text=t("LBL_CSV_PROFILE"))
         csv_profile_manage_btn.config(text=t("BTN_MANAGE_CSV_PROFILES"))
+        lbl_save_as.config(text=t("LBL_SAVE_AS"))
+        btn_save_as.config(text=t("BTN_SAVE_AS"))
+        btn_clear_save_as.config(text=t("BTN_CLEAR"))
+        lbl_save_as_hint.config(
+            text=t("LBL_SAVE_AS_HINT", dir=shorten_path(output_directory, max_len=60))
+        )
         chk_use_template.config(text=t("CHK_USE_TEMPLATE"))
         lbl_template_file.config(text=t("LBL_TEMPLATE_FILE"))
         choose_template_btn.config(text=t("BTN_SELECT_TEMPLATE"))
@@ -8021,6 +10537,7 @@ def run_gui(connection_store, output_directory):
         lbl_template_start_cell.config(text=t("LBL_TEMPLATE_START_CELL"))
         include_header_check.config(text=t("CHK_INCLUDE_HEADERS"))
         btn_start.config(text=t("BTN_START"))
+        btn_cancel.config(text=t("BTN_CANCEL_RUN"))
         btn_report_issue.config(text=t("BTN_REPORT_ISSUE"))
         btn_check_updates.config(text=t("BTN_CHECK_UPDATES"))
         btn_help.config(text=t("BTN_HELP"))
@@ -8056,35 +10573,667 @@ def run_gui(connection_store, output_directory):
     lang_combo.bind("<<ComboboxSelected>>", on_lang_change)
 
     _center_window(root)
+    root.protocol("WM_DELETE_WINDOW", on_close)
 
+    _dbg("run_gui(): entering mainloop()")
     root.mainloop()
+    _dbg("run_gui(): mainloop() returned")
+
+
+# =========================
+# SELF-TESTS / DEV CHECKS
+# =========================
+
+LOGGER_METHODS = {"debug", "info", "warning", "error", "exception", "critical"}
+
+
+def _is_logger_call_stmt(stmt) -> bool:
+    import ast
+
+    if not isinstance(stmt, ast.Expr):
+        return False
+    call = stmt.value
+    if not isinstance(call, ast.Call):
+        return False
+    func = call.func
+    if not isinstance(func, ast.Attribute):
+        return False
+    if func.attr not in LOGGER_METHODS:
+        return False
+    return isinstance(func.value, ast.Name) and func.value.id == "LOGGER"
+
+
+def _find_logger_try_except_pass_wrappers(source: str) -> list[str]:
+    import ast
+
+    tree = ast.parse(source)
+    locations: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Try):
+            continue
+        if node.orelse or node.finalbody:
+            continue
+        if len(node.handlers) != 1:
+            continue
+        handler = node.handlers[0]
+        if not isinstance(handler.type, ast.Name) or handler.type.id != "Exception":
+            continue
+        if len(handler.body) != 1 or not isinstance(handler.body[0], ast.Pass):
+            continue
+        if not node.body or not all(_is_logger_call_stmt(stmt) for stmt in node.body):
+            continue
+        locations.append(f"line {node.lineno}")
+    return locations
+
+
+def _find_unclosed_openpyxl_workbooks(source: str) -> list[str]:
+    import ast
+
+    tree = ast.parse(source)
+
+    def _is_load_workbook_call(node: ast.AST) -> bool:
+        if not isinstance(node, ast.Call):
+            return False
+        func = node.func
+        if isinstance(func, ast.Name):
+            return func.id == "load_workbook"
+        if isinstance(func, ast.Attribute):
+            return func.attr == "load_workbook"
+        return False
+
+    def _node_to_dotted_path(node: ast.AST) -> str | None:
+        if isinstance(node, ast.Name):
+            return node.id
+        if isinstance(node, ast.Attribute):
+            base = _node_to_dotted_path(node.value)
+            if base is None:
+                return None
+            return f"{base}.{node.attr}"
+        return None
+
+    def _extract_assigned_names(target: ast.AST) -> list[str]:
+        dotted = _node_to_dotted_path(target)
+        if dotted is not None:
+            return [dotted]
+        if isinstance(target, (ast.Tuple, ast.List)):
+            out: list[str] = []
+            for elt in target.elts:
+                out.extend(_extract_assigned_names(elt))
+            return out
+        return []
+
+    def _expr_contains_load_workbook(expr: ast.AST) -> bool:
+        # łapie: load_workbook(...), load_workbook(...).sheetnames, itd.
+        return any(_is_load_workbook_call(n) for n in ast.walk(expr))
+
+    def _is_immediate_load_workbook_close(expr: ast.AST) -> bool:
+        if not isinstance(expr, ast.Call):
+            return False
+        func = expr.func
+        if not isinstance(func, ast.Attribute) or func.attr != "close":
+            return False
+        return _is_load_workbook_call(func.value)
+
+    def _collect_closed_names_in_finally(finalbody: list[ast.stmt]) -> set[str]:
+        module = ast.Module(body=finalbody, type_ignores=[])
+        closed_names: set[str] = set()
+        for node in ast.walk(module):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if not isinstance(func, ast.Attribute) or func.attr != "close":
+                continue
+            dotted = _node_to_dotted_path(func.value)
+            if dotted is not None:
+                closed_names.add(dotted)
+        return closed_names
+
+    unclosed_lines: set[int] = set()
+
+    class WorkbookCloseVisitor(ast.NodeVisitor):
+        def __init__(self) -> None:
+            self.try_finally_closed_stack: list[set[str]] = []
+
+        def _current_closed_names(self) -> set[str]:
+            if not self.try_finally_closed_stack:
+                return set()
+            combined: set[str] = set()
+            for names in self.try_finally_closed_stack:
+                combined.update(names)
+            return combined
+
+        def _check_assignment(self, node: ast.AST, value: ast.AST, targets: list[ast.AST]) -> None:
+            if not _is_load_workbook_call(value):
+                return
+            target_names: list[str] = []
+            for target in targets:
+                target_names.extend(_extract_assigned_names(target))
+            closed_names = self._current_closed_names()
+            for name in target_names:
+                if name not in closed_names:
+                    unclosed_lines.add(node.lineno)
+
+        def visit_Assign(self, node: ast.Assign) -> None:
+            self._check_assignment(node, node.value, node.targets)
+            self.generic_visit(node)
+
+        def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
+            if node.value is not None:
+                self._check_assignment(node, node.value, [node.target])
+            self.generic_visit(node)
+
+        def visit_Expr(self, node: ast.Expr) -> None:
+            if (
+                _expr_contains_load_workbook(node.value)
+                and not _is_immediate_load_workbook_close(node.value)
+            ):
+                unclosed_lines.add(node.lineno)
+            self.generic_visit(node)
+
+        def visit_Try(self, node: ast.Try) -> None:
+            closed_names = _collect_closed_names_in_finally(node.finalbody)
+            if node.finalbody:
+                self.try_finally_closed_stack.append(closed_names)
+
+            for stmt in node.body:
+                self.visit(stmt)
+            for handler in node.handlers:
+                self.visit(handler)
+            for stmt in node.orelse:
+                self.visit(stmt)
+            for stmt in node.finalbody:
+                self.visit(stmt)
+
+            if node.finalbody:
+                self.try_finally_closed_stack.pop()
+
+    WorkbookCloseVisitor().visit(tree)
+
+    return [f"line {line}" for line in sorted(unclosed_lines)]
+
+
+def _selftest_openpyxl_close_scan() -> bool:
+    cases = [
+        (
+            "name_target_closed",
+            """
+def f(path):
+    try:
+        wb = load_workbook(path)
+    finally:
+        wb.close()
+""",
+            [],
+        ),
+        (
+            "self_attr_target_closed",
+            """
+def f(self, path):
+    try:
+        self.wb = load_workbook(path)
+    finally:
+        self.wb.close()
+""",
+            [],
+        ),
+        (
+            "obj_attr_target_closed",
+            """
+def f(obj, path):
+    try:
+        obj.wb = load_workbook(path)
+    finally:
+        obj.wb.close()
+""",
+            [],
+        ),
+        (
+            "different_name_not_closed_by_attr",
+            """
+def f(self, path):
+    try:
+        wb = load_workbook(path)
+    finally:
+        self.wb.close()
+""",
+            ["line 4"],
+        ),
+        (
+            "immediate_close_allowed",
+            """
+def f(path):
+    load_workbook(path).close()
+""",
+            [],
+        ),
+    ]
+
+    ok = True
+    for name, source, expected in cases:
+        got = _find_unclosed_openpyxl_workbooks(source)
+        if got != expected:
+            print(
+                "[FAIL] _find_unclosed_openpyxl_workbooks() "
+                f"case={name} expected={expected!r} got={got!r}"
+            )
+            ok = False
+
+    return ok
+
+
+def _selftest_has_multiple_statements() -> bool:
+    cases = [
+        ("pg_single", "postgresql", "select 1", False),
+        ("pg_two", "postgresql", "select 1; select 2", True),
+        ("pg_trailing_semicolon", "postgresql", "select 1;", False),
+        ("pg_semicolon_in_string", "postgresql", "select ';' as x", False),
+        ("pg_comment_semicolon", "postgresql", "-- comment;\nselect 1", False),
+        ("pg_comment_between", "postgresql", "select 1; -- comment\nselect 2", True),
+        ("pg_block_comment", "postgresql", "/* ; */ select 1", False),
+        (
+            "pg_do_block_then_select",
+            "postgresql",
+            "do $$ begin perform 1; perform 2; end $$; select 1",
+            True,
+        ),
+        (
+            "pg_dollar_quoted_string",
+            "postgresql",
+            "select $tag$ a; b $tag$ as x",
+            False,
+        ),
+        ("mysql_two", "mysql", "select 1; select 2", True),
+        ("mysql_backticks", "mysql", "select `a;b` from t", False),
+        # Python string: "a\\\';b" -> SQL string content: a\';b
+        ("mysql_escape", "mysql", "select 'a\\\';b' as x", False),
+        ("sqlite_two", "sqlite", "select 1; select 2", True),
+        ("sqlite_empty_segments", "sqlite", " ; \n select 1 ;", False),
+    ]
+
+    ok = True
+    for name, backend, sql, expected in cases:
+        try:
+            got = has_multiple_statements(sql, backend)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[FAIL] has_multiple_statements: {name} raised {type(exc).__name__}: {exc}")
+            ok = False
+            continue
+
+        if got == expected:
+            print(f"[OK] has_multiple_statements: {name}")
+        else:
+            print(f"[FAIL] has_multiple_statements: {name} expected {expected} got {got}")
+            ok = False
+
+    return ok
+
+
+
+def _selftest_apply_mssql_safe_set() -> bool:
+    class _FakeCursor:
+        def __init__(self, mode: str):
+            self.mode = mode
+            self.calls: list[str] = []
+
+        def execute(self, sql):
+            s = str(sql)
+            self.calls.append(s)
+            is_batch = ("\n" in s) or (s.upper().count("SET ") > 1)
+            if self.mode == "batch_fails_singles_ok":
+                if is_batch:
+                    raise RuntimeError("batch not supported")
+                return None
+            if self.mode == "single_statement_fails":
+                if is_batch:
+                    raise RuntimeError("batch not supported")
+                if s == "SET ANSI_WARNINGS ON":
+                    raise RuntimeError("simulated single statement failure")
+                return None
+            if self.mode == "batch_ok":
+                return None
+            raise RuntimeError(f"unknown mode: {self.mode}")
+
+    ok = True
+
+    cur_batch_fallback = _FakeCursor("batch_fails_singles_ok")
+    result_batch_fallback = _apply_mssql_safe_set(cur_batch_fallback)
+    expected_stmt_calls = [
+        stmt.strip()
+        for stmt in MSSQL_SAFE_SET_SQL.split(";")
+        if stmt.strip()
+    ]
+    if result_batch_fallback is True and cur_batch_fallback.calls == [
+        MSSQL_SAFE_SET_SQL,
+        *expected_stmt_calls,
+    ]:
+        print("[OK] _apply_mssql_safe_set(): fallback per statement")
+    else:
+        print(
+            "[FAIL] _apply_mssql_safe_set(): fallback per statement "
+            f"result={result_batch_fallback!r} calls={cur_batch_fallback.calls!r}"
+        )
+        ok = False
+
+    cur_partial_failure = _FakeCursor("single_statement_fails")
+    result_partial_failure = _apply_mssql_safe_set(cur_partial_failure)
+    if result_partial_failure is False and cur_partial_failure.calls == [
+        MSSQL_SAFE_SET_SQL,
+        *expected_stmt_calls,
+    ]:
+        print("[OK] _apply_mssql_safe_set(): keeps trying after statement failure")
+    else:
+        print(
+            "[FAIL] _apply_mssql_safe_set(): partial failure handling "
+            f"result={result_partial_failure!r} calls={cur_partial_failure.calls!r}"
+        )
+        ok = False
+
+    cur_batch_ok = _FakeCursor("batch_ok")
+    result_batch_ok = _apply_mssql_safe_set(cur_batch_ok)
+    if result_batch_ok is True and cur_batch_ok.calls == [MSSQL_SAFE_SET_SQL]:
+        print("[OK] _apply_mssql_safe_set(): batch fast path")
+    else:
+        print(
+            "[FAIL] _apply_mssql_safe_set(): batch fast path "
+            f"result={result_batch_ok!r} calls={cur_batch_ok.calls!r}"
+        )
+        ok = False
+
+    return ok
+
+
+def _can_write_text_stream(stream) -> bool:
+    """Return True when ``stream`` looks writable and is not marked as closed."""
+    try:
+        return stream is not None and hasattr(stream, "write") and not getattr(stream, "closed", False)
+    except Exception:
+        return False
+
+
+def run_self_test() -> bool:
+    ok, report = run_self_test_report()
+
+    emitted = False
+    stdout = getattr(sys, "stdout", None)
+    if _can_write_text_stream(stdout):
+        try:
+            print(report)
+            try:
+                stdout.flush()
+            except Exception:
+                pass
+            emitted = True
+        except Exception:
+            emitted = False
+
+    report_path = _write_self_test_report(report)
+    # Popup only as a fallback when we cannot emit to stdout (e.g. pythonw / no console).
+    if (not emitted) and report_path:
+        _show_self_test_report_popup(report, report_path)
+
+    return ok
+
+
+def run_self_test_report() -> tuple[bool, str]:
+    lines: list[str] = []
+
+    def _append(label: str, value) -> None:
+        lines.append(f"{label}: {value}")
+
+    lines.append("=== KKR Query2XLSX self-test report ===")
+    _append("app_version", get_app_version_label())
+    _append("install_mode", detect_install_mode())
+    _append("BASE_DIR", BASE_DIR)
+    _append("DATA_DIR", DATA_DIR)
+    _append("LOG_FILE_PATH", LOG_FILE_PATH or "")
+    _append("sys.executable", sys.executable)
+    _append("python version", sys.version.replace("\n", " "))
+    _append("platform", platform.platform())
+    _append("sqlalchemy.__version__", getattr(sqlalchemy, "__version__", "unknown"))
+    _append("openpyxl.__version__", getattr(openpyxl, "__version__", "unknown"))
+
+    try:
+        import pyodbc  # type: ignore
+
+        _append("pyodbc", f"available ({getattr(pyodbc, '__version__', 'unknown')})")
+        try:
+            drivers = pyodbc.drivers()
+            _append("pyodbc.drivers()", ", ".join(drivers) if drivers else "<none>")
+        except Exception as exc:  # noqa: BLE001
+            _append("pyodbc.drivers()", f"<error: {type(exc).__name__}: {exc}>")
+    except Exception as exc:  # noqa: BLE001
+        _append("pyodbc", f"missing ({type(exc).__name__}: {exc})")
+        _append("pyodbc.drivers()", "<unavailable>")
+
+    lines.append("")
+    lines.append("=== checks ===")
+
+    ok = True
+
+    is_frozen = bool(getattr(sys, "frozen", False))
+    src_path = None
+    has_source_file = False
+
+    if not is_frozen:
+        file_path = globals().get("__file__")
+        if isinstance(file_path, str) and file_path:
+            src_path = Path(file_path)
+            has_source_file = src_path.exists()
+
+    # 1) Syntax compile smoke test (source only)
+    if has_source_file and not is_frozen:
+        try:
+            import py_compile
+
+            py_compile.compile(str(src_path), doraise=True)  # type: ignore[arg-type]
+            lines.append("[OK] py_compile main.pyw")
+        except Exception as exc:  # noqa: BLE001
+            lines.append(f"[FAIL] py_compile main.pyw: {type(exc).__name__}: {exc}")
+            ok = False
+    else:
+        lines.append("[SKIP] py_compile (no source file / frozen exe)")
+
+    # 2) Code hygiene scan: forbid try: LOGGER.*; except Exception: pass (source only)
+    if has_source_file and not is_frozen:
+        try:
+            source = src_path.read_text(encoding="utf-8")  # type: ignore[union-attr]
+            locations = _find_logger_try_except_pass_wrappers(source)
+            if locations:
+                lines.append(
+                    "[FAIL] Found forbidden LOGGER try/except-pass wrappers at: "
+                    + ", ".join(locations)
+                )
+                ok = False
+            else:
+                lines.append("[OK] no LOGGER try/except-pass wrappers")
+        except Exception as exc:  # noqa: BLE001
+            lines.append(f"[FAIL] LOGGER wrapper scan: {type(exc).__name__}: {exc}")
+            ok = False
+    else:
+        lines.append("[SKIP] LOGGER wrapper scan (no source file / frozen exe)")
+
+    # 2b) openpyxl load_workbook close scan
+    if has_source_file and not is_frozen:
+        try:
+            source = src_path.read_text(encoding="utf-8")  # type: ignore[union-attr]
+            locations = _find_unclosed_openpyxl_workbooks(source)
+            if locations:
+                formatted_locations = "\n".join(f"- {location}" for location in locations)
+                lines.append("[FAIL] Found load_workbook() without close() in finally at:")
+                lines.append(formatted_locations)
+                lines.append("Wrap load_workbook in try/finally and call wb.close()")
+                ok = False
+            else:
+                lines.append("[OK] openpyxl.load_workbook close handling")
+        except Exception as exc:  # noqa: BLE001
+            lines.append(f"[FAIL] openpyxl close scan: {type(exc).__name__}: {exc}")
+            ok = False
+    else:
+        lines.append("[SKIP] openpyxl close scan (no source file / frozen exe)")
+
+    # 2c) openpyxl load_workbook close scan self-test (string-only)
+    try:
+        if _selftest_openpyxl_close_scan():
+            lines.append("[OK] _find_unclosed_openpyxl_workbooks() cases")
+        else:
+            lines.append("[FAIL] _find_unclosed_openpyxl_workbooks() cases")
+            ok = False
+    except Exception as exc:  # noqa: BLE001
+        lines.append(
+            "[FAIL] _find_unclosed_openpyxl_workbooks() self-test crashed: "
+            f"{type(exc).__name__}: {exc}"
+        )
+        ok = False
+
+    # 3) Runtime function smoke test (always)
+    try:
+        diagnostics = odbc_diagnostics_text()
+        if isinstance(diagnostics, str):
+            lines.append("[OK] odbc_diagnostics_text()")
+        else:
+            lines.append("[FAIL] odbc_diagnostics_text(): returned non-string value")
+            ok = False
+    except Exception as exc:  # noqa: BLE001
+        lines.append(f"[FAIL] odbc_diagnostics_text(): {type(exc).__name__}: {exc}")
+        ok = False
+
+    # 4) has_multiple_statements() self-test (string-only)
+    try:
+        capture = io.StringIO()
+        with contextlib.redirect_stdout(capture):
+            has_multi_ok = _selftest_has_multiple_statements()
+        emitted = capture.getvalue().strip()
+        if emitted:
+            lines.extend(emitted.splitlines())
+
+        if has_multi_ok:
+            lines.append("[OK] has_multiple_statements() cases")
+        else:
+            lines.append("[FAIL] has_multiple_statements() cases")
+            ok = False
+    except Exception as exc:  # noqa: BLE001
+        lines.append(f"[FAIL] has_multiple_statements() self-test crashed: {type(exc).__name__}: {exc}")
+        ok = False
+
+    # 5) MSSQL session prolog helper self-test (no DB required)
+    try:
+        capture = io.StringIO()
+        with contextlib.redirect_stdout(capture):
+            safe_set_ok = _selftest_apply_mssql_safe_set()
+        emitted = capture.getvalue().strip()
+        if emitted:
+            lines.extend(emitted.splitlines())
+
+        if safe_set_ok:
+            lines.append("[OK] _apply_mssql_safe_set() cases")
+        else:
+            lines.append("[FAIL] _apply_mssql_safe_set() cases")
+            ok = False
+    except Exception as exc:  # noqa: BLE001
+        lines.append(f"[FAIL] _apply_mssql_safe_set() self-test crashed: {type(exc).__name__}: {exc}")
+        ok = False
+
+    lines.append("")
+    lines.append("SELF-TEST: OK" if ok else "SELF-TEST: FAIL")
+    report = "\n".join(lines)
+    return ok, report
+
+
+def _write_self_test_report(report: str) -> str | None:
+    candidates = [LOG_DIR, DATA_DIR, tempfile.gettempdir()]
+    filename = f"kkr-query2xlsx.selftest_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+    for candidate in candidates:
+        if not candidate:
+            continue
+        try:
+            os.makedirs(candidate, exist_ok=True)
+            path = os.path.join(candidate, filename)
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(report)
+                fh.write("\n")
+            return path
+        except Exception:
+            continue
+    return None
+
+
+def _show_self_test_report_popup(report: str, report_path: str) -> None:
+    try:
+        popup_root = tk.Tk()
+        apply_app_icon(popup_root)
+        popup_root.title("Self-test report")
+        popup_root.geometry("860x560")
+        popup_root.minsize(700, 420)
+
+        popup_root.columnconfigure(0, weight=1)
+        popup_root.rowconfigure(1, weight=1)
+
+        info = ttk.Label(
+            popup_root,
+            text=f"Report saved to:\n{report_path}",
+            justify="left",
+            anchor="w",
+            padding=(12, 10, 12, 6),
+        )
+        info.grid(row=0, column=0, sticky="we")
+
+        body = ttk.Frame(popup_root, padding=(12, 0, 12, 8))
+        body.grid(row=1, column=0, sticky="nsew")
+        body.columnconfigure(0, weight=1)
+        body.rowconfigure(0, weight=1)
+
+        text_widget = tk.Text(
+            body,
+            wrap="none",
+            font=("Consolas", 9) if sys.platform == "win32" else None,
+            borderwidth=1,
+            relief="solid",
+        )
+        y_scroll = ttk.Scrollbar(body, orient="vertical", command=text_widget.yview)
+        x_scroll = ttk.Scrollbar(body, orient="horizontal", command=text_widget.xview)
+        text_widget.configure(yscrollcommand=y_scroll.set, xscrollcommand=x_scroll.set)
+
+        text_widget.grid(row=0, column=0, sticky="nsew")
+        y_scroll.grid(row=0, column=1, sticky="ns")
+        x_scroll.grid(row=1, column=0, sticky="we")
+
+        text_widget.insert("1.0", report)
+        text_widget.config(state="disabled")
+
+        btns = ttk.Frame(popup_root, padding=(12, 0, 12, 12))
+        btns.grid(row=2, column=0, sticky="we")
+
+        def copy_all() -> None:
+            popup_root.clipboard_clear()
+            popup_root.clipboard_append(report or "")
+
+        ttk.Button(btns, text=t("BTN_COPY_ALL"), command=copy_all).pack(side="left", padx=(0, 8))
+        ttk.Button(btns, text=t("BTN_CLOSE"), command=popup_root.destroy).pack(side="left")
+
+        popup_root.bind("<Escape>", lambda *_: popup_root.destroy())
+        popup_root.mainloop()
+    except Exception:
+        return
 
 
 if __name__ == "__main__":
-    output_directory = _build_path("generated_reports")
-    ensure_directories(
-        [
-            output_directory,
-            SQL_ARCHIVE_DIR,
-            _build_path("templates"),
-            _build_path("queries"),
-        ]
-    )
+    if os.environ.get("KKR_DEBUG_EXIT") == "1":
+        _install_debug_sys_exit_hook()
+        _dbg("entered __main__")
 
-    pre_parser = argparse.ArgumentParser(add_help=False)
-    pre_parser.add_argument("--lang", choices=["en", "pl"])
-    pre_args, _ = pre_parser.parse_known_args()
-    lang_for_cli = pre_args.lang
-    if lang_for_cli:
-        set_lang(lang_for_cli)
-        persist_ui_lang(lang_for_cli)
-    else:
-        stored_lang = load_persisted_ui_lang()
-        if stored_lang:
-            set_lang(stored_lang)
+    early_parser = argparse.ArgumentParser(add_help=False)
+    early_parser.add_argument("--lang", choices=["en", "pl"])
+    early_parser.add_argument("--self-test", action="store_true")
+    early_args, _ = early_parser.parse_known_args()
+    if early_args.lang:
+        set_lang(early_args.lang)
+    if early_args.self_test:
+        sys.exit(0 if run_self_test() else 1)
 
     parser = argparse.ArgumentParser(description=t("CLI_DESC"))
+    parser.add_argument("--self-test", action="store_true", help=t("CLI_SELF_TEST_HELP"))
     parser.add_argument("-c", "--console", action="store_true", help=t("CLI_CONSOLE_HELP"))
+    parser.add_argument("-o", "--output", help=t("CLI_OUTPUT_HELP"))
     parser.add_argument("--lang", choices=["en", "pl"], help=t("CLI_LANG_HELP"))
     parser.add_argument("--diag-odbc", action="store_true", help=t("CLI_DIAG_ODBC_HELP"))
     parser.add_argument(
@@ -8103,9 +11252,15 @@ if __name__ == "__main__":
         help="Archive executed SQL (with metadata) to sql_archive/.",
     )
     args = parser.parse_args()
+
+    if args.self_test:
+        sys.exit(0 if run_self_test() else 1)
+
+    if args.diag_odbc:
+        print(odbc_diagnostics_text())
+        sys.exit(0)
+
     install_mode = detect_install_mode()
-    if install_mode == "exe":
-        _apply_pending_updater_update()
 
     if args.check_update:
         if install_mode == "git":
@@ -8203,6 +11358,9 @@ if __name__ == "__main__":
         sys.exit(0)
 
     if args.update:
+        # Ensure we don't launch an outdated updater if a staged updater exists.
+        if install_mode == "exe":
+            _apply_pending_updater_update()
         if install_mode != "exe":
             print(
                 "Update: not supported for source runs. Use `git pull` or download a new ZIP."
@@ -8220,22 +11378,8 @@ if __name__ == "__main__":
             sys.exit(1)
         sys.exit(0)
 
-    if args.diag_odbc:
-        print(odbc_diagnostics_text())
-        sys.exit(0)
+    output_directory = bootstrap_data_dir_and_workdirs_or_exit()
 
-    created_files = bootstrap_local_files()
-    if created_files:
-        try:
-            LOGGER.info(
-                "Bootstrapped local files from samples: %s",
-                ", ".join(created_files),
-            )
-        except Exception:
-            pass
-
-    connection_store = load_connections()
-    connection_store.pop("ui_lang", None)
     if args.lang:
         set_lang(args.lang)
         persist_ui_lang(args.lang)
@@ -8243,6 +11387,19 @@ if __name__ == "__main__":
         stored_lang = load_persisted_ui_lang()
         if stored_lang:
             set_lang(stored_lang)
+
+    if install_mode == "exe":
+        _apply_pending_updater_update()
+
+    created_files = bootstrap_local_files()
+    if created_files:
+        LOGGER.info(
+            "Bootstrapped local files from samples: %s",
+            ", ".join(created_files),
+        )
+
+    connection_store = load_connections()
+    connection_store.pop("ui_lang", None)
     selected_name = connection_store.get("last_selected")
     selected_connection = None
     for conn in connection_store.get("connections", []):
@@ -8277,9 +11434,21 @@ if __name__ == "__main__":
                             name=selected_connection.get("name"),
                         )
                     )
+                    if not str(pwd or "").strip():
+                        raise PasswordRequiredError(
+                            name=selected_connection.get("name", ""),
+                            conn_type=str(ctype or ""),
+                        )
                 url = _build_runtime_url(ctype, details, pwd)
             engine = create_engine(url, **engine_kwargs)
+            if selected_connection.get("type") == "mssql_odbc":
+                _ensure_engine_mssql_set_hook(engine)
         except Exception as exc:  # noqa: BLE001
+            if isinstance(exc, PasswordRequiredError):
+                name = getattr(exc, "name", "") or selected_connection.get("name", "")
+                print(t("ERR_PASSWORD_REQUIRED_TITLE"))
+                print(t("ERR_PASSWORD_REQUIRED_BODY", name=name))
+                sys.exit(1)
             handled = handle_db_driver_error(
                 exc,
                 selected_connection.get("type"),
@@ -8291,7 +11460,7 @@ if __name__ == "__main__":
                     "Failed to initialize console engine for %s (%s)",
                     selected_connection.get("name"),
                     selected_connection.get("type"),
-                    exc_info=exc,
+                    exc_info=True,
                 )
                 title, msg = _format_connection_error(
                     conn_type=str(selected_connection.get("type") or ""),
@@ -8306,6 +11475,9 @@ if __name__ == "__main__":
             output_directory,
             selected_connection,
             archive_sql=args.archive_sql,
+            output_override=args.output,
         )
     else:
+        _dbg("__main__: about to call run_gui()")
         run_gui(connection_store, output_directory)
+        _dbg("__main__: run_gui() returned")

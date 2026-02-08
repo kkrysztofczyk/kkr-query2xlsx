@@ -180,8 +180,22 @@ Local JSON file with connection settings (may include credentials). **Never comm
 ### `queries.txt` (optional “choose from list”)
 Optional text file listing paths to `.sql` files (one per line).
 
-### `kkr-query2xlsx.json` (CSV profiles)
+### `kkr-query2xlsx.json` (CSV profiles + timeouts)
 CSV profiles (delimiter, encoding, decimals, quoting, date format, etc.).
+
+Timeouts:
+```json
+{
+  "timeouts": {
+    "db_seconds": 180,
+    "export_seconds": 180
+  }
+}
+```
+Notes:
+- `db_seconds` covers **execution + fetch** time.
+- `export_seconds` covers **XLSX/CSV generation** time.
+- `0` means **no limit**.
 
 Important:
 - `delimiter_replacement` replaces delimiter characters in **all** string fields (global replacement).
@@ -200,6 +214,28 @@ Your private workspace (keep local, not in public git):
 - `queries/` — your `.sql` files
 - `templates/` — your XLSX templates
 - `data/` or `db/` — your databases
+
+---
+
+## Timeouts (DB + export)
+
+The app has **two independent timeouts** (default: **3 minutes** each, `0 = no limit`):
+
+1) **DB timeout** — execution + fetch.
+2) **Export timeout** — XLSX/CSV generation.
+
+### DB timeout (best-effort per backend/driver)
+- **PostgreSQL**: sets `statement_timeout` in the session (reliable) + watchdog cancel as fallback.
+- **SQLite**: uses `interrupt()` on the connection to stop execution.
+- **SQL Server / ODBC (pyodbc)**: tries `cursor.timeout` (if the driver supports it) + watchdog cancel/close fallback.
+- **MySQL/MariaDB**: tries `SET SESSION max_execution_time` (SELECT-only, depends on server/version) + watchdog cancel/close fallback.
+
+> Note: “cancel” is best‑effort. Depending on the driver and server configuration, server-side work may not stop immediately.
+
+### Export timeout (XLSX/CSV)
+- Applies to file generation only.
+- Export is streamed and the deadline is checked every N rows.
+- On timeout the export is interrupted and the partially written file is removed (best-effort).
 
 ---
 

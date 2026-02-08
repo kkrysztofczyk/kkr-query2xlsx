@@ -72,9 +72,9 @@ jobs:
           $iconCandidates = @("docs\kkr-query2xlsx.ico","docs\icon.ico","docs\app.ico")
           $icon = $iconCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
           if ($icon) {
-            pyinstaller --onedir --windowed --name kkr-query2xlsx --icon $icon --noupx --hidden-import pyodbc main.pyw
+            pyinstaller --onedir --windowed --name kkr-query2xlsx --icon $icon --noupx --hidden-import pyodbc --hidden-import tklinenums --collect-submodules pygments.lexers --collect-submodules pygments.styles main.pyw
           } else {
-            pyinstaller --onedir --windowed --name kkr-query2xlsx --noupx --hidden-import pyodbc main.pyw
+            pyinstaller --onedir --windowed --name kkr-query2xlsx --noupx --hidden-import pyodbc --hidden-import tklinenums --collect-submodules pygments.lexers --collect-submodules pygments.styles main.pyw
           }
 
       - name: Build updater (PyInstaller - onefile)
