@@ -74,7 +74,7 @@ You have **two options**:
 - ✅ Your files are created next to the app folder:
   - `generated_reports/` (exports)
   - `logs/kkr-query2xlsx.log` (logs)
-- ✅ If you see “access denied / no permission” → move the extracted folder somewhere writable.
+- ✅ If app folder is not writable, the app offers switching data to your user folder (`%LOCALAPPDATA%\kkr-query2xlsx`).
 
 ### Option 2 — Run from source (developers / non-Windows)
 - Requires Python + dependencies
@@ -154,7 +154,7 @@ If enabled, the app:
 
 - Exports: `generated_reports/`
 - Logs: `logs/kkr-query2xlsx.log` (rotating)
-- In the app: **Help → Open logs / Open reports**
+- In the app: use **Open logs folder** on the main screen; after export, use **Open folder** for the generated file location (there is no **Help → Open logs / Open reports** path in the current UI).
 
 ---
 
@@ -266,12 +266,33 @@ python main.pyw --lang en
 python main.pyw --lang pl
 ```
 
+## Testing
+
+Run a quick smoke test (self-test):
+
+```bash
+python main.pyw --self-test
+```
+
+Run unit tests:
+
+```bash
+py -m unittest discover -s tests -p "test_*.py" -v
+```
+
+On Linux/macOS use:
+
+```bash
+python -m unittest discover -s tests -p "test_*.py" -v
+```
+
 ---
 
 ## Troubleshooting (Windows)
 
 - **Always unzip first** (don’t run the exe inside the zip)
-- If you see **Access denied / no permission** errors, unzip/move the folder to a user-writable location (Desktop / Documents)
+- If you see **Access denied / no permission** errors, unzip/move the folder to a user-writable location (Desktop / Documents).
+- If app folder is not writable, accept the startup prompt to switch data to `%LOCALAPPDATA%\kkr-query2xlsx`.
 - If Windows blocks the download: right-click the `.zip` → Properties → **Unblock**
 - If antivirus/EDR blocks the app, whitelist the extracted folder (common with packed apps)
 

@@ -12,6 +12,7 @@ import platform
 import textwrap
 import queue
 import re
+import socket
 import threading
 import traceback
 import os
@@ -21,17 +22,13 @@ import subprocess
 import sys
 import tempfile
 import time
-import tkinter as tk
-import tkinter.font as tkfont
 import webbrowser
 import io
 import contextlib
 from datetime import datetime
 from pathlib import Path
-from tkinter import filedialog, messagebox, simpledialog
-from tkinter import ttk
-from tkinter.scrolledtext import ScrolledText
-from typing import Optional, Tuple
+from typing import Literal, Optional, Tuple
+from urllib.error import HTTPError, URLError
 from urllib.parse import quote_plus, unquote_plus
 from urllib.request import Request, urlopen
 
@@ -43,6 +40,29 @@ from sqlalchemy import create_engine, event, text
 from sqlalchemy.exc import DBAPIError, NoSuchModuleError
 from openpyxl import Workbook, load_workbook
 from openpyxl.utils import coordinate_to_tuple
+
+try:
+    import tkinter as tk
+    import tkinter.font as tkfont
+    from tkinter import filedialog, messagebox, simpledialog
+    from tkinter import ttk
+    from tkinter.scrolledtext import ScrolledText
+
+    _TK_AVAILABLE = True
+except Exception:  # noqa: BLE001
+    tk = None  # type: ignore[assignment]
+    tkfont = None  # type: ignore[assignment]
+    filedialog = messagebox = simpledialog = None  # type: ignore[assignment]
+    ttk = None  # type: ignore[assignment]
+    ScrolledText = None  # type: ignore[assignment]
+    _TK_AVAILABLE = False
+
+
+def _require_tk() -> None:
+    if not _TK_AVAILABLE:
+        raise RuntimeError(
+            "Tkinter is not available. Install python3-tk (Linux) / ensure Tk is bundled."
+        )
 
 
 def _load_optional_sql_highlighter():
@@ -296,6 +316,50 @@ def _set_data_dir(new_dir: str) -> None:
     APP_CONFIG_PATH = _build_path("kkr-query2xlsx.json")
     LEGACY_CSV_PROFILES_PATH = _build_path("csv_profiles.json")
     SQL_ARCHIVE_DIR = _build_path("sql_archive")
+    _attach_logger_file_handler(_build_path("logs"))
+
+
+def get_default_user_data_dir() -> str:
+    app_name = "kkr-query2xlsx"
+    if sys.platform == "win32":
+        base = os.environ.get("LOCALAPPDATA") or str(Path.home())
+        return os.path.join(base, app_name)
+    if sys.platform == "darwin":
+        return os.path.join(str(Path.home()), "Library", "Application Support", app_name)
+    base = os.environ.get("XDG_DATA_HOME") or os.path.join(str(Path.home()), ".local", "share")
+    return os.path.join(base, app_name)
+
+
+def has_data_markers(path: str | Path) -> bool:
+    base = Path(path)
+    file_markers = ("secure.txt", "queries.txt", "kkr-query2xlsx.json")
+    dir_markers = ("generated_reports", "logs", "sql_archive")
+
+    return any((base / name).exists() for name in file_markers + dir_markers)
+
+
+def select_startup_data_dir(base_dir: str | Path, user_dir: str | Path) -> str:
+    base_raw = str(base_dir)
+    user_raw = str(user_dir)
+
+    if has_data_markers(base_raw):
+        return base_raw
+    if has_data_markers(user_raw):
+        return user_raw
+    return base_raw
+
+
+def _path_cmp_key(path: str | Path) -> str:
+    """Return a normalized key for path comparisons on the current OS."""
+    try:
+        return os.path.normcase(os.path.abspath(str(path)))
+    except Exception:
+        return str(path)
+
+
+def _same_path(a: str | Path, b: str | Path) -> bool:
+    """Best-effort path equality check without mutating caller-provided values."""
+    return _path_cmp_key(a) == _path_cmp_key(b)
 
 
 _APP_ICON_PHOTO = None  # keep a reference to avoid GC in Tk
@@ -451,7 +515,7 @@ class ExportProgressWindow:
 
 # --- App version -------------------------------------------------------------
 
-APP_VERSION = "0.3.9"  # bump manually for releases
+APP_VERSION = "0.4.0"  # bump manually for releases
 
 MSSQL_SAFE_SET_SQL = """\
 SET NOCOUNT ON;
@@ -568,32 +632,129 @@ def detect_install_mode() -> str:
     return "source"
 
 
-def _fetch_latest_release() -> dict:
-    req = Request(
-        GITHUB_RELEASES_LATEST_URL,
-        headers={
-            "Accept": "application/vnd.github+json",
-            "User-Agent": "kkr-query2xlsx-updater",
-        },
-    )
-    with urlopen(req, timeout=10) as resp:  # noqa: S310
+def _read_json_request(req: Request, timeout_s: int) -> object:
+    with urlopen(req, timeout=timeout_s) as resp:  # noqa: S310
         payload = resp.read().decode("utf-8")
     return json.loads(payload)
 
 
-def _fetch_remote_main_sha() -> str | None:
-    req = Request(
-        GITHUB_COMMITS_MAIN_URL,
-        headers={
-            "Accept": "application/vnd.github+json",
-            "User-Agent": "kkr-query2xlsx-updater",
-        },
+def _fetch_latest_release() -> dict:
+    data = _read_json_request(
+        Request(
+            GITHUB_RELEASES_LATEST_URL,
+            headers={
+                "Accept": "application/vnd.github+json",
+                "User-Agent": "kkr-query2xlsx-updater",
+            },
+        ),
+        timeout_s=10,
     )
-    with urlopen(req, timeout=10) as resp:  # noqa: S310
-        payload = resp.read().decode("utf-8")
-    data = json.loads(payload)
+    if not isinstance(data, dict):
+        raise ValueError("GitHub release payload is not a JSON object")
+    return data
+
+
+def _fetch_remote_main_sha() -> str | None:
+    data = _read_json_request(
+        Request(
+            GITHUB_COMMITS_MAIN_URL,
+            headers={
+                "Accept": "application/vnd.github+json",
+                "User-Agent": "kkr-query2xlsx-updater",
+            },
+        ),
+        timeout_s=10,
+    )
+    if not isinstance(data, dict):
+        raise ValueError("GitHub commit payload is not a JSON object")
     sha = (data or {}).get("sha") or ""
     return sha.strip() or None
+
+
+_UPD_MAX_RETRY_AFTER_SECONDS = 7 * 24 * 60 * 60
+_UPD_MAX_RESET_FUTURE_SECONDS = 365 * 24 * 60 * 60
+
+
+def _format_local_ts(ts: float) -> str | None:
+    try:
+        return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def _parse_retry_hint(headers) -> str | None:  # noqa: ANN001
+    if not headers:
+        return None
+
+    retry_after = headers.get("retry-after")
+    if retry_after is not None:
+        s = str(retry_after).strip()
+        if not s:
+            return None
+        if s.isdigit():
+            try:
+                seconds = int(s)
+            except (OverflowError, ValueError):
+                return None
+            if 0 <= seconds <= _UPD_MAX_RETRY_AFTER_SECONDS:
+                return _format_local_ts(time.time() + seconds)
+            return None
+        return s[:64]
+
+    reset_raw = headers.get("x-ratelimit-reset")
+    if reset_raw is not None:
+        s = str(reset_raw).strip()
+        if s.isdigit():
+            try:
+                reset_ts = int(s)
+            except (OverflowError, ValueError):
+                return None
+            now = int(time.time())
+            if reset_ts < 0 or reset_ts > now + _UPD_MAX_RESET_FUTURE_SECONDS:
+                return None
+            try:
+                dt = datetime.fromtimestamp(reset_ts)
+                return dt.strftime("%Y-%m-%d %H:%M:%S")
+            except (OverflowError, OSError, ValueError):
+                return None
+    return None
+
+
+def _classify_update_check_error(exc: Exception) -> tuple[str, dict]:
+    if isinstance(exc, TimeoutError | socket.timeout):
+        return "UPD_ERR_TIMEOUT", {}
+    if isinstance(exc, HTTPError):
+        status = exc.code
+        headers = exc.headers or {}
+        remaining = str(headers.get("x-ratelimit-remaining", "")).strip()
+        retry_at = _parse_retry_hint(headers)
+        if status == 429:
+            return (
+                "UPD_ERR_RATE_LIMITED",
+                {"status": status, "retry_at": retry_at or "unknown"},
+            )
+        if status == 403 and (retry_at or remaining == "0"):
+            return (
+                "UPD_ERR_RATE_LIMITED",
+                {"status": status, "retry_at": retry_at or "unknown"},
+            )
+        return "UPD_ERR_HTTP", {"status": status}
+    if isinstance(exc, URLError):
+        reason = getattr(exc, "reason", None)
+        if isinstance(reason, TimeoutError | socket.timeout):
+            return "UPD_ERR_TIMEOUT", {}
+        return "UPD_ERR_NETWORK", {}
+    if isinstance(exc, json.JSONDecodeError | UnicodeDecodeError | ValueError):
+        return "UPD_ERR_JSON", {}
+    return "UPD_CHECK_FAILED", {}
+
+
+def _build_update_check_message(exc: Exception) -> str:
+    try:
+        key, params = _classify_update_check_error(exc)
+        return t(key, **params)
+    except Exception:
+        return t("UPD_CHECK_FAILED")
 
 
 def _fetch_github_compare_status(base_ref: str, head_ref: str) -> str | None:
@@ -1007,6 +1168,7 @@ def _build_mssql_error_message(
     drivers: list[str],
 ) -> str:
     sqlstate, msg = _pyodbc_sqlstate_and_msg(exc)
+    msg = _redact_conn_secrets(msg or "")
 
     diagnostics_lines = [
         f"exe={sys.executable}",
@@ -1028,7 +1190,8 @@ def _build_mssql_error_message(
             text.append(f"- {hint}")
         text.append("")
     text.append(t("CONN_DIAGNOSTICS"))
-    text.extend(diagnostics_lines)
+    for line in diagnostics_lines:
+        text.append(f"- {line}")
     return "\n".join(text)
 
 
@@ -1247,18 +1410,26 @@ def _build_connection_error_message(
     exc: BaseException,
     hints: list[str],
     diagnostics_lines: list[str],
+    sqlstate: Optional[str] = None,
 ) -> str:
     msg = _best_exception_message(exc)
+    msg = _redact_conn_secrets(msg or "")
     text = []
     text.append(msg if msg else "Connection failed.")
     text.append("")
+
+    if sqlstate:
+        text.append(t("CONN_SQLSTATE_LINE", sqlstate=sqlstate))
+        text.append("")
+
     if hints:
-        text.append("Most common causes:")
+        text.append(t("CONN_MOST_COMMON_CAUSES"))
         for hint in hints:
             text.append(f"- {hint}")
         text.append("")
-    text.append("Diagnostics:")
-    text.extend(diagnostics_lines)
+    text.append(t("CONN_DIAGNOSTICS"))
+    for line in diagnostics_lines:
+        text.append(f"- {line}")
     return "\n".join(text)
 
 
@@ -1284,6 +1455,7 @@ def _format_connection_error(
     details = details or {}
 
     if conn_type == "mssql_odbc":
+        orig = _unwrap_dbapi_original(exc)
         pyodbc_ok = False
         drivers = []
         try:
@@ -1322,13 +1494,13 @@ def _format_connection_error(
         conn_str = ";".join(conn_parts)
 
         title, hints = _classify_mssql_conn_error(
-            exc=exc,
+            exc=orig,
             conn_str=conn_str,
             pyodbc_ok=pyodbc_ok,
             drivers=drivers,
         )
         msg = _build_mssql_error_message(
-            exc=exc,
+            exc=orig,
             hints=hints,
             pyodbc_ok=pyodbc_ok,
             drivers=drivers,
@@ -1338,6 +1510,7 @@ def _format_connection_error(
     if conn_type == "postgresql":
         orig = _unwrap_dbapi_original(exc)
         title, hints = _classify_postgresql_conn_error(orig)
+        pg_sqlstate = getattr(orig, "pgcode", None) or getattr(orig, "sqlstate", None)
         host = str(details.get("host") or "").strip()
         port = str(details.get("port") or "5432").strip() or "5432"
         database = str(details.get("database") or "").strip()
@@ -1358,6 +1531,7 @@ def _format_connection_error(
             exc=orig,
             hints=hints,
             diagnostics_lines=diagnostics,
+            sqlstate=pg_sqlstate,
         )
         return title, msg
 
@@ -1790,30 +1964,19 @@ I18N: dict[str, dict[str, str]] = {
         "BTN_HELP": "Help / README",
         "BTN_OPEN_LOGS": "Open logs folder",
         "LBL_PROJECT_PAGE": "Project page",
-        "HELP_TITLE": "Help",
-        "HELP_BODY": (
-            "Checklist (30 seconds):\n"
-            "1) Unzip the ZIP to a folder you can write to (Desktop / Documents).\n"
-            "   Avoid Program Files.\n"
-            "2) Do NOT run the .exe from inside the ZIP (unzip first).\n"
-            "3) If you see access denied / no permission errors, move the folder\n"
-            "   somewhere writable.\n\n"
-            "Where are my files?\n"
-            "- App folder: {base_dir}\n"
-            "- Reports (exports): {reports_dir}\n"
-            "- Logs: {log_file}\n\n"
-            "Tip: Use the buttons below to open these locations."
-        ),
-        "HELP_OPEN_README": "Open README",
-        "HELP_OPEN_LOGS": "Open logs folder",
-        "HELP_OPEN_REPORTS": "Open reports folder",
         "LBL_EXPORT_INFO": "Export info:",
         "BTN_OPEN_FILE": "Open file",
         "BTN_OPEN_FOLDER": "Open folder",
         "LBL_ERRORS_SHORT": "Errors (summary):",
+        "README_WINDOW_TITLE": "kkr-query2xlsx — README",
         "UPD_TITLE": "Updates",
         "UPD_CHECKING": "Checking for updates...",
         "UPD_CHECK_FAILED": "Could not check updates.",
+        "UPD_ERR_NETWORK": "Could not reach GitHub (network/DNS problem). Check your connection and try again.",
+        "UPD_ERR_TIMEOUT": "GitHub did not respond in time (timeout). Try again in a moment.",
+        "UPD_ERR_HTTP": "GitHub returned HTTP {status} while checking updates.",
+        "UPD_ERR_RATE_LIMITED": "GitHub returned HTTP {status}. It looks like rate limiting. Try again after: {retry_at}.",
+        "UPD_ERR_JSON": "Received an invalid response from GitHub (JSON parse error).",
         "UPD_NO_UPDATE": (
             "No Release updates available. Current: {current}, latest Release: {latest}."
         ),
@@ -1830,7 +1993,7 @@ I18N: dict[str, dict[str, str]] = {
         "UPD_GIT_STATUS_DIFFERENT": "Git status: local {local}, remote main {remote} (different).",
         "UPD_GIT_STATUS_DIFFERENT_UNVERIFIED": (
             "Git status: local {local}, remote main {remote} (different) "
-            "(could not compare — check GitHub connection)."
+            "(could not compare — no connection or the local commit does not exist on GitHub)."
         ),
         "UPD_SOURCE_MODE": (
             "This run comes from source files without Git. This check looks only for official "
@@ -2343,30 +2506,19 @@ I18N: dict[str, dict[str, str]] = {
         "BTN_HELP": "Pomoc / README",
         "BTN_OPEN_LOGS": "Otwórz katalog logów",
         "LBL_PROJECT_PAGE": "Strona projektu",
-        "HELP_TITLE": "Pomoc",
-        "HELP_BODY": (
-            "Checklista (30 sekund):\n"
-            "1) Rozpakuj ZIP do katalogu z prawem zapisu (Pulpit / Dokumenty).\n"
-            "   Unikaj Program Files.\n"
-            "2) Nie uruchamiaj .exe z wnętrza ZIP (najpierw rozpakuj).\n"
-            "3) Jeśli widzisz komunikat access denied / no permission, przenieś\n"
-            "   folder w miejsce, do którego masz prawa zapisu.\n\n"
-            "Gdzie są moje pliki?\n"
-            "- Katalog aplikacji: {base_dir}\n"
-            "- Eksporty: {reports_dir}\n"
-            "- Logi: {log_file}\n\n"
-            "Wskazówka: użyj przycisków poniżej, żeby otworzyć te lokalizacje."
-        ),
-        "HELP_OPEN_README": "Otwórz README",
-        "HELP_OPEN_LOGS": "Otwórz katalog logów",
-        "HELP_OPEN_REPORTS": "Otwórz katalog eksportów",
         "LBL_EXPORT_INFO": "Informacje o eksporcie:",
         "BTN_OPEN_FILE": "Otwórz plik",
         "BTN_OPEN_FOLDER": "Otwórz katalog",
         "LBL_ERRORS_SHORT": "Błędy (skrót):",
+        "README_WINDOW_TITLE": "kkr-query2xlsx — README",
         "UPD_TITLE": "Aktualizacje",
         "UPD_CHECKING": "Sprawdzanie aktualizacji...",
         "UPD_CHECK_FAILED": "Nie udało się sprawdzić aktualizacji.",
+        "UPD_ERR_NETWORK": "Brak połączenia z GitHub (problem sieci/DNS). Sprawdź połączenie i spróbuj ponownie.",
+        "UPD_ERR_TIMEOUT": "GitHub nie odpowiedział na czas (timeout). Spróbuj ponownie za chwilę.",
+        "UPD_ERR_HTTP": "GitHub zwrócił HTTP {status} podczas sprawdzania aktualizacji.",
+        "UPD_ERR_RATE_LIMITED": "GitHub zwrócił HTTP {status}. Wygląda na limit zapytań. Spróbuj ponownie po: {retry_at}.",
+        "UPD_ERR_JSON": "Otrzymano nieprawidłową odpowiedź z GitHub (błąd parsowania JSON).",
         "UPD_NO_UPDATE": (
             "Brak aktualizacji wydań (Release). Obecna: {current}, najnowsze Release: {latest}."
         ),
@@ -2383,7 +2535,7 @@ I18N: dict[str, dict[str, str]] = {
         "UPD_GIT_STATUS_DIFFERENT": "Status Git: lokalnie {local}, zdalnie main {remote} (różne).",
         "UPD_GIT_STATUS_DIFFERENT_UNVERIFIED": (
             "Status Git: lokalnie {local}, zdalnie main {remote} (różne) "
-            "(nie udało się porównać — sprawdź połączenie z GitHub)."
+            "(nie udało się porównać — brak połączenia lub lokalny commit nie istnieje na GitHub)."
         ),
         "UPD_SOURCE_MODE": (
             "Uruchomiono ze źródeł bez repo Git. Ta funkcja sprawdza tylko oficjalne wydania "
@@ -2684,23 +2836,6 @@ def open_github_issue_chooser(parent=None) -> None:
 # =========================
 
 REPO_URL = "https://github.com/kkrysztofczyk/kkr-query2xlsx"
-RELEASES_URL = f"{REPO_URL}/releases"
-ISSUES_URL = f"{REPO_URL}/issues"
-
-_DEFAULT_HELP_MD = """# kkr-query2xlsx
-
-Run SQL queries from `.sql` files and export results to **XLSX** or **CSV**.
-
-## Quickstart (GUI)
-1. Select a connection
-2. Choose a `.sql` file (or pick from the list)
-3. Choose output format (XLSX/CSV)
-4. Click **Start**
-5. Your file appears in `generated_reports/`
-
-## Need full docs?
-Open the online README on GitHub.
-"""
 
 
 def _resource_path(rel_path: str) -> Path:
@@ -2716,13 +2851,6 @@ def _read_text_if_exists(path: Path) -> str | None:
     except Exception:
         return None
     return None
-
-
-def open_docs_online(url: str = REPO_URL) -> None:
-    try:
-        webbrowser.open_new_tab(url)
-    except Exception:
-        pass
 
 
 def _cleanup_md_for_viewer(md: str) -> str:
@@ -2827,7 +2955,7 @@ def show_readme_window(parent) -> None:
 
     win = tk.Toplevel(parent)
     apply_app_icon(win)
-    win.title("kkr-query2xlsx — README")
+    win.title(t("README_WINDOW_TITLE"))
     win.geometry("920x700")
     win.minsize(720, 480)
     win.transient(parent)
@@ -2877,6 +3005,8 @@ def show_readme_window(parent) -> None:
     _maybe_insert_image(txt, win._img_refs, _resource_path("docs/gui.png"), max_width=880)
 
     txt.configure(state="disabled")
+    win.update_idletasks()
+    _center_window(win, parent)
 
 
 SECURE_PATH = _build_path("secure.txt")
@@ -3551,26 +3681,46 @@ def remove_bom(content: bytes) -> str:
     """
     Decode text from bytes, handling UTF-8/16/32 BOM if present.
 
+    Also detects UTF-16 without BOM using a light heuristic:
+    NUL bytes mostly on even or odd positions -> likely UTF-16-BE/LE.
+
     Falls back to UTF-8 when no BOM is detected and attempts legacy
     codepages when UTF-8 decoding fails (useful for queries saved with
     Windows encodings).
     """
+    if not content:
+        return ""
+
     # UTF-8 with BOM
     if content.startswith(b"\xef\xbb\xbf"):
         return content[3:].decode("utf-8")
 
+    # UTF-32 LE / BE with BOM
+    if content.startswith((b"\xff\xfe\x00\x00", b"\x00\x00\xfe\xff")):
+        return content.decode("utf-32")
+
     # UTF-16 LE / BE with BOM
-    if content.startswith(b"\xff\xfe") or content.startswith(b"\xfe\xff"):
+    if content.startswith((b"\xff\xfe", b"\xfe\xff")):
         return content.decode("utf-16")
 
-    # UTF-32 LE / BE with BOM
-    if content.startswith(b"\x00\x00\xfe\xff") or content.startswith(b"\xff\xfe\x00\x00"):
-        return content.decode("utf-32")
+    # UTF-16 without BOM (heuristic): aligned NUL bytes suggest LE/BE text
+    head = content[:8192]
+    if b"\x00" in head:
+        nul_positions = [i for i, current_byte in enumerate(head) if current_byte == 0]
+        if nul_positions:
+            even = sum(1 for i in nul_positions if i % 2 == 0)
+            odd = len(nul_positions) - even
+            if max(even, odd) / len(nul_positions) >= 0.90:
+                encoding = "utf-16-le" if odd > even else "utf-16-be"
+                try:
+                    return content.decode(encoding)
+                except UnicodeDecodeError:
+                    pass
 
     # Default: attempt UTF-8 without BOM, then try common Windows encodings
     try:
         return content.decode("utf-8")
-    except UnicodeDecodeError as exc:
+    except UnicodeDecodeError:
         for fallback_encoding in ("cp1250", "cp1252"):
             try:
                 LOGGER.warning(
@@ -3782,12 +3932,53 @@ XLSX_MAX_COLS = 16_384
 
 LOG_DIR: str | None = None
 LOG_FILE_PATH: str | None = None
+LOG_FORMATTER = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s - %(message)s")
+
+
+def _attach_logger_file_handler(log_dir: str) -> bool:
+    global LOG_DIR, LOG_FILE_PATH
+    logger = logging.getLogger("kkr-query2xlsx")
+
+    try:
+        os.makedirs(log_dir, exist_ok=True)
+        log_path = os.path.join(log_dir, "kkr-query2xlsx.log")
+        handler = RotatingFileHandler(
+            log_path,
+            maxBytes=1_000_000,
+            backupCount=3,
+            encoding="utf-8",
+        )
+        handler.setFormatter(LOG_FORMATTER)
+    except Exception:
+        return False
+
+    for existing in list(logger.handlers):
+        if isinstance(existing, RotatingFileHandler):
+            logger.removeHandler(existing)
+            try:
+                existing.close()
+            except Exception:
+                pass
+            continue
+
+        is_fallback_stream = bool(getattr(existing, "_kkr_fallback", False))
+        if is_fallback_stream:
+            logger.removeHandler(existing)
+            try:
+                existing.close()
+            except Exception:
+                pass
+
+    logger.addHandler(handler)
+    LOG_DIR = log_dir
+    LOG_FILE_PATH = log_path
+    return True
 
 
 def _setup_logger():
     """
     Prosty globalny logger z rotacją (ok. 1 MB na plik, 3 backupy).
-    Ścieżka logu może być w katalogu aplikacji albo w katalogu użytkownika (fallback).
+    Domyślnie loguje do DATA_DIR/logs.
     """
     logger = logging.getLogger("kkr-query2xlsx")
     logger.setLevel(logging.INFO)
@@ -3796,92 +3987,49 @@ def _setup_logger():
     # Nie dodawaj handlerów ponownie przy imporcie
     if not logger.handlers:
         global LOG_DIR, LOG_FILE_PATH
-        formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s - %(message)s")
-        handler: logging.Handler | None = None
+        candidates: list[str] = [os.path.join(DATA_DIR, "logs")]
 
-        # 1) Kandydaci - user dirs najpierw (lepsze dla PyInstaller i braku praw zapisu).
-        candidates: list[str] = []
-
-        # 2) Fallback: katalog użytkownika (zawsze writable).
+        # Ostateczny fallback: temp.
         try:
-            if sys.platform == "win32":
-                base = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA")
-                if base:
-                    candidates.append(os.path.join(base, "kkr-query2xlsx", "logs"))
-            elif sys.platform == "darwin":
-                candidates.append(os.path.join(str(Path.home()), "Library", "Logs", "kkr-query2xlsx"))
-            else:
-                base = os.environ.get("XDG_STATE_HOME") or os.environ.get("XDG_CACHE_HOME")
-                if not base:
-                    base = os.path.join(str(Path.home()), ".local", "state")
-                candidates.append(os.path.join(base, "kkr-query2xlsx", "logs"))
-        except Exception:
-            pass
-
-        # 3) Jeśli nie jesteśmy w trybie "frozen", to trzymaj logi przy projekcie jako opcję.
-        if not getattr(sys, "frozen", False):
-            candidates.append(os.path.join(BASE_DIR, "logs"))
-
-        # 4) Ostateczny fallback: temp.
-        try:
-            import tempfile
-
             candidates.append(os.path.join(tempfile.gettempdir(), "kkr-query2xlsx", "logs"))
         except Exception:
             pass
 
-        # 5) Tworzenie handlera z pierwszego katalogu, który działa.
+        attached = False
         for log_dir in candidates:
-            try:
-                os.makedirs(log_dir, exist_ok=True)
-                log_path = os.path.join(log_dir, "kkr-query2xlsx.log")
-                handler = RotatingFileHandler(
-                    log_path,
-                    maxBytes=1_000_000,
-                    backupCount=3,
-                    encoding="utf-8",
-                )
-                LOG_DIR = log_dir
-                LOG_FILE_PATH = log_path
+            if _attach_logger_file_handler(log_dir):
+                attached = True
                 break
-            except Exception:
-                handler = None
 
-        # 6) Jeśli wszystko zawiodło (np. ekstremalne restrykcje) - nie wywalaj aplikacji.
-        if handler is None:
+        if not attached:
             LOG_DIR = None
             LOG_FILE_PATH = None
             if sys.stderr is not None:
-                handler = logging.StreamHandler(sys.stderr)
+                fallback_handler = logging.StreamHandler(sys.stderr)
+                fallback_handler.setFormatter(LOG_FORMATTER)
+                setattr(fallback_handler, "_kkr_fallback", True)
+                logger.addHandler(fallback_handler)
             else:
-                handler = logging.NullHandler()
-
-        handler.setFormatter(formatter)
-        logger.addHandler(handler)
+                logger.addHandler(logging.NullHandler())
 
     return logger
 
 
-def _startup_ask_yes_no(title: str, message: str) -> bool:
-    stdin = getattr(sys, "stdin", None)
-    # Non-interactive runs (CI/scheduled jobs) must not block or open GUI prompts.
-    try:
-        if stdin is None or not getattr(stdin, "isatty", lambda: False)():
+def _startup_ask_yes_no(
+    title: str,
+    message: str,
+    *,
+    mode: Literal["gui", "console", "auto"] = "auto",
+    prefer_gui: bool = False,
+) -> bool:
+    def _console_prompt() -> bool:
+        stdin = getattr(sys, "stdin", None)
+        try:
+            if stdin is None or not getattr(stdin, "isatty", lambda: False)():
+                return False
+        except Exception:
             return False
-    except Exception:
-        return False
 
-    try:
-        import tkinter as _tk
-        from tkinter import messagebox as _mb
-
-        r = _tk.Tk()
-        r.withdraw()
-        ans = _mb.askyesno(title, message, parent=r)
-        r.destroy()
-        return bool(ans)
-    except Exception:
-        # fallback konsolowy
         try:
             print(f"{title}\n{message}", file=sys.stderr)
             resp = input("Use user folder? [y/N]: ").strip().lower()
@@ -3889,16 +4037,33 @@ def _startup_ask_yes_no(title: str, message: str) -> bool:
         except Exception:
             return False
 
+    def _gui_prompt() -> bool:
+        _require_tk()
+        try:
+            import tkinter as _tk
+            from tkinter import messagebox as _mb
+
+            r = _tk.Tk()
+            r.withdraw()
+            try:
+                return bool(_mb.askyesno(title, message, parent=r))
+            finally:
+                r.destroy()
+        except Exception:
+            return _console_prompt()
+
+    if mode == "console":
+        return _console_prompt()
+    if mode == "gui":
+        return _gui_prompt()
+    if mode == "auto":
+        return _gui_prompt() if prefer_gui else _console_prompt()
+
+    return False
+
 
 def _suggest_user_data_dir() -> str:
-    app_name = "kkr-query2xlsx"
-    if sys.platform == "win32":
-        base = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA") or str(Path.home())
-        return os.path.join(base, app_name)
-    if sys.platform == "darwin":
-        return os.path.join(str(Path.home()), "Library", "Application Support", app_name)
-    base = os.environ.get("XDG_DATA_HOME") or os.path.join(str(Path.home()), ".local", "share")
-    return os.path.join(base, app_name)
+    return get_default_user_data_dir()
 
 
 def _startup_show_error(title: str, message: str) -> None:
@@ -3951,6 +4116,93 @@ def _log_unhandled_exception(exc_type, exc_value, exc_traceback):
 
 
 sys.excepthook = _log_unhandled_exception
+
+_ORIG_UNRAISABLEHOOK = getattr(sys, "unraisablehook", None)
+_KKR_UNRAISABLE_INSTALLED = False
+_PKG_VER_CACHE: dict[str, str] = {}
+
+
+def _pkg_version(name: str) -> str:
+    if name in _PKG_VER_CACHE:
+        return _PKG_VER_CACHE[name]
+    try:
+        ver = importlib.metadata.version(name) or ""
+    except Exception:
+        ver = ""
+    _PKG_VER_CACHE[name] = ver
+    return ver
+
+
+def _install_unraisablehook() -> None:
+    global _KKR_UNRAISABLE_INSTALLED
+    if _KKR_UNRAISABLE_INSTALLED or _ORIG_UNRAISABLEHOOK is None:
+        return
+
+    def _debug_unraisable_enabled() -> bool:
+        return os.environ.get("KKR_DEBUG_UNRAISABLE") == "1"
+
+    def _call_orig_unraisablehook(unraisable) -> None:  # noqa: ANN001
+        try:
+            _ORIG_UNRAISABLEHOOK(unraisable)
+        except Exception:
+            pass
+
+    def _hook(unraisable):  # noqa: ANN001
+        try:
+            debug_mode = _debug_unraisable_enabled()
+
+            exc_type = getattr(unraisable, "exc_type", None)
+            exc = getattr(unraisable, "exc_value", None)
+            tb = getattr(unraisable, "exc_traceback", None)
+            obj = getattr(unraisable, "object", None)
+            err_msg = getattr(unraisable, "err_msg", None) or ""
+
+            exc_name = getattr(exc_type, "__name__", "") if exc_type is not None else ""
+            try:
+                obj_repr = repr(obj) if obj is not None else ""
+            except Exception:
+                obj_repr = "<repr unavailable>"
+
+            is_openpyxl_lxml_noise = (
+                exc_name in {"LxmlSyntaxError", "XMLSyntaxError"}
+                and (
+                    "WorksheetWriter.get_stream" in obj_repr
+                    or "WriteOnlyWorksheet._write_rows" in obj_repr
+                )
+            )
+
+            if is_openpyxl_lxml_noise:
+                (LOGGER.debug if debug_mode else LOGGER.warning)(
+                    "%s noisy openpyxl/lxml unraisable exception during cleanup "
+                    "(usually after failed/cancelled XLSX save; check earlier logs for root cause). "
+                    "Python=%s openpyxl=%s lxml=%s; %s",
+                    ("Not suppressed" if debug_mode else "Suppressed"),
+                    (sys.version.split()[0] if sys.version else ""),
+                    _pkg_version("openpyxl"),
+                    _pkg_version("lxml"),
+                    str(exc) if exc is not None else "",
+                )
+                if debug_mode:
+                    _call_orig_unraisablehook(unraisable)
+                return
+
+            LOGGER.error(
+                "Unraisable exception: %s",
+                err_msg,
+                exc_info=(exc_type, exc, tb),
+            )
+
+            if debug_mode:
+                _call_orig_unraisablehook(unraisable)
+        except Exception:
+            if _debug_unraisable_enabled():
+                _call_orig_unraisablehook(unraisable)
+
+    sys.unraisablehook = _hook
+    _KKR_UNRAISABLE_INSTALLED = True
+
+
+_install_unraisablehook()
 
 _ORIG_SYS_EXIT = sys.exit
 
@@ -4265,23 +4517,65 @@ def _ensure_required_work_dirs(output_dir: str) -> None:
     ensure_directories(_required_work_dirs(output_dir))
 
 
-def bootstrap_data_dir_and_workdirs_or_exit() -> str:
+def bootstrap_data_dir_and_workdirs_or_exit(*, prefer_gui_prompt: bool = False) -> str:
     """Ensure working directories are ready, fallback to user dir, or exit with code 1."""
+    user_dir = _suggest_user_data_dir()
+    selected_data_dir = select_startup_data_dir(BASE_DIR, user_dir)
+    _set_data_dir(selected_data_dir)
+
     output_dir = _build_path("generated_reports")
     try:
         _ensure_required_work_dirs(output_dir)
         return output_dir
     except OSError as exc:
-        suggested = _suggest_user_data_dir()
+        base_dir_raw = str(BASE_DIR)
+        user_dir_raw = str(user_dir)
+        current_dir_raw = str(DATA_DIR)
+
+        if _same_path(current_dir_raw, user_dir_raw) and not _same_path(base_dir_raw, user_dir_raw):
+            LOGGER.warning(
+                "DATA_DIR bootstrap failed in user data dir (%s). Trying app dir (%s). Error: %s",
+                user_dir_raw,
+                base_dir_raw,
+                exc,
+                exc_info=True,
+            )
+
+            _set_data_dir(base_dir_raw)
+            output_dir = _build_path("generated_reports")
+            try:
+                _ensure_required_work_dirs(output_dir)
+                return output_dir
+            except OSError as exc_base:
+                _startup_show_error(
+                    "No write permission",
+                    "App cannot create its working folders in either location:\n\n"
+                    f"- User data folder: {user_dir_raw}\n"
+                    f"  Error: {exc}\n\n"
+                    f"- App folder: {base_dir_raw}\n"
+                    f"  Error: {exc_base}\n\n"
+                    "Try:\n"
+                    "- Ensure your user profile storage is available and writable.\n"
+                    "- Or move the app to a writable folder (e.g. Desktop/Documents) and try again.\n",
+                )
+                sys.exit(1)
+
         msg = (
             "App cannot create its working folders under:\n"
-            f"{BASE_DIR}\n\n"
+            f"{DATA_DIR}\n\n"
             "Do you want to store app data in your user folder instead?\n"
-            f"{suggested}\n\n"
+            f"{user_dir_raw}\n\n"
             f"Error: {exc}"
         )
-        if _startup_ask_yes_no("No write permission", msg):
-            _set_data_dir(suggested)
+
+        already_user_dir = _same_path(DATA_DIR, user_dir_raw)
+        if (not already_user_dir) and _startup_ask_yes_no(
+            "No write permission",
+            msg,
+            mode="auto",
+            prefer_gui=prefer_gui_prompt,
+        ):
+            _set_data_dir(user_dir_raw)
             output_dir = _build_path("generated_reports")
             try:
                 _ensure_required_work_dirs(output_dir)
@@ -4294,15 +4588,15 @@ def bootstrap_data_dir_and_workdirs_or_exit() -> str:
                     f"Error: {exc2}",
                 )
                 sys.exit(1)
-        else:
-            _startup_show_error(
-                "No write permission",
-                "App cannot create its working folders under:\n"
-                f"{BASE_DIR}\n\n"
-                "Move the app to a writable folder (e.g. Desktop/Documents) and try again.\n\n"
-                f"Error: {exc}",
-            )
-            sys.exit(1)
+
+        _startup_show_error(
+            "No write permission",
+            "App cannot create its working folders under:\n"
+            f"{DATA_DIR}\n\n"
+            "Move the app to a writable folder (e.g. Desktop/Documents) and try again.\n\n"
+            f"Error: {exc}",
+        )
+        sys.exit(1)
 
 
 def _expected_output_extension(output_format: str) -> str:
@@ -5364,10 +5658,14 @@ def format_error_for_ui(
     sql_query: str,
     sql_source_path: str | None = None,
     max_chars: int = 2000,
+    context: Literal["sql", "export"] = "sql",
 ) -> str:
     """Log full error and return a shortened message for UI display."""
     # pełny traceback + SQL tylko do loga
-    LOGGER.exception("Błąd podczas wykonywania zapytania SQL. Query:\n%s", sql_query)
+    if context == "export":
+        LOGGER.exception("Export failed. Query:\n%s", sql_query)
+    else:
+        LOGGER.exception("Query failed. Query:\n%s", sql_query)
 
     orig = getattr(exc, "orig", exc)
     orig_s = str(orig).strip() if orig is not None else ""
@@ -5543,24 +5841,24 @@ def _export_rows_to_xlsx(
     deadline = _deadline(timeout_seconds)
 
     wb = Workbook(write_only=True)
-    ws = wb.create_sheet(title="Results")
-    ws.append([str(c) for c in (columns or [])])
-
-    for idx, row in enumerate(rows or [], start=1):
-        if idx % 100 == 0:
-            if cancel_event is not None and cancel_event.is_set():
-                raise UserCancelledError(t("ERR_CANCELLED_BY_USER"))
-            _check_deadline(
-                deadline,
-                ExportTimeoutError,
-                t(
-                    "ERR_EXPORT_TIMEOUT",
-                    minutes=max(1, int(math.ceil(timeout_seconds / 60))),
-                ),
-            )
-        ws.append(list(row))
-
     try:
+        ws = wb.create_sheet(title="Results")
+        ws.append([str(c) for c in (columns or [])])
+
+        for idx, row in enumerate(rows or [], start=1):
+            if idx % 100 == 0:
+                if cancel_event is not None and cancel_event.is_set():
+                    raise UserCancelledError(t("ERR_CANCELLED_BY_USER"))
+                _check_deadline(
+                    deadline,
+                    ExportTimeoutError,
+                    t(
+                        "ERR_EXPORT_TIMEOUT",
+                        minutes=max(1, int(math.ceil(timeout_seconds / 60))),
+                    ),
+                )
+            ws.append(list(row))
+
         wb.save(output_file_path)
     finally:
         # Avoid leaving open zip/file handles (notably visible on Python 3.13 at shutdown).
@@ -7775,6 +8073,7 @@ def open_csv_profiles_manager_gui(
 
 
 def run_gui(connection_store, output_directory):
+    _require_tk()
     query_paths_state = {"paths": load_query_paths()}
     csv_profile_state = {"config": load_csv_profiles(), "combobox": None}
     connections_state = {
@@ -9591,6 +9890,7 @@ def run_gui(connection_store, output_directory):
                 exc,
                 sql_query,
                 sql_source_path=sql_src,
+                context="export",
             )
             result_info_var.set(t("ERR_EXPORT"))
             update_error_display(ui_msg)
@@ -9653,6 +9953,7 @@ def run_gui(connection_store, output_directory):
                     exc,
                     sql_query,
                     sql_source_path=params.get("sql_source_path", ""),
+                    context="export",
                 )
                 result_info_var.set(t("ERR_EXPORT"))
                 update_error_display(ui_msg)
@@ -9955,7 +10256,7 @@ def run_gui(connection_store, output_directory):
             except Exception:
                 target = None
         if not target:
-            target = os.path.join(BASE_DIR, "logs")
+            target = _build_path("logs")
         _open_path(target)
 
     def show_help_window():
@@ -9998,7 +10299,7 @@ def run_gui(connection_store, output_directory):
             info = get_update_info()
         except Exception as exc:  # noqa: BLE001
             LOGGER.warning("Update check failed: %s", exc, exc_info=True)
-            messagebox.showerror(t("UPD_TITLE"), t("UPD_CHECK_FAILED"))
+            messagebox.showerror(t("UPD_TITLE"), _build_update_check_message(exc))
             return
         finally:
             if prev_key:
@@ -10009,10 +10310,10 @@ def run_gui(connection_store, output_directory):
         latest_tag = info.get("latest_tag") or ""
         current_tag = info.get("current_tag") or f"v{APP_VERSION}"
         if not latest_tag:
-            messagebox.showerror(t("UPD_TITLE"), t("UPD_CHECK_FAILED"))
+            messagebox.showerror(t("UPD_TITLE"), t("UPD_ERR_JSON"))
             return
         if mode == "exe" and not info.get("asset"):
-            messagebox.showerror(t("UPD_TITLE"), t("UPD_CHECK_FAILED"))
+            messagebox.showerror(t("UPD_TITLE"), t("UPD_ERR_JSON"))
             return
 
         if not info.get("update_available"):
@@ -11300,7 +11601,7 @@ if __name__ == "__main__":
                     print(
                         "Update: local differs from remote main "
                         f"(local {local_short}, remote {remote_short}) "
-                        "(could not compare — check GitHub connection)"
+                        "(could not compare — no connection or the local commit does not exist on GitHub)"
                     )
                 else:
                     print(
@@ -11343,13 +11644,14 @@ if __name__ == "__main__":
             sys.exit(0)
         try:
             info = get_update_info()
-        except Exception:
-            print("Update: error (check failed)")
+        except Exception as exc:
+            LOGGER.warning("Update check failed (CLI): %s", exc, exc_info=True)
+            print(f"Update: error ({_build_update_check_message(exc)})")
             sys.exit(0)
         latest_tag = info.get("latest_tag") or ""
         current_tag = info.get("current_tag") or f"v{APP_VERSION}"
         if not latest_tag:
-            print("Update: error (check failed)")
+            print(f"Update: error ({t('UPD_ERR_JSON')})")
             sys.exit(0)
         if info.get("update_available"):
             print(f"Update: available (current {current_tag}, latest {latest_tag})")
@@ -11378,7 +11680,7 @@ if __name__ == "__main__":
             sys.exit(1)
         sys.exit(0)
 
-    output_directory = bootstrap_data_dir_and_workdirs_or_exit()
+    output_directory = bootstrap_data_dir_and_workdirs_or_exit(prefer_gui_prompt=not args.console)
 
     if args.lang:
         set_lang(args.lang)

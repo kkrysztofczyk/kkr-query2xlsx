@@ -1,6 +1,7 @@
 import importlib.machinery
 import importlib.util
 import unittest
+import os
 from pathlib import Path
 from unittest.mock import patch
 
@@ -33,6 +34,22 @@ class BootstrapDataDirTests(unittest.TestCase):
                 ],
             )
 
+
+    def test_select_startup_data_dir_prefers_base_when_base_has_markers(self):
+        with patch.object(self.app, "has_data_markers", side_effect=[True, True]):
+            selected = self.app.select_startup_data_dir("/base", "/user")
+        self.assertEqual(selected, "/base")
+
+    def test_select_startup_data_dir_falls_back_to_user_markers(self):
+        with patch.object(self.app, "has_data_markers", side_effect=[False, True]):
+            selected = self.app.select_startup_data_dir("/base", "/user")
+        self.assertEqual(selected, "/user")
+
+    def test_select_startup_data_dir_defaults_to_base_without_markers(self):
+        with patch.object(self.app, "has_data_markers", side_effect=[False, False]):
+            selected = self.app.select_startup_data_dir("/base", "/user")
+        self.assertEqual(selected, "/base")
+
     def test_startup_ask_yes_no_returns_false_in_non_interactive_mode(self):
         class NonTtyStdin:
             @staticmethod
@@ -43,17 +60,23 @@ class BootstrapDataDirTests(unittest.TestCase):
             self.assertFalse(self.app._startup_ask_yes_no("title", "message"))
 
     def test_bootstrap_returns_primary_output_dir_when_first_attempt_succeeds(self):
-        with patch.object(self.app, "_build_path", return_value="/base/generated_reports"), patch.object(
+        with patch.object(self.app, "_suggest_user_data_dir", return_value="/user"), patch.object(
+            self.app, "select_startup_data_dir", return_value="/base"
+        ), patch.object(self.app, "_set_data_dir") as set_data_dir_mock, patch.object(self.app, "_build_path", return_value="/base/generated_reports"), patch.object(
             self.app,
             "_ensure_required_work_dirs",
         ) as ensure_mock:
-            output_dir = self.app.bootstrap_data_dir_and_workdirs_or_exit()
+            output_dir = self.app.bootstrap_data_dir_and_workdirs_or_exit(prefer_gui_prompt=False)
+
+        set_data_dir_mock.assert_called_once_with("/base")
 
         self.assertEqual(output_dir, "/base/generated_reports")
         ensure_mock.assert_called_once_with("/base/generated_reports")
 
     def test_bootstrap_first_failure_user_declines_fallback_exits(self):
-        with patch.object(self.app, "_build_path", return_value="/base/generated_reports"), patch.object(
+        with patch.object(self.app, "_suggest_user_data_dir", return_value="/user"), patch.object(
+            self.app, "select_startup_data_dir", return_value="/base"
+        ), patch.object(self.app, "_set_data_dir"), patch.object(self.app, "_build_path", return_value="/base/generated_reports"), patch.object(
             self.app,
             "_ensure_required_work_dirs",
             side_effect=OSError("readonly"),
@@ -62,7 +85,7 @@ class BootstrapDataDirTests(unittest.TestCase):
             "_startup_show_error",
         ) as show_error_mock:
             with self.assertRaises(SystemExit) as ctx:
-                self.app.bootstrap_data_dir_and_workdirs_or_exit()
+                self.app.bootstrap_data_dir_and_workdirs_or_exit(prefer_gui_prompt=False)
 
         self.assertEqual(ctx.exception.code, 1)
         show_error_mock.assert_called_once()
@@ -81,21 +104,25 @@ class BootstrapDataDirTests(unittest.TestCase):
             "_suggest_user_data_dir",
             return_value="/user",
         ), patch.object(
+            self.app, "select_startup_data_dir", return_value="/base"
+        ), patch.object(
             self.app,
             "_startup_ask_yes_no",
             return_value=True,
-        ), patch.object(
+        ) as ask_mock, patch.object(
             self.app,
             "_set_data_dir",
         ) as set_data_dir_mock, patch.object(
             self.app,
             "_startup_show_error",
         ) as show_error_mock:
-            output_dir = self.app.bootstrap_data_dir_and_workdirs_or_exit()
+            output_dir = self.app.bootstrap_data_dir_and_workdirs_or_exit(prefer_gui_prompt=False)
 
         self.assertEqual(output_dir, "/user/generated_reports")
         self.assertEqual(ensure_mock.call_count, 2)
-        set_data_dir_mock.assert_called_once_with("/user")
+        self.assertEqual(set_data_dir_mock.call_args_list[0].args, ("/base",))
+        self.assertEqual(set_data_dir_mock.call_args_list[1].args, ("/user",))
+        ask_mock.assert_called_once()
         show_error_mock.assert_not_called()
 
     def test_bootstrap_fallback_retry_failure_exits(self):
@@ -112,10 +139,12 @@ class BootstrapDataDirTests(unittest.TestCase):
             "_suggest_user_data_dir",
             return_value="/user",
         ), patch.object(
+            self.app, "select_startup_data_dir", return_value="/base"
+        ), patch.object(
             self.app,
             "_startup_ask_yes_no",
             return_value=True,
-        ), patch.object(
+        ) as ask_mock, patch.object(
             self.app,
             "_set_data_dir",
         ) as set_data_dir_mock, patch.object(
@@ -123,10 +152,69 @@ class BootstrapDataDirTests(unittest.TestCase):
             "_startup_show_error",
         ) as show_error_mock:
             with self.assertRaises(SystemExit) as ctx:
-                self.app.bootstrap_data_dir_and_workdirs_or_exit()
+                self.app.bootstrap_data_dir_and_workdirs_or_exit(prefer_gui_prompt=False)
 
         self.assertEqual(ctx.exception.code, 1)
-        set_data_dir_mock.assert_called_once_with("/user")
+        self.assertEqual(set_data_dir_mock.call_args_list[0].args, ("/base",))
+        self.assertEqual(set_data_dir_mock.call_args_list[1].args, ("/user",))
+        ask_mock.assert_called_once()
+        show_error_mock.assert_called_once()
+
+    def test_bootstrap_user_dir_selected_fails_then_base_succeeds_without_prompt(self):
+        # When user_dir is auto-selected (markers) but it's not writable, we should try BASE_DIR.
+        with patch.object(self.app, "BASE_DIR", "/base"), patch.object(
+            self.app, "_suggest_user_data_dir", return_value="/user"
+        ), patch.object(
+            self.app, "select_startup_data_dir", return_value="/user"
+        ), patch.object(
+            self.app, "_build_path",
+            side_effect=["/user/generated_reports", "/base/generated_reports"],
+        ), patch.object(
+            self.app, "_ensure_required_work_dirs",
+            side_effect=[OSError("user readonly"), None],
+        ) as ensure_mock, patch.object(
+            self.app, "_startup_ask_yes_no"
+        ) as ask_mock, patch.object(
+            self.app, "_startup_show_error"
+        ) as show_error_mock, patch.object(
+            self.app, "_set_data_dir"
+        ) as set_data_dir_mock:
+            set_data_dir_mock.side_effect = lambda path: setattr(self.app, "DATA_DIR", os.path.abspath(path))
+            output_dir = self.app.bootstrap_data_dir_and_workdirs_or_exit(prefer_gui_prompt=False)
+
+        self.assertEqual(output_dir, "/base/generated_reports")
+        self.assertEqual(ensure_mock.call_count, 2)
+        self.assertEqual(set_data_dir_mock.call_args_list[0].args, ("/user",))
+        self.assertEqual(set_data_dir_mock.call_args_list[1].args, ("/base",))
+        ask_mock.assert_not_called()
+        show_error_mock.assert_not_called()
+
+    def test_bootstrap_user_dir_selected_and_base_also_fails_exits_without_prompt(self):
+        with patch.object(self.app, "BASE_DIR", "/base"), patch.object(
+            self.app, "_suggest_user_data_dir", return_value="/user"
+        ), patch.object(
+            self.app, "select_startup_data_dir", return_value="/user"
+        ), patch.object(
+            self.app, "_build_path",
+            side_effect=["/user/generated_reports", "/base/generated_reports"],
+        ), patch.object(
+            self.app, "_ensure_required_work_dirs",
+            side_effect=[OSError("user readonly"), OSError("base readonly")],
+        ), patch.object(
+            self.app, "_startup_ask_yes_no"
+        ) as ask_mock, patch.object(
+            self.app, "_startup_show_error"
+        ) as show_error_mock, patch.object(
+            self.app, "_set_data_dir"
+        ) as set_data_dir_mock:
+            set_data_dir_mock.side_effect = lambda path: setattr(self.app, "DATA_DIR", os.path.abspath(path))
+            with self.assertRaises(SystemExit) as ctx:
+                self.app.bootstrap_data_dir_and_workdirs_or_exit(prefer_gui_prompt=False)
+
+        self.assertEqual(ctx.exception.code, 1)
+        self.assertEqual(set_data_dir_mock.call_args_list[0].args, ("/user",))
+        self.assertEqual(set_data_dir_mock.call_args_list[1].args, ("/base",))
+        ask_mock.assert_not_called()
         show_error_mock.assert_called_once()
 
 
