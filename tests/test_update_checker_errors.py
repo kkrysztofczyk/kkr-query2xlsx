@@ -49,6 +49,33 @@ class UpdateCheckerErrorTests(unittest.TestCase):
             self.fail(f"_parse_retry_hint must not raise, but raised: {exc!r}")
         self.assertTrue(out is None or isinstance(out, str))
 
+    def test_parse_retry_hint_falls_back_to_reset_when_retry_after_is_invalid(self):
+        # Retry-After is absurdly large, but X-RateLimit-Reset is usable -> should not return None.
+        with patch.object(self.app.time, "time", return_value=1000):
+            headers = {"retry-after": "9" * 200, "x-ratelimit-reset": "1060"}
+            out = self.app._parse_retry_hint(headers)
+        self.assertIsInstance(out, str)
+        self.assertTrue(out)
+
+
+    def test_parse_retry_hint_prefers_reset_over_non_numeric_retry_after(self):
+        with patch.object(self.app.time, "time", return_value=1000):
+            headers = {
+                "retry-after": "Wed, 21 Oct 2015 07:28:00 GMT",
+                "x-ratelimit-reset": "1060",
+            }
+            out = self.app._parse_retry_hint(headers)
+        self.assertIsInstance(out, str)
+        self.assertRegex(out, r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$")
+        self.assertNotEqual(out, headers["retry-after"])
+
+    def test_parse_retry_hint_returns_retry_after_fallback_when_no_reset(self):
+        headers = {
+            "retry-after": "Wed, 21 Oct 2015 07:28:00 GMT",
+        }
+        out = self.app._parse_retry_hint(headers)
+        self.assertEqual(out, headers["retry-after"][:64])
+
     def test_parse_retry_hint_huge_ratelimit_reset_does_not_raise(self):
         headers = {"x-ratelimit-reset": str(10**200)}
         try:
@@ -102,7 +129,7 @@ class UpdateCheckerErrorTests(unittest.TestCase):
     def test_build_message_never_raises_even_if_retry_hint_parser_breaks(self):
         err = _mk_http_error(429, {"retry-after": "10"})
         with patch.object(self.app, "_parse_retry_hint", side_effect=OverflowError("boom")):
-            msg = self.app._build_update_check_message(err)
+            msg = self.app._build_update_check_message_with_hint(err)
         self.assertIsInstance(msg, str)
         self.assertTrue(msg)
 

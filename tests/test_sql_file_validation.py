@@ -3,6 +3,7 @@ import importlib.util
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 def load_app_module():
@@ -65,6 +66,32 @@ class SqlFileValidationTests(unittest.TestCase):
         path = self._write_temp(".sql", b"\x00\x01\x02\x00" * 128)
         ok, _ = self.app.validate_sql_text_file(path)
         self.assertFalse(ok)
+
+    def test_no_file_selected_is_blocked(self):
+        ok, msg = self.app.validate_sql_text_file("")
+        self.assertFalse(ok)
+        self.assertEqual(msg, self.app.t("ERR_NO_FILE_SELECTED"))
+
+    def test_sqlite_extensions_are_blocked(self):
+        for suffix in (".db", ".sqlite", ".sqlite3"):
+            path = self._write_temp(suffix, b"SELECT 1;\n")
+            ok, msg = self.app.validate_sql_text_file(path)
+            self.assertFalse(ok)
+            self.assertEqual(msg, self.app.t("ERR_SQLFILE_IS_SQLITE_EXT"))
+
+    def test_old_office_magic_is_blocked(self):
+        magic = b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1" + b"rest"
+        path = self._write_temp(".sql", magic)
+        ok, msg = self.app.validate_sql_text_file(path)
+        self.assertFalse(ok)
+        self.assertEqual(msg, self.app.t("ERR_SQLFILE_IS_OLD_OFFICE"))
+
+    def test_cannot_open_file_is_blocked(self):
+        with patch("builtins.open", side_effect=OSError("boom")):
+            ok, msg = self.app.validate_sql_text_file("/nonexistent/path.sql")
+        self.assertFalse(ok)
+        self.assertIsInstance(msg, str)
+        self.assertIn("boom", msg)
 
 
 if __name__ == "__main__":

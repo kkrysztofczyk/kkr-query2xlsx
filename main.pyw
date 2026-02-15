@@ -9,7 +9,6 @@ import importlib.metadata
 import logging
 import math
 import platform
-import textwrap
 import queue
 import re
 import socket
@@ -27,19 +26,39 @@ import io
 import contextlib
 from datetime import datetime
 from pathlib import Path
-from typing import Literal, Optional, Tuple
+from typing import Callable, Literal, Optional, Tuple
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote_plus, unquote_plus
 from urllib.request import Request, urlopen
 
 from logging.handlers import RotatingFileHandler
 
-import openpyxl
-import sqlalchemy
-from sqlalchemy import create_engine, event, text
-from sqlalchemy.exc import DBAPIError, NoSuchModuleError
-from openpyxl import Workbook, load_workbook
-from openpyxl.utils import coordinate_to_tuple
+_MISSING_DEPENDENCIES: list[str] = []
+
+try:
+    import openpyxl
+    from openpyxl import Workbook, load_workbook
+    from openpyxl.utils import coordinate_to_tuple
+except ModuleNotFoundError:
+    openpyxl = None  # type: ignore[assignment]
+    Workbook = load_workbook = coordinate_to_tuple = None  # type: ignore[assignment]
+    _MISSING_DEPENDENCIES.append("openpyxl")
+
+try:
+    import sqlalchemy
+    from sqlalchemy import create_engine, event, text
+    from sqlalchemy.exc import DBAPIError, NoSuchModuleError
+except ModuleNotFoundError:
+    sqlalchemy = None  # type: ignore[assignment]
+    create_engine = event = text = None  # type: ignore[assignment]
+
+    class DBAPIError(Exception):
+        pass
+
+    class NoSuchModuleError(Exception):
+        pass
+
+    _MISSING_DEPENDENCIES.append("sqlalchemy")
 
 try:
     import tkinter as tk
@@ -82,6 +101,50 @@ def _load_optional_sql_highlighter():
 
 
 CodeView, SQL_LEXER_CLASSES = _load_optional_sql_highlighter()
+
+
+def _missing_deps_message() -> str:
+    deps = sorted(set(_MISSING_DEPENDENCIES))
+    if not deps:
+        return ""
+    deps_csv = ", ".join(deps)
+    deps_pip = " ".join(deps)
+    return (
+        "Missing required dependencies: "
+        f"{deps_csv}.\nInstall with: python -m pip install {deps_pip}"
+    )
+
+
+def _ensure_runtime_dependencies(*, show_gui: bool = True) -> None:
+    if not _MISSING_DEPENDENCIES:
+        return
+    msg = _missing_deps_message()
+    try:
+        if show_gui and _TK_AVAILABLE and messagebox is not None:
+            messagebox.showerror("Missing dependencies", msg)
+    except Exception:
+        pass
+    raise RuntimeError(msg)
+
+
+def _sql_log_excerpt(sql: str, *, max_chars: int = 5000, max_lines: int = 200) -> str:
+    is_debug = str(os.environ.get("KKR_LOG_FULL_SQL", "")).strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    if is_debug:
+        return (sql or "").rstrip()
+    return _sql_excerpt_preserve_lines(sql, max_chars=max_chars, max_lines=max_lines)
+
+
+def _log_sql_exception(message: str, sql_query: str) -> None:
+    LOGGER.exception("%s Query (excerpt):\n%s", message, _sql_log_excerpt(sql_query))
+
+
+def _log_sql_warning(message: str, sql_query: str, *args) -> None:
+    LOGGER.warning(message + " Query (excerpt):\n%s", *args, _sql_log_excerpt(sql_query))
 
 
 def _xlsx_get_sheetnames(xlsx_path: str) -> list[str]:
@@ -686,38 +749,49 @@ def _parse_retry_hint(headers) -> str | None:  # noqa: ANN001
     if not headers:
         return None
 
-    retry_after = headers.get("retry-after")
+    retry_after_fallback_str: str | None = None
+    retry_after_ts: str | None = None
+
+    try:
+        retry_after = headers.get("retry-after")
+    except Exception:  # noqa: BLE001
+        retry_after = None
     if retry_after is not None:
         s = str(retry_after).strip()
-        if not s:
-            return None
-        if s.isdigit():
-            try:
-                seconds = int(s)
-            except (OverflowError, ValueError):
-                return None
-            if 0 <= seconds <= _UPD_MAX_RETRY_AFTER_SECONDS:
-                return _format_local_ts(time.time() + seconds)
-            return None
-        return s[:64]
+        if s:
+            if s.isdigit():
+                try:
+                    seconds = int(s)
+                except (OverflowError, ValueError):
+                    seconds = None
+                if seconds is not None and 0 <= seconds <= _UPD_MAX_RETRY_AFTER_SECONDS:
+                    retry_after_ts = _format_local_ts(time.time() + seconds)
+            else:
+                retry_after_fallback_str = s[:64]
 
-    reset_raw = headers.get("x-ratelimit-reset")
+    try:
+        reset_raw = headers.get("x-ratelimit-reset")
+    except Exception:  # noqa: BLE001
+        reset_raw = None
     if reset_raw is not None:
         s = str(reset_raw).strip()
         if s.isdigit():
             try:
                 reset_ts = int(s)
             except (OverflowError, ValueError):
-                return None
-            now = int(time.time())
-            if reset_ts < 0 or reset_ts > now + _UPD_MAX_RESET_FUTURE_SECONDS:
-                return None
-            try:
-                dt = datetime.fromtimestamp(reset_ts)
-                return dt.strftime("%Y-%m-%d %H:%M:%S")
-            except (OverflowError, OSError, ValueError):
-                return None
-    return None
+                reset_ts = None
+            if reset_ts is not None:
+                now = int(time.time())
+                if 0 <= reset_ts <= now + _UPD_MAX_RESET_FUTURE_SECONDS:
+                    try:
+                        dt = datetime.fromtimestamp(reset_ts)
+                        return dt.strftime("%Y-%m-%d %H:%M:%S")
+                    except (OverflowError, OSError, ValueError):
+                        pass
+
+    if retry_after_ts:
+        return retry_after_ts
+    return retry_after_fallback_str
 
 
 def _classify_update_check_error(exc: Exception) -> tuple[str, dict]:
@@ -726,7 +800,10 @@ def _classify_update_check_error(exc: Exception) -> tuple[str, dict]:
     if isinstance(exc, HTTPError):
         status = exc.code
         headers = exc.headers or {}
-        remaining = str(headers.get("x-ratelimit-remaining", "")).strip()
+        try:
+            remaining = str(headers.get("x-ratelimit-remaining", "")).strip()
+        except Exception:  # noqa: BLE001
+            remaining = ""
         retry_at = _parse_retry_hint(headers)
         if status == 429:
             return (
@@ -749,12 +826,70 @@ def _classify_update_check_error(exc: Exception) -> tuple[str, dict]:
     return "UPD_CHECK_FAILED", {}
 
 
-def _build_update_check_message(exc: Exception) -> str:
+def _build_update_check_message_with_hint(exc: Exception) -> str:
+    """Build update checker message with a short diagnostic hint."""
     try:
         key, params = _classify_update_check_error(exc)
-        return t(key, **params)
+        base = t(key, **(params or {}))
     except Exception:
-        return t("UPD_CHECK_FAILED")
+        key = "UPD_CHECK_FAILED"
+        base = t("UPD_CHECK_FAILED")
+
+    hint_key = {
+        "UPD_ERR_NETWORK": "UPD_HINT_NETWORK",
+        "UPD_ERR_TIMEOUT": "UPD_HINT_TIMEOUT",
+        "UPD_ERR_RATE_LIMITED": "UPD_HINT_RATE_LIMITED",
+        "UPD_ERR_JSON": "UPD_HINT_JSON",
+        "UPD_ERR_HTTP": "UPD_HINT_HTTP",
+    }.get(key)
+
+    if not hint_key:
+        return base
+
+    try:
+        hint = t(hint_key)
+    except Exception:
+        return base
+
+    if hint and hint != hint_key:
+        return base + "\n\n" + t("UPD_DIAG_HINT", hint=hint)
+    return base
+
+
+def _is_transient_update_check_error(key: str, params: dict) -> bool:
+    """Return True for update checker errors worth retrying once."""
+    if key in {"UPD_ERR_NETWORK", "UPD_ERR_TIMEOUT"}:
+        return True
+    if key == "UPD_ERR_HTTP":
+        try:
+            status = int((params or {}).get("status") or 0)
+        except Exception:
+            return False
+        return status in {408, 500, 502, 503, 504}
+    return False
+
+
+def _get_update_info_with_retry(*, retry_once: bool = True, retry_delay_s: float = 0.8) -> dict:
+    """Call get_update_info with optional one-time retry for transient errors."""
+    attempts = 2 if retry_once else 1
+    last_exc: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return get_update_info()
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            if attempt >= attempts:
+                raise
+            try:
+                key, params = _classify_update_check_error(exc)
+            except Exception:
+                raise exc.with_traceback(exc.__traceback__) from None
+            if not _is_transient_update_check_error(key, params):
+                raise
+            LOGGER.info("Update check transient error (%s) - retrying once.", key)
+            time.sleep(max(0.0, float(retry_delay_s)))
+
+    raise last_exc or RuntimeError("Update check failed")
 
 
 def _fetch_github_compare_status(base_ref: str, head_ref: str) -> str | None:
@@ -966,6 +1101,7 @@ def apply_native_ttk_theme(root: tk.Tk) -> None:
                     continue
     except Exception:
         pass
+
 
 def _get_git_short_sha() -> str | None:
     """Best-effort git short SHA for local/dev runs. Returns None when unavailable."""
@@ -1405,28 +1541,31 @@ def _classify_sqlite_conn_error(exc: BaseException) -> tuple[str, list[str]]:
     )
 
 
+def _raise_if_cancelled(cancel_event: threading.Event | None) -> None:
+    if cancel_event is not None and cancel_event.is_set():
+        raise UserCancelledError(t("ERR_CANCELLED_BY_USER"))
+
+
 def _build_connection_error_message(
-    *,
-    exc: BaseException,
+    exc: Exception,
     hints: list[str],
     diagnostics_lines: list[str],
     sqlstate: Optional[str] = None,
+    msg_override: Optional[str] = None,
 ) -> str:
-    msg = _best_exception_message(exc)
+    override = str(msg_override).strip() if isinstance(msg_override, str) else ""
+    msg = override or _best_exception_message(exc)
     msg = _redact_conn_secrets(msg or "")
-    text = []
-    text.append(msg if msg else "Connection failed.")
-    text.append("")
-
+    text = [msg if msg else "Connection failed."]
     if sqlstate:
-        text.append(t("CONN_SQLSTATE_LINE", sqlstate=sqlstate))
         text.append("")
-
+        text.append(t("CONN_SQLSTATE_LINE", sqlstate=sqlstate))
     if hints:
+        text.append("")
         text.append(t("CONN_MOST_COMMON_CAUSES"))
         for hint in hints:
             text.append(f"- {hint}")
-        text.append("")
+    text.append("")
     text.append(t("CONN_DIAGNOSTICS"))
     for line in diagnostics_lines:
         text.append(f"- {line}")
@@ -1449,7 +1588,7 @@ def _format_connection_error(
         f"exe={sys.executable}",
         f"python={sys.version.split()[0]} ({'frozen' if _is_frozen_exe() else 'source'})",
         f"platform={sys.platform}",
-        f"sqlalchemy={sqlalchemy.__version__}",
+        f"sqlalchemy={getattr(sqlalchemy, '__version__', 'unknown')}",
     ]
     conn_type = (conn_type or "").strip()
     details = details or {}
@@ -1977,6 +2116,12 @@ I18N: dict[str, dict[str, str]] = {
         "UPD_ERR_HTTP": "GitHub returned HTTP {status} while checking updates.",
         "UPD_ERR_RATE_LIMITED": "GitHub returned HTTP {status}. It looks like rate limiting. Try again after: {retry_at}.",
         "UPD_ERR_JSON": "Received an invalid response from GitHub (JSON parse error).",
+        "UPD_DIAG_HINT": "Diagnostic hint: {hint}",
+        "UPD_HINT_NETWORK": "Check your internet connection, VPN/proxy, or open github.com in a browser to verify access.",
+        "UPD_HINT_TIMEOUT": "Network may be slow or GitHub may be temporarily overloaded - try again in a minute.",
+        "UPD_HINT_RATE_LIMITED": "GitHub limits API requests (especially without login). Wait and try again later.",
+        "UPD_HINT_HTTP": "A corporate proxy/firewall may be blocking api.github.com.",
+        "UPD_HINT_JSON": "A proxy/antivirus might be modifying the response. Try another network or report an issue.",
         "UPD_NO_UPDATE": (
             "No Release updates available. Current: {current}, latest Release: {latest}."
         ),
@@ -2008,7 +2153,7 @@ I18N: dict[str, dict[str, str]] = {
         "ERR_CONNECTION_BODY": (
             "Failed to establish a connection.\n\nTechnical details:\n{error}"
         ),
-        "STATUS_CONNECTED": "Connected to {name} ({type}).",
+        "STATUS_CONNECTED": "Connected to {name} - {type}.",
         "INFO_CONNECTION_OK_TITLE": "Connection works",
         "INFO_CONNECTION_OK_BODY": "Connection {name} succeeded.",
         "ERR_NO_SECURE_CONFIG": "No connection configuration.",
@@ -2018,21 +2163,32 @@ I18N: dict[str, dict[str, str]] = {
         "CLI_DESC": "Run SQL files and export results to XLSX/CSV.",
         "CLI_LANG_HELP": "UI language (en/pl).",
         "CLI_CONSOLE_HELP": "Run in console mode.",
+        "CLI_SQL_HELP": "Path to a .sql file to run (non-interactive mode).",
+        "CLI_FORMAT_HELP": "Output format for --sql: xlsx or csv.",
+        "CLI_CONNECTION_HELP": "Connection name to use in console mode (defaults to last_selected).",
+        "CLI_DEMO_HELP": "Use built-in demo SQLite database (ignores saved connections).",
         "CLI_OUTPUT_HELP": (
             "Optional output file or directory. A directory may be existing or a new path "
             "without an extension. Use a trailing slash/backslash to force directory "
             "interpretation."
         ),
+        "CLI_USING_CONNECTION": "Using connection: {name} - {type}.",
+        "CLI_CONNECTION_NOT_FOUND": "Connection not found: {name}. Available: {available}",
+        "CLI_DEMO_MISSING": "Demo database file not found: {path}",
         "CLI_NO_CONNECTIONS": (
             "No saved connections. Create a connection in GUI mode to run console."
         ),
         "CLI_CONNECTION_FAIL": "Failed to create connection. Full details in log.",
+        "CLI_PASSWORD_REQUIRED_NONINTERACTIVE": (
+            "Password required - store it in secure.txt or use Trusted_Connection."
+        ),
         "MENU_LANGUAGE": "Language",
         "ERR_FILE_PATH": "Path: {path}",
         "ERR_FILE_LOCKED": (
             "The output file already exists and may be open in another app (e.g. Excel). "
             "Close it and try again.{path}"
         ),
+        "ERR_NO_WRITE_TITLE": "No write permission",
         "ERR_NO_WRITE_PERMISSION": (
             "No permission to write the output file or the path is unavailable. "
             "Check the file location."
@@ -2519,6 +2675,12 @@ I18N: dict[str, dict[str, str]] = {
         "UPD_ERR_HTTP": "GitHub zwrócił HTTP {status} podczas sprawdzania aktualizacji.",
         "UPD_ERR_RATE_LIMITED": "GitHub zwrócił HTTP {status}. Wygląda na limit zapytań. Spróbuj ponownie po: {retry_at}.",
         "UPD_ERR_JSON": "Otrzymano nieprawidłową odpowiedź z GitHub (błąd parsowania JSON).",
+        "UPD_DIAG_HINT": "Wskazówka diagnostyczna: {hint}",
+        "UPD_HINT_NETWORK": "Sprawdź internet, VPN/proxy albo otwórz github.com w przeglądarce, żeby potwierdzić dostęp.",
+        "UPD_HINT_TIMEOUT": "Sieć może być wolna albo GitHub chwilowo nie odpowiada - spróbuj ponownie za minutę.",
+        "UPD_HINT_RATE_LIMITED": "GitHub limituje liczbę zapytań API (zwłaszcza bez logowania). Odczekaj i spróbuj później.",
+        "UPD_HINT_HTTP": "Możliwe, że proxy/firewall blokuje api.github.com (częste w sieciach firmowych).",
+        "UPD_HINT_JSON": "Możliwe, że proxy/antywirus modyfikuje odpowiedź. Spróbuj z innej sieci albo zgłoś problem.",
         "UPD_NO_UPDATE": (
             "Brak aktualizacji wydań (Release). Obecna: {current}, najnowsze Release: {latest}."
         ),
@@ -2550,7 +2712,7 @@ I18N: dict[str, dict[str, str]] = {
         "ERR_CONNECTION_BODY": (
             "Nie udało się nawiązać połączenia.\n\nSzczegóły techniczne:\n{error}"
         ),
-        "STATUS_CONNECTED": "Połączono z {name} ({type}).",
+        "STATUS_CONNECTED": "Połączono z {name} - {type}.",
         "INFO_CONNECTION_OK_TITLE": "Połączenie działa",
         "INFO_CONNECTION_OK_BODY": "Połączenie {name} powiodło się.",
         "ERR_NO_SECURE_CONFIG": "Brak konfiguracji połączenia",
@@ -2560,20 +2722,31 @@ I18N: dict[str, dict[str, str]] = {
         "CLI_DESC": "Uruchamiaj pliki SQL i eksportuj wyniki do XLSX/CSV.",
         "CLI_LANG_HELP": "Język interfejsu (en/pl).",
         "CLI_CONSOLE_HELP": "Uruchom w trybie konsolowym.",
+        "CLI_SQL_HELP": "Ścieżka do pliku .sql do uruchomienia (tryb bez interakcji).",
+        "CLI_FORMAT_HELP": "Format wyjściowy dla --sql: xlsx lub csv.",
+        "CLI_CONNECTION_HELP": "Nazwa połączenia dla trybu konsolowego (domyślnie: last_selected).",
+        "CLI_DEMO_HELP": "Użyj wbudowanej bazy demo SQLite (ignoruje zapisane połączenia).",
         "CLI_OUTPUT_HELP": (
             "Opcjonalny plik lub katalog docelowy. Katalog może być istniejący lub nowy "
             "(ścieżka bez rozszerzenia). Aby wymusić katalog, dodaj na końcu / lub \\."
         ),
+        "CLI_USING_CONNECTION": "Używam połączenia: {name} - {type}.",
+        "CLI_CONNECTION_NOT_FOUND": "Nie znaleziono połączenia: {name}. Dostępne: {available}",
+        "CLI_DEMO_MISSING": "Nie znaleziono pliku bazy demo: {path}",
         "CLI_NO_CONNECTIONS": (
             "Brak zapisanych połączeń. Utwórz połączenie w trybie GUI, aby uruchomić konsolę."
         ),
         "CLI_CONNECTION_FAIL": "Nie udało się utworzyć połączenia. Pełne szczegóły w logu.",
+        "CLI_PASSWORD_REQUIRED_NONINTERACTIVE": (
+            "Wymagane hasło — zapisz je w secure.txt lub użyj Trusted_Connection."
+        ),
         "MENU_LANGUAGE": "Język",
         "ERR_FILE_PATH": "Ścieżka: {path}",
         "ERR_FILE_LOCKED": (
             "Plik docelowy już istnieje i może być otwarty w innej aplikacji "
             "(np. Excel). Zamknij go i spróbuj ponownie.{path}"
         ),
+        "ERR_NO_WRITE_TITLE": "Brak uprawnień do zapisu",
         "ERR_NO_WRITE_PERMISSION": (
             "Brak uprawnień do zapisu pliku docelowego lub ścieżka jest niedostępna. "
             "Sprawdź lokalizację pliku."
@@ -3451,51 +3624,6 @@ def _apply_codeview_pygments_style(w: tk.Text, style_name: str = "vs") -> None:
             except Exception:
                 pass
 
-
-def _apply_sql_light_theme_simple(w: tk.Text) -> None:
-    # base
-    w.configure(
-        bg="white",
-        fg="black",
-        insertbackground="black",
-        selectbackground="#cce8ff",
-        inactiveselectbackground="#cce8ff",
-    )
-
-    def _set(tag: str, **cfg):
-        try:
-            w.tag_configure(tag, **cfg)
-        except Exception:
-            pass
-
-    for tag in w.tag_names():
-        lt = tag.lower()
-        norm = lt.replace(".", "_").replace("-", "_")
-
-        # comments
-        if "comment" in norm:
-            _set(tag, foreground="#008000")
-            continue
-
-        # strings
-        if "string" in norm:
-            _set(tag, foreground="#a31515")
-            continue
-
-        # keywords (SELECT/CREATE/INSERT/...)
-        if "keyword" in norm:
-            _set(tag, foreground="#0000ff")
-            continue
-
-        # datatypes often come as Name.Builtin / Keyword.Type
-        if "name_builtin" in norm or "keyword_type" in norm or "type" in norm:
-            _set(tag, foreground="#0000ff")
-            continue
-
-        # numbers (opcjonalnie)
-        if "number" in norm:
-            _set(tag, foreground="#098658")
-            continue
 
 
 def shorten_path(path, max_len=80):
@@ -4498,18 +4626,16 @@ def ensure_directories(paths):
         os.makedirs(path, exist_ok=True)
 
 
+WORKDIR_SUBDIRS = ("sql_archive", "templates", "queries")
+
+
 def _required_work_dirs(output_dir: str) -> list[str]:
     """Single source of truth for required working directories.
 
     NOTE: compute subpaths via ``_build_path`` to avoid stale import-time globals
     after a runtime DATA_DIR switch.
     """
-    return [
-        output_dir,
-        _build_path("sql_archive"),
-        _build_path("templates"),
-        _build_path("queries"),
-    ]
+    return [output_dir, *[_build_path(subdir) for subdir in WORKDIR_SUBDIRS]]
 
 
 def _ensure_required_work_dirs(output_dir: str) -> None:
@@ -4517,8 +4643,17 @@ def _ensure_required_work_dirs(output_dir: str) -> None:
     ensure_directories(_required_work_dirs(output_dir))
 
 
-def bootstrap_data_dir_and_workdirs_or_exit(*, prefer_gui_prompt: bool = False) -> str:
+def bootstrap_data_dir_and_workdirs_or_exit(*, prefer_gui_prompt: bool = False, headless: bool = False) -> str:
     """Ensure working directories are ready, fallback to user dir, or exit with code 1."""
+    no_write_title = t("ERR_NO_WRITE_TITLE")
+
+    def _exit_no_write(message: str) -> None:
+        if headless:
+            print(f"{no_write_title}:\n{message}", file=sys.stderr)
+        else:
+            _startup_show_error(no_write_title, message)
+        sys.exit(1)
+
     user_dir = _suggest_user_data_dir()
     selected_data_dir = select_startup_data_dir(BASE_DIR, user_dir)
     _set_data_dir(selected_data_dir)
@@ -4533,9 +4668,17 @@ def bootstrap_data_dir_and_workdirs_or_exit(*, prefer_gui_prompt: bool = False) 
         current_dir_raw = str(DATA_DIR)
 
         if _same_path(current_dir_raw, user_dir_raw) and not _same_path(base_dir_raw, user_dir_raw):
+            failed_data_dir = str(DATA_DIR)
+            required_dirs = [
+                output_dir,
+                *[os.path.join(failed_data_dir, subdir) for subdir in WORKDIR_SUBDIRS],
+            ]
             LOGGER.warning(
-                "DATA_DIR bootstrap failed in user data dir (%s). Trying app dir (%s). Error: %s",
+                "DATA_DIR bootstrap failed during user-dir attempt. failed_data_dir=%s user_dir=%s output_dir=%s required_dirs=%s. Trying app dir=%s. Error: %s",
+                failed_data_dir,
                 user_dir_raw,
+                output_dir,
+                required_dirs,
                 base_dir_raw,
                 exc,
                 exc_info=True,
@@ -4547,8 +4690,7 @@ def bootstrap_data_dir_and_workdirs_or_exit(*, prefer_gui_prompt: bool = False) 
                 _ensure_required_work_dirs(output_dir)
                 return output_dir
             except OSError as exc_base:
-                _startup_show_error(
-                    "No write permission",
+                _exit_no_write(
                     "App cannot create its working folders in either location:\n\n"
                     f"- User data folder: {user_dir_raw}\n"
                     f"  Error: {exc}\n\n"
@@ -4558,45 +4700,52 @@ def bootstrap_data_dir_and_workdirs_or_exit(*, prefer_gui_prompt: bool = False) 
                     "- Ensure your user profile storage is available and writable.\n"
                     "- Or move the app to a writable folder (e.g. Desktop/Documents) and try again.\n",
                 )
-                sys.exit(1)
 
         msg = (
             "App cannot create its working folders under:\n"
-            f"{DATA_DIR}\n\n"
+            f"{DATA_DIR}\n"
+            f"Output folder: {output_dir}\n\n"
             "Do you want to store app data in your user folder instead?\n"
             f"{user_dir_raw}\n\n"
             f"Error: {exc}"
         )
 
         already_user_dir = _same_path(DATA_DIR, user_dir_raw)
-        if (not already_user_dir) and _startup_ask_yes_no(
-            "No write permission",
-            msg,
-            mode="auto",
-            prefer_gui=prefer_gui_prompt,
-        ):
+        if headless and (not already_user_dir):
+            use_user_dir = True
+        elif not already_user_dir:
+            use_user_dir = _startup_ask_yes_no(
+                no_write_title,
+                msg,
+                mode="auto",
+                prefer_gui=prefer_gui_prompt,
+            )
+        else:
+            use_user_dir = False
+
+        if use_user_dir:
             _set_data_dir(user_dir_raw)
             output_dir = _build_path("generated_reports")
             try:
                 _ensure_required_work_dirs(output_dir)
                 return output_dir
             except OSError as exc2:
-                _startup_show_error(
-                    "No write permission",
+                _exit_no_write(
                     "Still cannot create working folders in:\n"
-                    f"{DATA_DIR}\n\n"
+                    f"{DATA_DIR}\n"
+                    f"Output folder: {output_dir}\n\n"
                     f"Error: {exc2}",
                 )
-                sys.exit(1)
 
-        _startup_show_error(
-            "No write permission",
+        # Recompute from current DATA_DIR so the final message stays consistent.
+        output_dir = _build_path("generated_reports")
+        _exit_no_write(
             "App cannot create its working folders under:\n"
-            f"{DATA_DIR}\n\n"
+            f"{DATA_DIR}\n"
+            f"Output folder: {output_dir}\n\n"
             "Move the app to a writable folder (e.g. Desktop/Documents) and try again.\n\n"
             f"Error: {exc}",
         )
-        sys.exit(1)
 
 
 def _expected_output_extension(output_format: str) -> str:
@@ -4930,6 +5079,35 @@ def _check_deadline(deadline, exc_type, message: str) -> None:
     if deadline is not None and time.monotonic() > deadline:
         raise exc_type(message)
 
+
+def _timeout_minutes_from_seconds(seconds: int | float) -> int:
+    """Convert seconds to whole minutes used in user-facing timeout messages."""
+    try:
+        secs = float(seconds or 0)
+    except Exception:
+        secs = 0.0
+    return max(1, int(math.ceil(max(0.0, secs) / 60.0)))
+
+
+def _export_timeout_msg(timeout_seconds: int | float) -> str:
+    return t(
+        "ERR_EXPORT_TIMEOUT",
+        minutes=_timeout_minutes_from_seconds(timeout_seconds),
+    )
+
+
+def _query_timeout_msg(timeout_seconds: int | float) -> str:
+    return t(
+        "ERR_QUERY_TIMEOUT",
+        minutes=_timeout_minutes_from_seconds(timeout_seconds),
+    )
+
+
+def _raise_if_timed_out(timed_out_flag: dict, timeout_seconds: int | float) -> None:
+    if timed_out_flag.get("flag"):
+        raise QueryTimeoutError(_query_timeout_msg(timeout_seconds))
+
+
 def _sql_excerpt_preserve_lines(
     sql: str,
     *,
@@ -4959,6 +5137,7 @@ def _sql_excerpt_preserve_lines(
         out += "\n...\n(Trimmed in UI, full query in kkr-query2xlsx.log)"
     return out
 
+
 def _limit_text_for_widget(text: str, max_chars: int = 50000) -> str:
     s = text or ""
     if len(s) <= max_chars:
@@ -4981,11 +5160,6 @@ def _dbapi_conn_from_raw_connection(raw_conn):
         except Exception:
             pass
     return raw_conn
-
-
-def _mssql_dbapi_from_raw_connection(raw_conn):
-    """Backward-compatible alias for legacy call sites."""
-    return _dbapi_conn_from_raw_connection(raw_conn)
 
 
 def _split_sql_statements(sql: str, backend: str) -> list[str]:
@@ -5160,6 +5334,24 @@ def _apply_server_side_timeout_dbapi(backend: str, cur, timeout_seconds: int) ->
         pass
 
 
+def _setup_dbapi_cursor_from_raw(raw, *, timeout_seconds: int, dbapi_conn_holder: dict):
+    """Common DBAPI cursor setup for batch execution.
+
+    - sets cancellable handle in dbapi_conn_holder
+    - applies driver-level timeout when supported
+    """
+    cur = raw.cursor()
+    dbapi_conn_holder["conn"] = (
+        cur if hasattr(cur, "cancel") else _dbapi_conn_from_raw_connection(raw)
+    )
+    try:
+        if hasattr(cur, "timeout"):
+            cur.timeout = max(0, int(timeout_seconds or 0))
+    except Exception:
+        pass
+    return cur
+
+
 def _run_dbapi_batch_fetch_last_select(
     engine,
     sql_query: str,
@@ -5179,18 +5371,11 @@ def _run_dbapi_batch_fetch_last_select(
     raw = engine.raw_connection()
     cur = None
     try:
-        cur = raw.cursor()
-        # Keep a cancellable object: prefer cursor.cancel() when available,
-        # otherwise use the underlying DBAPI connection.
-        dbapi_conn_holder["conn"] = (
-            cur if hasattr(cur, "cancel") else _dbapi_conn_from_raw_connection(raw)
+        cur = _setup_dbapi_cursor_from_raw(
+            raw,
+            timeout_seconds=int(timeout_seconds or 0),
+            dbapi_conn_holder=dbapi_conn_holder,
         )
-
-        try:
-            if hasattr(cur, "timeout"):
-                cur.timeout = max(0, int(timeout_seconds or 0))
-        except Exception:
-            pass
 
         _apply_server_side_timeout_dbapi(backend, cur, int(timeout_seconds or 0))
 
@@ -5202,19 +5387,9 @@ def _run_dbapi_batch_fetch_last_select(
         last_cols: list = []
         fetch_size = 2000
 
-        def _raise_timeout():
-            raise QueryTimeoutError(
-                t(
-                    "ERR_QUERY_TIMEOUT",
-                    minutes=max(1, int(math.ceil(max(0, int(timeout_seconds or 0)) / 60))),
-                )
-            )
-
         for stmt in stmts:
-            if cancel_event is not None and cancel_event.is_set():
-                raise UserCancelledError(t("ERR_CANCELLED_BY_USER"))
-            if timed_out_flag.get("flag"):
-                _raise_timeout()
+            _raise_if_cancelled(cancel_event)
+            _raise_if_timed_out(timed_out_flag, timeout_seconds)
 
             try:
                 cur.execute(stmt)
@@ -5232,10 +5407,8 @@ def _run_dbapi_batch_fetch_last_select(
                 cols = [str(c[0]) for c in (cur.description or [])]
                 rows: list = []
                 while True:
-                    if cancel_event is not None and cancel_event.is_set():
-                        raise UserCancelledError(t("ERR_CANCELLED_BY_USER"))
-                    if timed_out_flag.get("flag"):
-                        _raise_timeout()
+                    _raise_if_cancelled(cancel_event)
+                    _raise_if_timed_out(timed_out_flag, timeout_seconds)
                     try:
                         chunk = cur.fetchmany(fetch_size)
                     except Exception as exc:  # noqa: BLE001
@@ -5289,23 +5462,15 @@ def _run_mssql_batch_fetch_last_select(
     raw = engine.raw_connection()
     cur = None
     try:
-        cur = raw.cursor()
-        # Keep a cancellable object: prefer cursor.cancel() when available,
-        # otherwise use the underlying DBAPI connection.
-        dbapi_conn_holder["conn"] = (
-            cur if hasattr(cur, "cancel") else _dbapi_conn_from_raw_connection(raw)
+        cur = _setup_dbapi_cursor_from_raw(
+            raw,
+            timeout_seconds=int(timeout_seconds or 0),
+            dbapi_conn_holder=dbapi_conn_holder,
         )
-
-        try:
-            if hasattr(cur, "timeout"):
-                cur.timeout = max(0, int(timeout_seconds or 0))
-        except Exception:
-            pass
 
         batch = "SET NOCOUNT ON;\n" + (sql_query or "")
 
-        if cancel_event is not None and cancel_event.is_set():
-            raise UserCancelledError(t("ERR_CANCELLED_BY_USER"))
+        _raise_if_cancelled(cancel_event)
 
         try:
             cur.execute(batch)
@@ -5324,22 +5489,8 @@ def _run_mssql_batch_fetch_last_select(
         last_cols: list = []
 
         while True:
-            if cancel_event is not None and cancel_event.is_set():
-                raise UserCancelledError(t("ERR_CANCELLED_BY_USER"))
-            if timed_out_flag.get("flag"):
-                raise QueryTimeoutError(
-                    t(
-                        "ERR_QUERY_TIMEOUT",
-                        minutes=max(
-                            1,
-                            int(
-                                math.ceil(
-                                    max(0, int(timeout_seconds or 0)) / 60
-                                )
-                            ),
-                        ),
-                    )
-                )
+            _raise_if_cancelled(cancel_event)
+            _raise_if_timed_out(timed_out_flag, timeout_seconds)
 
             if cur.description is not None:
                 cols = [str(c[0]) for c in (cur.description or [])]
@@ -5347,22 +5498,8 @@ def _run_mssql_batch_fetch_last_select(
                 fetch_size = 2000
 
                 while True:
-                    if cancel_event is not None and cancel_event.is_set():
-                        raise UserCancelledError(t("ERR_CANCELLED_BY_USER"))
-                    if timed_out_flag.get("flag"):
-                        raise QueryTimeoutError(
-                            t(
-                                "ERR_QUERY_TIMEOUT",
-                                minutes=max(
-                                    1,
-                                    int(
-                                        math.ceil(
-                                            max(0, int(timeout_seconds or 0)) / 60
-                                        )
-                                    ),
-                                ),
-                            )
-                        )
+                    _raise_if_cancelled(cancel_event)
+                    _raise_if_timed_out(timed_out_flag, timeout_seconds)
                     try:
                         chunk = cur.fetchmany(fetch_size)
                     except (UserCancelledError, QueryTimeoutError):
@@ -5450,16 +5587,21 @@ def _run_query_to_rows(
             def canceller():
                 if cancel_event is None:
                     return
-                cancel_event.wait()
-                cancelled["flag"] = True
+                # IMPORTANT: don't leak daemon threads when the user never cancels.
+                # Exit as soon as the query finishes.
+                while not done.wait(0.05):  # type: ignore[union-attr]
+                    if not cancel_event.is_set():
+                        continue
+                    cancelled["flag"] = True
 
-                while True:
-                    if done.wait(0.05):  # type: ignore[union-attr]
-                        return
-                    conn = dbapi_conn_holder.get("conn")
-                    if conn is not None:
-                        _cancel_db_operation(conn)
-                        return
+                    # Wait until we have a cancellable handle (cursor/conn),
+                    # but also stop if the query finishes first.
+                    while not done.wait(0.05):  # type: ignore[union-attr]
+                        conn = dbapi_conn_holder.get("conn")
+                        if conn is not None:
+                            _cancel_db_operation(conn)
+                            return
+                    return
 
             done = threading.Event()
             t_watchdog = threading.Thread(target=watchdog, daemon=True)
@@ -5492,8 +5634,7 @@ def _run_query_to_rows(
                 )
             else:
                 with engine.connect() as connection:
-                    if cancel_event is not None and cancel_event.is_set():
-                        raise UserCancelledError(t("ERR_CANCELLED_BY_USER"))
+                    _raise_if_cancelled(cancel_event)
                     set_engine_db_timeout(engine, timeout_seconds)
                     _apply_server_side_timeout_if_possible(
                         backend, connection, timeout_seconds
@@ -5508,20 +5649,14 @@ def _run_query_to_rows(
                         columns = list(result.keys())
                         fetch_size = 2000
                         while True:
-                            if cancel_event is not None and cancel_event.is_set():
-                                raise UserCancelledError(t("ERR_CANCELLED_BY_USER"))
+                            _raise_if_cancelled(cancel_event)
                             chunk = result.fetchmany(fetch_size)
                             if not chunk:
                                 break
                             rows.extend(chunk)
                             if timed_out["flag"]:
                                 raise QueryTimeoutError(
-                                    t(
-                                        "ERR_QUERY_TIMEOUT",
-                                        minutes=max(
-                                            1, int(math.ceil(timeout_seconds / 60))
-                                        ),
-                                    )
+                                    _query_timeout_msg(timeout_seconds)
                                 )
                     else:
                         rows = []
@@ -5541,10 +5676,7 @@ def _run_query_to_rows(
 
             if timed_out.get("flag"):
                 raise QueryTimeoutError(
-                    t(
-                        "ERR_QUERY_TIMEOUT",
-                        minutes=max(1, int(math.ceil(timeout_seconds / 60))),
-                    )
+                    _query_timeout_msg(timeout_seconds)
                 ) from e
 
             if timeout_seconds > 0:
@@ -5571,10 +5703,7 @@ def _run_query_to_rows(
                     signature in msg_lower for signature in timeout_error_signatures
                 ):
                     raise QueryTimeoutError(
-                        t(
-                            "ERR_QUERY_TIMEOUT",
-                            minutes=max(1, int(math.ceil(timeout_seconds / 60))),
-                        )
+                        _query_timeout_msg(timeout_seconds)
                     ) from e
 
             # Keep this as a safe superset (avoid regressions across backends).
@@ -5602,18 +5731,18 @@ def _run_query_to_rows(
                 signature in msg_lower for signature in retryable_error_signatures
             ) and attempt < max_retries:
                 wait_seconds = 2 ** attempt
-                LOGGER.warning(
+                _log_sql_warning(
                     "Deadlock-like DBAPIError while executing SQL "
-                    "(attempt %s/%s, waiting %s s). Query:\n%s",
+                    "(attempt %s/%s, waiting %s s).",
+                    sql_query,
                     attempt,
                     max_retries,
                     wait_seconds,
-                    sql_query,
                 )
                 time.sleep(wait_seconds)
                 continue
 
-            LOGGER.exception("DBAPIError while executing SQL. Query:\n%s", sql_query)
+            _log_sql_exception("DBAPIError while executing SQL.", sql_query)
             raise
 
         except (UserCancelledError, QueryTimeoutError) as e:
@@ -5636,8 +5765,8 @@ def _run_query_to_rows(
 
         except Exception:  # noqa: BLE001
             last_exception = sys.exc_info()[1]
-            LOGGER.exception(
-                "Unexpected error while executing SQL. Query:\n%s",
+            _log_sql_exception(
+                "Unexpected error while executing SQL.",
                 sql_query,
             )
             raise
@@ -5663,9 +5792,9 @@ def format_error_for_ui(
     """Log full error and return a shortened message for UI display."""
     # pełny traceback + SQL tylko do loga
     if context == "export":
-        LOGGER.exception("Export failed. Query:\n%s", sql_query)
+        _log_sql_exception("Export failed.", sql_query)
     else:
-        LOGGER.exception("Query failed. Query:\n%s", sql_query)
+        _log_sql_exception("Query failed.", sql_query)
 
     orig = getattr(exc, "orig", exc)
     orig_s = str(orig).strip() if orig is not None else ""
@@ -5799,15 +5928,11 @@ def _export_rows_to_csv(
 
         for idx, row in enumerate(rows or [], start=1):
             if idx % 100 == 0:
-                if cancel_event is not None and cancel_event.is_set():
-                    raise UserCancelledError(t("ERR_CANCELLED_BY_USER"))
+                _raise_if_cancelled(cancel_event)
                 _check_deadline(
                     deadline,
                     ExportTimeoutError,
-                    t(
-                        "ERR_EXPORT_TIMEOUT",
-                        minutes=max(1, int(math.ceil(timeout_seconds / 60))),
-                    ),
+                    _export_timeout_msg(timeout_seconds),
                 )
 
             values = list(row)
@@ -5824,10 +5949,12 @@ def _export_rows_to_csv(
                 ]
             )
 
+    _raise_if_cancelled(cancel_event)
+
     _check_deadline(
         deadline,
         ExportTimeoutError,
-        t("ERR_EXPORT_TIMEOUT", minutes=max(1, int(math.ceil(timeout_seconds / 60)))),
+        _export_timeout_msg(timeout_seconds),
     )
 
 
@@ -5847,19 +5974,24 @@ def _export_rows_to_xlsx(
 
         for idx, row in enumerate(rows or [], start=1):
             if idx % 100 == 0:
-                if cancel_event is not None and cancel_event.is_set():
-                    raise UserCancelledError(t("ERR_CANCELLED_BY_USER"))
+                _raise_if_cancelled(cancel_event)
                 _check_deadline(
                     deadline,
                     ExportTimeoutError,
-                    t(
-                        "ERR_EXPORT_TIMEOUT",
-                        minutes=max(1, int(math.ceil(timeout_seconds / 60))),
-                    ),
+                    _export_timeout_msg(timeout_seconds),
                 )
             ws.append(list(row))
 
+        _raise_if_cancelled(cancel_event)
+
+        _check_deadline(
+            deadline,
+            ExportTimeoutError,
+            _export_timeout_msg(timeout_seconds),
+        )
+
         wb.save(output_file_path)
+        _raise_if_cancelled(cancel_event)
     finally:
         # Avoid leaving open zip/file handles (notably visible on Python 3.13 at shutdown).
         try:
@@ -5870,7 +6002,7 @@ def _export_rows_to_xlsx(
     _check_deadline(
         deadline,
         ExportTimeoutError,
-        t("ERR_EXPORT_TIMEOUT", minutes=max(1, int(math.ceil(timeout_seconds / 60)))),
+        _export_timeout_msg(timeout_seconds),
     )
 
 
@@ -5883,10 +6015,17 @@ def run_export(
     *,
     db_timeout_seconds: int = 0,
     export_timeout_seconds: int = 0,
+    cancel_event: threading.Event | None = None,
+    phase_callback: Optional[Callable[[str], None]] = None,
 ):
     """Execute SQL, export the result, and return timing + row count details."""
+    if phase_callback is not None:
+        phase_callback("query")
     rows, columns, sql_duration, sql_start = _run_query_to_rows(
-        engine, sql_query, timeout_seconds=db_timeout_seconds
+        engine,
+        sql_query,
+        timeout_seconds=db_timeout_seconds,
+        cancel_event=cancel_event,
     )
     rows_count = len(rows)
     columns_count = len(columns)
@@ -5903,6 +6042,9 @@ def run_export(
 
     export_duration = 0.0
     if rows_count:
+        _raise_if_cancelled(cancel_event)
+        if phase_callback is not None:
+            phase_callback("export_xlsx" if output_format == "xlsx" else "export_csv")
         export_start = time.perf_counter()
         try:
             if output_format == "xlsx":
@@ -5911,6 +6053,7 @@ def run_export(
                     columns=list(columns),
                     rows=rows,
                     timeout_seconds=int(export_timeout_seconds or 0),
+                    cancel_event=cancel_event,
                 )
             else:
                 profile = csv_profile or DEFAULT_CSV_PROFILE
@@ -5920,6 +6063,7 @@ def run_export(
                     rows=rows,
                     profile=profile,
                     timeout_seconds=int(export_timeout_seconds or 0),
+                    cancel_event=cancel_event,
                 )
         except Exception:
             _safe_remove(output_file_path)
@@ -5944,7 +6088,8 @@ def run_export_to_template(
     *,
     db_timeout_seconds: int = 0,
     export_timeout_seconds: int = 0,
-    cancel_event: Optional[threading.Event] = None,
+    cancel_event: threading.Event | None = None,
+    phase_callback: Optional[Callable[[str], None]] = None,
 ):
     """
     Execute SQL, copy XLSX template and paste data into given sheet starting at start_cell.
@@ -5952,6 +6097,8 @@ def run_export_to_template(
     Returns the same tuple as run_export:
     (sql_duration, export_duration, total_duration, rows_count).
     """
+    if phase_callback is not None:
+        phase_callback("query")
     rows, columns, sql_duration, sql_start = _run_query_to_rows(
         engine,
         sql_query,
@@ -5974,14 +6121,38 @@ def run_export_to_template(
 
     export_start = time.perf_counter()
     try:
+        deadline = _deadline(int(export_timeout_seconds or 0))
         # Zawsze kopiujemy template, nawet jeśli nie ma wierszy z SQL
+        _raise_if_cancelled(cancel_event)
+        if phase_callback is not None:
+            phase_callback("export_template")
+        _check_deadline(
+            deadline,
+            ExportTimeoutError,
+            _export_timeout_msg(export_timeout_seconds),
+        )
         shutil.copyfile(template_path, output_file_path)
+
+        # Allow user cancellation right after template copy.
+        # Without this check, a cancellation triggered during/after the copy
+        # might still continue into workbook loading/writing.
+        _raise_if_cancelled(cancel_event)
+
+        _check_deadline(
+            deadline,
+            ExportTimeoutError,
+            _export_timeout_msg(export_timeout_seconds),
+        )
 
         wb = None
         try:
             if rows_count:
-                deadline = _deadline(int(export_timeout_seconds or 0))
                 wb = load_workbook(output_file_path)
+                _check_deadline(
+                    deadline,
+                    ExportTimeoutError,
+                    _export_timeout_msg(export_timeout_seconds),
+                )
                 if sheet_name not in wb.sheetnames:
                     raise ValueError(t("ERR_TEMPLATE_MISSING_SHEET", sheet=sheet_name))
 
@@ -5989,26 +6160,14 @@ def run_export_to_template(
 
                 data_start_row = start_row
                 if include_header:
-                    if cancel_event is not None and cancel_event.is_set():
-                        raise UserCancelledError(t("ERR_CANCELLED_BY_USER"))
+                    _raise_if_cancelled(cancel_event)
                     for c_offset, col_name in enumerate(list(columns)):
                         if c_offset % 50 == 0:
-                            if cancel_event is not None and cancel_event.is_set():
-                                raise UserCancelledError(t("ERR_CANCELLED_BY_USER"))
+                            _raise_if_cancelled(cancel_event)
                             _check_deadline(
                                 deadline,
                                 ExportTimeoutError,
-                                t(
-                                    "ERR_EXPORT_TIMEOUT",
-                                    minutes=max(
-                                        1,
-                                        int(
-                                            math.ceil(
-                                                int(export_timeout_seconds or 0) / 60
-                                            )
-                                        ),
-                                    ),
-                                ),
+                                _export_timeout_msg(export_timeout_seconds),
                             )
                         cell = ws.cell(row=start_row, column=start_col + c_offset)
                         cell.value = col_name
@@ -6016,22 +6175,11 @@ def run_export_to_template(
 
                 for r_offset, row in enumerate(rows):
                     if r_offset % 100 == 0:
-                        if cancel_event is not None and cancel_event.is_set():
-                            raise UserCancelledError(t("ERR_CANCELLED_BY_USER"))
+                        _raise_if_cancelled(cancel_event)
                         _check_deadline(
                             deadline,
                             ExportTimeoutError,
-                            t(
-                                "ERR_EXPORT_TIMEOUT",
-                                minutes=max(
-                                    1,
-                                    int(
-                                        math.ceil(
-                                            int(export_timeout_seconds or 0) / 60
-                                        )
-                                    ),
-                                ),
-                            ),
+                            _export_timeout_msg(export_timeout_seconds),
                         )
                     for c_offset, value in enumerate(list(row)):
                         cell = ws.cell(
@@ -6039,9 +6187,19 @@ def run_export_to_template(
                             column=start_col + c_offset,
                         )
                         cell.value = value
-                if cancel_event is not None and cancel_event.is_set():
-                    raise UserCancelledError(t("ERR_CANCELLED_BY_USER"))
+                _raise_if_cancelled(cancel_event)
+                _check_deadline(
+                    deadline,
+                    ExportTimeoutError,
+                    _export_timeout_msg(export_timeout_seconds),
+                )
                 wb.save(output_file_path)
+                _raise_if_cancelled(cancel_event)
+                _check_deadline(
+                    deadline,
+                    ExportTimeoutError,
+                    _export_timeout_msg(export_timeout_seconds),
+                )
         finally:
             if wb is not None:
                 try:
@@ -6142,7 +6300,9 @@ def run_console(
             break
         print(t("CONSOLE_INVALID_FORMAT"))
 
-    selected_csv_profile = get_csv_profile(csv_config, csv_config.get("default_profile"))
+    selected_csv_profile = get_csv_profile(
+            csv_config, csv_config.get("default_profile")
+        ) or (csv_config.get("profiles") or [DEFAULT_CSV_PROFILE])[0]
     if output_format == "csv":
         profiles = csv_config.get("profiles", [])
         profile_names = [p.get("name") for p in profiles]
@@ -6234,6 +6394,96 @@ def run_console(
     if rows_count > 0:
         print(t("CONSOLE_EXPORT_TIME", fmt=output_format, seconds=export_dur))
         print(t("CONSOLE_TOTAL_TIME", seconds=total_dur))
+
+
+def run_console_noninteractive(
+    engine,
+    output_directory,
+    selected_connection,
+    *,
+    sql_path,
+    output_format,
+    output_override,
+    archive_sql,
+) -> int:
+    resolved_sql_path = resolve_path(sql_path)
+    ok, msg = validate_sql_text_file(resolved_sql_path)
+    if not ok:
+        print(f"ERROR: {msg}")
+        return 1
+
+    with open(resolved_sql_path, "rb") as file:
+        content = file.read()
+    sql_query = remove_bom(content).strip()
+
+    selected_csv_profile = None
+    if output_format == "csv":
+        csv_config = load_csv_profiles()
+        selected_csv_profile = get_csv_profile(
+            csv_config, csv_config.get("default_profile")
+        ) or (csv_config.get("profiles") or [DEFAULT_CSV_PROFILE])[0]
+
+    db_timeout_seconds = load_persisted_db_timeout_seconds()
+    export_timeout_seconds = load_persisted_export_timeout_seconds()
+
+    base_name = os.path.basename(resolved_sql_path)
+    output_file_name = os.path.splitext(base_name)[0] + (
+        ".xlsx" if output_format == "xlsx" else ".csv"
+    )
+    output_file_path, _ = normalize_output_file_path(
+        output_directory=output_directory,
+        default_file_name=output_file_name,
+        output_format=output_format,
+        override_path=(output_override.strip() if output_override else None),
+        prefer_dir_for_extensionless_nonexistent=True,
+    )
+
+    try:
+        sql_dur, export_dur, total_dur, rows_count = run_export(
+            engine,
+            sql_query,
+            output_file_path,
+            output_format,
+            csv_profile=selected_csv_profile,
+            db_timeout_seconds=db_timeout_seconds,
+            export_timeout_seconds=export_timeout_seconds,
+        )
+    except (XlsxSizeError, QueryTimeoutError, ExportTimeoutError) as exc:
+        print(str(exc))
+        return 1
+    except Exception as exc:  # noqa: BLE001
+        print(str(exc))
+        LOGGER.exception("Non-interactive export failed", exc_info=True)
+        return 1
+
+    if archive_sql:
+        try:
+            write_sql_archive_entry(
+                sql_query=sql_query,
+                report_label=os.path.basename(resolved_sql_path),
+                sql_source_path=resolved_sql_path,
+                output_file_path=output_file_path,
+                output_format=output_format,
+                rows_count=rows_count,
+                sql_duration=sql_dur,
+                export_duration=export_dur,
+                total_duration=total_dur,
+                connection_name=selected_connection.get("name", ""),
+                connection_type=selected_connection.get("type", ""),
+            )
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning("SQL archive failed: %s", exc, exc_info=True)
+
+    if rows_count > 0:
+        print(t("CONSOLE_SAVED_PATH", path=output_file_path))
+    else:
+        print(t("CONSOLE_NO_ROWS"))
+    print(t("CONSOLE_SQL_TIME", seconds=sql_dur))
+    if rows_count > 0:
+        print(t("CONSOLE_EXPORT_TIME", fmt=output_format, seconds=export_dur))
+        print(t("CONSOLE_TOTAL_TIME", seconds=total_dur))
+
+    return 0
 
 
 def _create_mssql_frame(parent):
@@ -10085,144 +10335,52 @@ def run_gui(connection_store, output_directory):
         def _work(report_step):
             engine = params["engine"]
             report_step(t("PROGRESS_GETTING_DATA"))
-    
-            rows, columns, sql_duration, sql_start = _run_query_to_rows(
-                engine,
-                sql_query,
-                timeout_seconds=db_timeout_seconds,
-                cancel_event=cancel_state["event"],
-            )
-            rows_count = len(rows)
-            columns_count = len(columns)
-    
+
+            def phase_cb(phase: str) -> None:
+                if phase == "query":
+                    report_step(t("PROGRESS_GETTING_DATA"))
+                elif phase == "export_template":
+                    report_step(t("PROGRESS_EXPORTING_XLSX_TEMPLATE"))
+                elif phase == "export_csv":
+                    report_step(t("PROGRESS_EXPORTING_CSV"))
+                elif phase == "export_xlsx":
+                    report_step(t("PROGRESS_EXPORTING_XLSX"))
+
             if params.get("use_template"):
                 template = params["template"]
-                start_row, start_col = coordinate_to_tuple(template["start_cell"])
-                _ensure_xlsx_limits(
-                    rows_count,
-                    columns_count,
-                    header_rows=(1 if (template["include_header"] and rows_count) else 0),
-                    start_row=start_row,
-                    start_col=start_col,
+                sql_duration, export_duration, total_duration, rows_count = run_export_to_template(
+                    engine,
+                    sql_query,
+                    template_path=template["template_path"],
+                    output_file_path=params["output_file_path"],
+                    sheet_name=template["sheet_name"],
+                    start_cell=template["start_cell"],
+                    include_header=template["include_header"],
+                    db_timeout_seconds=db_timeout_seconds,
+                    export_timeout_seconds=export_timeout_seconds,
+                    cancel_event=cancel_state["event"],
+                    phase_callback=phase_cb,
                 )
-                report_step(t("PROGRESS_EXPORTING_XLSX_TEMPLATE"))
-    
-                export_start = time.perf_counter()
-                try:
-                    shutil.copyfile(template["template_path"], params["output_file_path"])
-    
-                    wb = None
-                    try:
-                        if rows_count:
-                            deadline = _deadline(int(export_timeout_seconds or 0))
-                            wb = load_workbook(params["output_file_path"])
-                            if template["sheet_name"] not in wb.sheetnames:
-                                raise ValueError(
-                                    t("ERR_TEMPLATE_MISSING_SHEET", sheet=template["sheet_name"])
-                                )
-    
-                            ws = wb[template["sheet_name"]]
-    
-                            data_start_row = start_row
-                            if template["include_header"]:
-                                for c_offset, col_name in enumerate(list(columns)):
-                                    if c_offset % 50 == 0:
-                                        if cancel_state["event"] is not None and cancel_state["event"].is_set():
-                                            raise UserCancelledError(t("ERR_CANCELLED_BY_USER"))
-                                        _check_deadline(
-                                            deadline,
-                                            ExportTimeoutError,
-                                            t(
-                                                "ERR_EXPORT_TIMEOUT",
-                                                minutes=max(1, int(math.ceil(int(export_timeout_seconds or 0) / 60))),
-                                            ),
-                                        )
-                                    ws.cell(row=start_row, column=start_col + c_offset).value = col_name
-                                data_start_row = start_row + 1
-    
-                            for r_offset, row in enumerate(rows):
-                                if r_offset % 100 == 0:
-                                    if cancel_state["event"] is not None and cancel_state["event"].is_set():
-                                        raise UserCancelledError(t("ERR_CANCELLED_BY_USER"))
-                                    _check_deadline(
-                                        deadline,
-                                        ExportTimeoutError,
-                                        t(
-                                            "ERR_EXPORT_TIMEOUT",
-                                            minutes=max(1, int(math.ceil(int(export_timeout_seconds or 0) / 60))),
-                                        ),
-                                    )
-                                for c_offset, value in enumerate(list(row)):
-                                    ws.cell(
-                                        row=data_start_row + r_offset,
-                                        column=start_col + c_offset,
-                                    ).value = value
-                            if cancel_state["event"] is not None and cancel_state["event"].is_set():
-                                raise UserCancelledError(t("ERR_CANCELLED_BY_USER"))
-                            wb.save(params["output_file_path"])
-                    finally:
-                        if wb is not None:
-                            try:
-                                wb.close()
-                            except Exception:
-                                pass
-                except Exception:
-                    _safe_remove(params["output_file_path"])
-                    raise
-    
-                export_end = time.perf_counter()
-                export_duration = export_end - export_start
-                total_duration = export_end - sql_start
             else:
-                if output_format == "xlsx":
-                    _ensure_xlsx_limits(
-                        rows_count,
-                        columns_count,
-                        header_rows=(1 if rows_count else 0),
-                        start_row=1,
-                        start_col=1,
-                    )
-    
-                report_step(t("PROGRESS_EXPORTING_CSV") if output_format == "csv" else t("PROGRESS_EXPORTING_XLSX"))
-    
-                export_duration = 0.0
-                if rows_count:
-                    export_start = time.perf_counter()
-                    try:
-                        if output_format == "xlsx":
-                            _export_rows_to_xlsx(
-                                params["output_file_path"],
-                                columns=list(columns),
-                                rows=rows,
-                                timeout_seconds=int(export_timeout_seconds or 0),
-                                cancel_event=cancel_state["event"],
-                            )
-                        else:
-                            profile = csv_profile or DEFAULT_CSV_PROFILE
-                            _export_rows_to_csv(
-                                params["output_file_path"],
-                                columns=list(columns),
-                                rows=rows,
-                                profile=profile,
-                                timeout_seconds=int(export_timeout_seconds or 0),
-                                cancel_event=cancel_state["event"],
-                            )
-                    except Exception:
-                        _safe_remove(params["output_file_path"])
-                        raise
-                    export_end = time.perf_counter()
-                    export_duration = export_end - export_start
-                    total_duration = export_end - sql_start
-                else:
-                    total_duration = sql_duration
-    
+                sql_duration, export_duration, total_duration, rows_count = run_export(
+                    engine,
+                    sql_query,
+                    params["output_file_path"],
+                    output_format,
+                    csv_profile=csv_profile,
+                    db_timeout_seconds=db_timeout_seconds,
+                    export_timeout_seconds=export_timeout_seconds,
+                    cancel_event=cancel_state["event"],
+                    phase_callback=phase_cb,
+                )
+
             return {
                 "sql_duration": sql_duration,
                 "export_duration": export_duration,
                 "total_duration": total_duration,
                 "rows_count": rows_count,
             }
-    
+
         _run_export_in_background(_work)
 
     def _open_path(target):
@@ -10264,105 +10422,155 @@ def run_gui(connection_store, output_directory):
         show_readme_window(root)
 
     def check_updates_gui():
+        if btn_check_updates.cget("state") == tk.DISABLED:
+            return
+
         prev_status = connection_status_var.get()
         prev_key = connection_status_state.get("key")
-        prev_params = connection_status_state.get("params") or {}
+        prev_params = dict(connection_status_state.get("params") or {})
+        start_btn = start_button_holder.get("widget")
+        prev_connected = bool(start_btn is not None and start_btn.cget("state") == tk.NORMAL)
+
+        btn_check_updates.config(state=tk.DISABLED)
         connection_status_var.set(t("UPD_CHECKING"))
         root.update_idletasks()
-        mode = detect_install_mode()
-        git_status_line = None
-        if mode == "git":
-            local_sha = _get_git_full_sha()
-            remote_sha = None
+
+        result_queue: queue.Queue = queue.Queue()
+
+        def worker() -> None:
+            payload: dict[str, object] = {
+                "prev_status": prev_status,
+                "prev_key": prev_key,
+                "prev_params": prev_params,
+                "prev_connected": prev_connected,
+            }
             try:
-                remote_sha = _fetch_remote_main_sha()
-            except Exception:
-                remote_sha = None
-            if local_sha and remote_sha:
-                local_short = local_sha[:7]
-                remote_short = remote_sha[:7]
-                relation = _classify_git_relation(local_sha, remote_sha)
-                if relation == "match":
-                    key = "UPD_GIT_STATUS_MATCH"
-                elif relation == "remote_ahead":
-                    key = "UPD_GIT_STATUS_AHEAD"
-                elif relation == "local_ahead":
-                    key = "UPD_GIT_STATUS_LOCAL_AHEAD"
-                elif relation == "diverged":
-                    key = "UPD_GIT_STATUS_DIVERGED"
-                elif relation == "different_unverified":
-                    key = "UPD_GIT_STATUS_DIFFERENT_UNVERIFIED"
+                mode = detect_install_mode()
+                payload["mode"] = mode
+                git_status_line = None
+                if mode == "git":
+                    local_sha = _get_git_full_sha()
+                    remote_sha = None
+                    try:
+                        remote_sha = _fetch_remote_main_sha()
+                    except Exception:
+                        remote_sha = None
+                    if local_sha and remote_sha:
+                        local_short = local_sha[:7]
+                        remote_short = remote_sha[:7]
+                        relation = _classify_git_relation(local_sha, remote_sha)
+                        if relation == "match":
+                            key = "UPD_GIT_STATUS_MATCH"
+                        elif relation == "remote_ahead":
+                            key = "UPD_GIT_STATUS_AHEAD"
+                        elif relation == "local_ahead":
+                            key = "UPD_GIT_STATUS_LOCAL_AHEAD"
+                        elif relation == "diverged":
+                            key = "UPD_GIT_STATUS_DIVERGED"
+                        elif relation == "different_unverified":
+                            key = "UPD_GIT_STATUS_DIFFERENT_UNVERIFIED"
+                        else:
+                            key = "UPD_GIT_STATUS_DIFFERENT"
+                        git_status_line = t(key, local=local_short, remote=remote_short)
+                payload["git_status_line"] = git_status_line
+                payload["info"] = _get_update_info_with_retry(retry_once=True, retry_delay_s=0.8)
+                result_queue.put(("ok", payload))
+            except Exception as exc:  # noqa: BLE001
+                result_queue.put(("error", {**payload, "exc": exc}))
+
+        threading.Thread(target=worker, name="update-check-worker", daemon=True).start()
+
+        def poll_update_result() -> None:
+            try:
+                status, payload = result_queue.get_nowait()
+            except queue.Empty:
+                root.after(100, poll_update_result)
+                return
+
+            btn_check_updates.config(state=tk.NORMAL)
+            prev_key_local = payload.get("prev_key")
+            prev_params_local = payload.get("prev_params") or {}
+            prev_connected_local = bool(payload.get("prev_connected"))
+            if prev_key_local:
+                set_connection_status(
+                    connected=prev_connected_local,
+                    key=prev_key_local,
+                    **prev_params_local,
+                )
+            else:
+                connection_status_var.set(payload.get("prev_status") or "")
+                btn = start_button_holder.get("widget")
+                if btn is not None:
+                    btn.config(state=tk.NORMAL if prev_connected_local else tk.DISABLED)
+
+            if status == "error":
+                exc = payload.get("exc")
+                LOGGER.warning("Update check failed: %s", exc, exc_info=True)
+                messagebox.showerror(t("UPD_TITLE"), _build_update_check_message_with_hint(exc))
+                return
+
+            mode = payload.get("mode")
+            git_status_line = payload.get("git_status_line")
+            info = payload.get("info") or {}
+            latest_tag = info.get("latest_tag") or ""
+            current_tag = info.get("current_tag") or f"v{APP_VERSION}"
+            if not latest_tag:
+                messagebox.showerror(t("UPD_TITLE"), t("UPD_ERR_JSON"))
+                return
+            if mode == "exe" and not info.get("asset"):
+                messagebox.showerror(t("UPD_TITLE"), t("UPD_ERR_JSON"))
+                return
+
+            if not info.get("update_available"):
+                message_lines = [
+                    t("UPD_NO_UPDATE", current=current_tag, latest=latest_tag)
+                ]
+                if mode == "git":
+                    if git_status_line:
+                        message_lines.append(git_status_line)
+                    message_lines.append(t("UPD_GIT_MODE", command="git pull"))
+                elif mode == "source":
+                    message_lines.append(t("UPD_SOURCE_MODE"))
+                messagebox.showinfo(
+                    t("UPD_TITLE"),
+                    "\n\n".join(message_lines),
+                )
+                return
+            if mode in {"git", "source"}:
+                message_lines = [
+                    t("UPD_UPDATE_AVAILABLE", current=current_tag, latest=latest_tag)
+                ]
+                if mode == "git":
+                    if git_status_line:
+                        message_lines.append(git_status_line)
+                    message_lines.append(t("UPD_GIT_MODE", command="git pull"))
                 else:
-                    key = "UPD_GIT_STATUS_DIFFERENT"
-                git_status_line = t(key, local=local_short, remote=remote_short)
-        try:
-            info = get_update_info()
-        except Exception as exc:  # noqa: BLE001
-            LOGGER.warning("Update check failed: %s", exc, exc_info=True)
-            messagebox.showerror(t("UPD_TITLE"), _build_update_check_message(exc))
-            return
-        finally:
-            if prev_key:
-                set_connection_status(key=prev_key, **prev_params)
-            else:
-                connection_status_var.set(prev_status)
-
-        latest_tag = info.get("latest_tag") or ""
-        current_tag = info.get("current_tag") or f"v{APP_VERSION}"
-        if not latest_tag:
-            messagebox.showerror(t("UPD_TITLE"), t("UPD_ERR_JSON"))
-            return
-        if mode == "exe" and not info.get("asset"):
-            messagebox.showerror(t("UPD_TITLE"), t("UPD_ERR_JSON"))
-            return
-
-        if not info.get("update_available"):
-            message_lines = [
-                t("UPD_NO_UPDATE", current=current_tag, latest=latest_tag)
-            ]
-            if mode == "git":
-                if git_status_line:
-                    message_lines.append(git_status_line)
-                message_lines.append(t("UPD_GIT_MODE", command="git pull"))
-            elif mode == "source":
-                message_lines.append(t("UPD_SOURCE_MODE"))
-            messagebox.showinfo(
-                t("UPD_TITLE"),
-                "\n\n".join(message_lines),
+                    message_lines.append(t("UPD_SOURCE_MODE"))
+                messagebox.showinfo(t("UPD_TITLE"), "\n\n".join(message_lines))
+                return
+            prompt = "\n\n".join(
+                [
+                    t("UPD_UPDATE_AVAILABLE", current=current_tag, latest=latest_tag),
+                    t("UPD_PROMPT_INSTALL"),
+                ]
             )
-            return
-        if mode in {"git", "source"}:
-            message_lines = [
-                t("UPD_UPDATE_AVAILABLE", current=current_tag, latest=latest_tag)
-            ]
-            if mode == "git":
-                if git_status_line:
-                    message_lines.append(git_status_line)
-                message_lines.append(t("UPD_GIT_MODE", command="git pull"))
-            else:
-                message_lines.append(t("UPD_SOURCE_MODE"))
-            messagebox.showinfo(t("UPD_TITLE"), "\n\n".join(message_lines))
-            return
-        prompt = "\n\n".join(
-            [
-                t("UPD_UPDATE_AVAILABLE", current=current_tag, latest=latest_tag),
-                t("UPD_PROMPT_INSTALL"),
-            ]
-        )
-        if not messagebox.askyesno(t("UPD_TITLE"), prompt):
-            return
-        if not _get_updater_command():
-            messagebox.showerror(t("UPD_TITLE"), t("UPD_UPDATER_MISSING"))
-            return
-        try:
-            if not launch_updater(wait_pid=os.getpid()):
+            if not messagebox.askyesno(t("UPD_TITLE"), prompt):
+                return
+            if not _get_updater_command():
+                messagebox.showerror(t("UPD_TITLE"), t("UPD_UPDATER_MISSING"))
+                return
+            try:
+                if not launch_updater(wait_pid=os.getpid()):
+                    messagebox.showerror(t("UPD_TITLE"), t("UPD_START_FAILED"))
+                    return
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.warning("Failed to start updater: %s", exc, exc_info=True)
                 messagebox.showerror(t("UPD_TITLE"), t("UPD_START_FAILED"))
                 return
-        except Exception as exc:  # noqa: BLE001
-            LOGGER.warning("Failed to start updater: %s", exc, exc_info=True)
-            messagebox.showerror(t("UPD_TITLE"), t("UPD_START_FAILED"))
-            return
-        root.destroy()
+            root.destroy()
+
+        root.after(100, poll_update_result)
+
 
     connection_frame = ttk.LabelFrame(
         root, text=t("FRAME_DB_CONNECTION"), padding=(10, 10)
@@ -11198,10 +11406,16 @@ def _selftest_apply_mssql_safe_set() -> bool:
 
     cur_batch_fallback = _FakeCursor("batch_fails_singles_ok")
     result_batch_fallback = _apply_mssql_safe_set(cur_batch_fallback)
+    # expected ma być niezależnym "oracle" (bez duplikacji split/strip z implementacji)
     expected_stmt_calls = [
-        stmt.strip()
-        for stmt in MSSQL_SAFE_SET_SQL.split(";")
-        if stmt.strip()
+        "SET NOCOUNT ON",
+        "SET ANSI_NULLS ON",
+        "SET QUOTED_IDENTIFIER ON",
+        "SET ANSI_PADDING ON",
+        "SET ANSI_WARNINGS ON",
+        "SET CONCAT_NULL_YIELDS_NULL ON",
+        "SET ARITHABORT ON",
+        "SET NUMERIC_ROUNDABORT OFF",
     ]
     if result_batch_fallback is True and cur_batch_fallback.calls == [
         MSSQL_SAFE_SET_SQL,
@@ -11534,7 +11748,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=t("CLI_DESC"))
     parser.add_argument("--self-test", action="store_true", help=t("CLI_SELF_TEST_HELP"))
     parser.add_argument("-c", "--console", action="store_true", help=t("CLI_CONSOLE_HELP"))
+    parser.add_argument("--sql", help=t("CLI_SQL_HELP"))
+    parser.add_argument("--format", choices=["xlsx", "csv"], help=t("CLI_FORMAT_HELP"))
     parser.add_argument("-o", "--output", help=t("CLI_OUTPUT_HELP"))
+    grp = parser.add_mutually_exclusive_group()
+    grp.add_argument("--connection", help=t("CLI_CONNECTION_HELP"))
+    grp.add_argument("--demo", action="store_true", help=t("CLI_DEMO_HELP"))
     parser.add_argument("--lang", choices=["en", "pl"], help=t("CLI_LANG_HELP"))
     parser.add_argument("--diag-odbc", action="store_true", help=t("CLI_DIAG_ODBC_HELP"))
     parser.add_argument(
@@ -11554,6 +11773,9 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
+    if args.sql and not args.format:
+        parser.error("--format is required when --sql is provided")
+
     if args.self_test:
         sys.exit(0 if run_self_test() else 1)
 
@@ -11567,7 +11789,7 @@ if __name__ == "__main__":
         if install_mode == "git":
             release_info = None
             try:
-                release_info = get_update_info()
+                release_info = _get_update_info_with_retry(retry_once=True, retry_delay_s=0.8)
             except Exception:
                 release_info = None
             print("Update: repository checkout detected. Use Git to sync with remote (e.g. `git pull`).")
@@ -11623,7 +11845,7 @@ if __name__ == "__main__":
         if install_mode == "source":
             release_info = None
             try:
-                release_info = get_update_info()
+                release_info = _get_update_info_with_retry(retry_once=True, retry_delay_s=0.8)
             except Exception:
                 release_info = None
             print(
@@ -11643,10 +11865,10 @@ if __name__ == "__main__":
                     )
             sys.exit(0)
         try:
-            info = get_update_info()
+            info = _get_update_info_with_retry(retry_once=True, retry_delay_s=0.8)
         except Exception as exc:
             LOGGER.warning("Update check failed (CLI): %s", exc, exc_info=True)
-            print(f"Update: error ({_build_update_check_message(exc)})")
+            print(f"Update: error ({_build_update_check_message_with_hint(exc)})")
             sys.exit(0)
         latest_tag = info.get("latest_tag") or ""
         current_tag = info.get("current_tag") or f"v{APP_VERSION}"
@@ -11680,7 +11902,20 @@ if __name__ == "__main__":
             sys.exit(1)
         sys.exit(0)
 
-    output_directory = bootstrap_data_dir_and_workdirs_or_exit(prefer_gui_prompt=not args.console)
+    headless = bool(args.sql)
+    prefer_gui_prompt = not (headless or args.console)
+
+    # Require runtime deps only for normal app run (GUI / CLI query/export).
+    # Avoid GUI popups in CLI mode.
+    try:
+        _ensure_runtime_dependencies(show_gui=prefer_gui_prompt)
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr)
+        sys.exit(2)
+    output_directory = bootstrap_data_dir_and_workdirs_or_exit(
+        prefer_gui_prompt=prefer_gui_prompt,
+        headless=headless,
+    )
 
     if args.lang:
         set_lang(args.lang)
@@ -11711,16 +11946,50 @@ if __name__ == "__main__":
     if selected_connection is None and connection_store.get("connections"):
         selected_connection = connection_store["connections"][0]
 
-    if args.console:
+    if args.sql or args.console:
+        if args.demo:
+            demo_path = os.path.abspath(os.path.join(BASE_DIR, "examples", "db", "demo.sqlite"))
+            if not os.path.exists(demo_path):
+                print(t("CLI_DEMO_MISSING", path=demo_path))
+                sys.exit(1)
+            selected_connection = {
+                "name": "Demo SQLite",
+                "type": "sqlite",
+                "details": {"path": demo_path},
+            }
+        elif args.connection:
+            wanted = str(args.connection or "").strip()
+            found = next(
+                (c for c in (connection_store.get("connections") or []) if c.get("name") == wanted),
+                None,
+            )
+            if not found:
+                available = ", ".join(
+                    [c.get("name", "") for c in (connection_store.get("connections") or []) if c.get("name")]
+                ) or "<none>"
+                print(t("CLI_CONNECTION_NOT_FOUND", name=wanted, available=available))
+                sys.exit(1)
+            selected_connection = found
+
         if not selected_connection:
             print(t("CLI_NO_CONNECTIONS"))
             sys.exit(1)
+
+        type_key = (selected_connection.get("type", "") or "").strip()
+        type_label = _db_type_labels().get(type_key, type_key)
+
+        print(
+            t(
+                "CLI_USING_CONNECTION",
+                name=selected_connection.get("name", ""),
+                type=type_label,
+            )
+        )
 
         engine_kwargs = {}
         if selected_connection.get("type") == "mssql_odbc":
             engine_kwargs["isolation_level"] = "AUTOCOMMIT"
         try:
-            # Console: build runtime URL from details; if password missing -> prompt in console.
             ctype = selected_connection.get("type")
             details = selected_connection.get("details") or {}
             if ctype == "sqlite":
@@ -11730,6 +11999,9 @@ if __name__ == "__main__":
             else:
                 pwd = str(details.get("password") or "")
                 if not pwd:
+                    if args.sql:
+                        print(t("CLI_PASSWORD_REQUIRED_NONINTERACTIVE"))
+                        sys.exit(1)
                     pwd = getpass.getpass(
                         t(
                             "CONSOLE_PROMPT_PASSWORD",
@@ -11771,6 +12043,18 @@ if __name__ == "__main__":
                 )
                 print(f"{title}\n{msg}")
             sys.exit(1)
+
+        if args.sql:
+            exit_code = run_console_noninteractive(
+                engine,
+                output_directory,
+                selected_connection,
+                sql_path=args.sql,
+                output_format=args.format,
+                output_override=args.output,
+                archive_sql=args.archive_sql,
+            )
+            sys.exit(exit_code)
 
         run_console(
             engine,

@@ -131,6 +131,68 @@ This repo includes:
 5. Click **Start**
 6. Your file will appear in: `generated_reports/`
 
+### Run a demo query (CLI)
+
+> CLI is handy for automation (cron / Task Scheduler) and for people who prefer terminal workflows.
+
+Safest: force the built-in demo SQLite database:
+
+```bash
+python main.pyw -c --demo
+```
+
+Windows portable EXE:
+
+```bash
+kkr-query2xlsx.exe -c --demo
+```
+
+Then in the CLI:
+
+- Pick any `.sql` file (e.g. from `examples/queries/` or from your `queries.txt` list)
+- Choose output format: XLSX or CSV
+- The exported file will be saved into: `generated_reports/`
+
+Use a specific saved connection by name:
+
+```bash
+python main.pyw -c --connection "Demo SQLite"
+```
+
+Note: without `--demo` / `--connection`, console mode uses the “current” connection from `secure.txt` (`last_selected`).
+
+#### Non-interactive (no prompts)
+
+```bash
+# Demo DB + jeden plik SQL + XLSX (bez promptów)
+python main.pyw --demo --sql examples/queries/example.sql --format xlsx
+
+# Demo DB + CSV + zapis do konkretnego katalogu
+python main.pyw --demo --sql examples/queries/example.sql --format csv --output generated_reports/
+
+# Użycie zapisanej konfiguracji połączenia (bez promptów)
+python main.pyw --connection "My MSSQL" --sql C:/reports/sales.sql --format xlsx --output C:/exports/
+
+# Archiwizacja SQL + metadane
+python main.pyw --connection "My MSSQL" --sql C:/reports/sales.sql --format xlsx --archive-sql
+```
+
+Notes:
+- `--sql` runs non-interactive mode by itself (it does not require `-c`).
+- `--sql` runs fully headless: no prompts, no password dialogs, and no Tk/GUI windows (also when data-dir bootstrap fails).
+- If the connection requires a password and it is not stored, `--sql` exits with code 1; use a stored password, `Trusted_Connection`, or `--demo`.
+- `--output` works the same as in interactive mode (`-c`): it may point to a file or directory.
+- `--demo` and `--connection` work as before; without them, `last_selected` from `secure.txt` is used.
+- `--archive-sql` also works in non-interactive mode.
+
+Tip:
+- You can change UI language in both GUI and CLI:
+
+  ```bash
+  python main.pyw --lang en
+  python main.pyw --lang pl
+  ```
+
 ---
 
 ## How to use (GUI)
@@ -155,6 +217,14 @@ If enabled, the app:
 - Exports: `generated_reports/`
 - Logs: `logs/kkr-query2xlsx.log` (rotating)
 - In the app: use **Open logs folder** on the main screen; after export, use **Open folder** for the generated file location (there is no **Help → Open logs / Open reports** path in the current UI).
+
+## CLI notes
+
+- Exports: `generated_reports/`
+- Logs: `logs/kkr-query2xlsx.log`
+- Demo content included in repo:
+  - `examples/db/demo.sqlite`
+  - `examples/queries/`
 
 ---
 
