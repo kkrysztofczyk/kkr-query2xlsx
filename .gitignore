@@ -42,3 +42,4 @@ venv/
 Thumbs.db
 .idea/
 .vscode/
+*.bat
