@@ -69,11 +69,11 @@ class DependenciesRuntimeAndLoggingTests(unittest.TestCase):
                 self.app._ensure_runtime_dependencies(show_gui=True)
         self.assertEqual(dummy.calls, [])
 
-    def test_sql_log_excerpt_full_when_env_set(self):
+    def test_sql_for_log_returns_full_sql_when_env_set(self):
         sql = "SELECT 1;\n" * 1000
         with mock.patch.dict(os.environ, {"KKR_LOG_FULL_SQL": "1"}):
-            out = self.app._sql_log_excerpt(sql, max_chars=50, max_lines=1)
-        # when debug env is set, we should not truncate
+            out, mode = self.app._sql_for_log(sql)
+        self.assertEqual(mode, "full")
         self.assertEqual(out, sql.rstrip())
 
     def test_sql_log_excerpt_truncates_by_default(self):

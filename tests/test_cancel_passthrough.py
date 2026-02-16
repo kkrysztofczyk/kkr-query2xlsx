@@ -25,7 +25,13 @@ class CancelPassthroughTests(unittest.TestCase):
     def test_run_export_passes_cancel_event_to_db_phase(self):
         cancel_evt = threading.Event()
 
-        def fake_run_query_to_rows(engine, sql_query, timeout_seconds=0, cancel_event=None):
+        def fake_run_query_to_rows(
+            engine,
+            sql_query,
+            timeout_seconds=0,
+            cancel_event=None,
+            sql_source_path=None,
+        ):
             self.assertIs(cancel_event, cancel_evt)
             return [], ["id"], 0.1, 10.0
 

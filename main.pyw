@@ -128,23 +128,80 @@ def _ensure_runtime_dependencies(*, show_gui: bool = True) -> None:
 
 
 def _sql_log_excerpt(sql: str, *, max_chars: int = 5000, max_lines: int = 200) -> str:
-    is_debug = str(os.environ.get("KKR_LOG_FULL_SQL", "")).strip().lower() in {
+    return _sql_excerpt_preserve_lines(sql, max_chars=max_chars, max_lines=max_lines)
+
+
+def _is_full_sql_logging_enabled() -> bool:
+    return str(os.environ.get("KKR_LOG_FULL_SQL", "")).strip().lower() in {
         "1",
         "true",
         "yes",
         "on",
     }
-    if is_debug:
-        return (sql or "").rstrip()
-    return _sql_excerpt_preserve_lines(sql, max_chars=max_chars, max_lines=max_lines)
 
 
-def _log_sql_exception(message: str, sql_query: str) -> None:
-    LOGGER.exception("%s Query (excerpt):\n%s", message, _sql_log_excerpt(sql_query))
+def _sql_for_log(sql_text: str | None) -> tuple[str, str]:
+    sql = (sql_text or "").rstrip()
+    if not sql:
+        return "<empty sql>", "excerpt"
+    if _is_full_sql_logging_enabled():
+        return sql, "full"
+    return _sql_log_excerpt(sql), "excerpt"
 
 
-def _log_sql_warning(message: str, sql_query: str, *args) -> None:
-    LOGGER.warning(message + " Query (excerpt):\n%s", *args, _sql_log_excerpt(sql_query))
+def _sql_source_for_log(sql_source_path: str | None) -> str:
+    if not sql_source_path:
+        return ""
+    src = str(sql_source_path).strip()
+    if not src:
+        return ""
+    if src.startswith("<") and src.endswith(">"):
+        return src
+    return os.path.basename(src)
+
+
+def _log_sql_executing(sql_query: str, *, sql_source_path: str | None = None) -> None:
+    sql_for_log, mode = _sql_for_log(sql_query)
+    source = _sql_source_for_log(sql_source_path)
+    if source:
+        LOGGER.info(t("SQL_SOURCE_FILE", path=source))
+    LOGGER.info(t("SQL_EXECUTING", mode=mode, sql=sql_for_log))
+
+
+def _log_sql_exception(
+    message: str,
+    sql_query: str,
+    *,
+    sql_source_path: str | None = None,
+    error: BaseException | None = None,
+) -> None:
+    sql_for_log, mode = _sql_for_log(sql_query)
+    source = _sql_source_for_log(sql_source_path)
+    context_parts = []
+    if message:
+        context_parts.append(message)
+    if source:
+        context_parts.append(t("SQL_SOURCE_FILE", path=source))
+    if context_parts:
+        LOGGER.error(" | ".join(context_parts))
+    err_obj = getattr(error, "orig", error) if error is not None else None
+    err_text = str(err_obj) if err_obj is not None else message
+    if isinstance(err_obj, BaseException):
+        exc_info = (type(err_obj), err_obj, err_obj.__traceback__)
+    elif isinstance(error, BaseException):
+        exc_info = (type(error), error, error.__traceback__)
+    else:
+        exc_info = True
+    LOGGER.error(t("SQL_EXEC_FAILED", error=err_text, mode=mode, sql=sql_for_log), exc_info=exc_info)
+
+
+def _log_sql_warning(message: str, sql_query: str, *args, sql_source_path: str | None = None) -> None:
+    sql_for_log, mode = _sql_for_log(sql_query)
+    source = _sql_source_for_log(sql_source_path)
+    if source:
+        LOGGER.warning(t("SQL_SOURCE_FILE", path=source))
+    formatted = message % args if args else message
+    LOGGER.warning(t("SQL_EXEC_FAILED", error=formatted, mode=mode, sql=sql_for_log))
 
 
 def _xlsx_get_sheetnames(xlsx_path: str) -> list[str]:
@@ -578,7 +635,7 @@ class ExportProgressWindow:
 
 # --- App version -------------------------------------------------------------
 
-APP_VERSION = "0.4.0"  # bump manually for releases
+APP_VERSION = "0.4.2"  # bump manually for releases
 
 MSSQL_SAFE_SET_SQL = """\
 SET NOCOUNT ON;
@@ -1835,6 +1892,8 @@ I18N: dict[str, dict[str, str]] = {
         "CONSOLE_INVALID_SELECTION": "Invalid selection. Please try again.",
         "CONSOLE_SAVED_PATH": "Query results have been saved to: {path}",
         "CONSOLE_NO_ROWS": "The query did not return any rows.",
+        "CONSOLE_NO_ROWS_NOTHING_SAVED": "No rows, nothing saved.",
+        "CONSOLE_NO_ROWS_SAVED_EMPTY": "No rows, saved empty file to: {path}",
         "CONSOLE_SQL_TIME": "Data fetch time (SQL): {seconds:.2f} seconds",
         "CONSOLE_EXPORT_TIME": "Export time ({fmt}): {seconds:.2f} seconds",
         "CONSOLE_TOTAL_TIME": "Total time: {seconds:.2f} seconds",
@@ -2166,6 +2225,7 @@ I18N: dict[str, dict[str, str]] = {
         "CLI_SQL_HELP": "Path to a .sql file to run (non-interactive mode).",
         "CLI_FORMAT_HELP": "Output format for --sql: xlsx or csv.",
         "CLI_CONNECTION_HELP": "Connection name to use in console mode (defaults to last_selected).",
+        "CLI_LIST_CONNECTIONS_HELP": "List saved connections and exit.",
         "CLI_DEMO_HELP": "Use built-in demo SQLite database (ignores saved connections).",
         "CLI_OUTPUT_HELP": (
             "Optional output file or directory. A directory may be existing or a new path "
@@ -2173,7 +2233,10 @@ I18N: dict[str, dict[str, str]] = {
             "interpretation."
         ),
         "CLI_USING_CONNECTION": "Using connection: {name} - {type}.",
-        "CLI_CONNECTION_NOT_FOUND": "Connection not found: {name}. Available: {available}",
+        "CLI_CONNECTION_NOT_FOUND": (
+            "Connection not found: {name}. Available: {available}. "
+            "Use --list-connections."
+        ),
         "CLI_DEMO_MISSING": "Demo database file not found: {path}",
         "CLI_NO_CONNECTIONS": (
             "No saved connections. Create a connection in GUI mode to run console."
@@ -2194,6 +2257,9 @@ I18N: dict[str, dict[str, str]] = {
             "Check the file location."
         ),
         "ERR_SQL_SOURCE": "SQL source:",
+        "SQL_SOURCE_FILE": "SQL source: {path}",
+        "SQL_EXECUTING": "Executing SQL ({mode}):\n{sql}",
+        "SQL_EXEC_FAILED": "SQL execution failed ({mode}): {error}\n{sql}",
         "ERR_DB_MESSAGE": "Database message (excerpt):",
         "ERR_SQL_PREVIEW": "SQL (start):",
         "ERR_FULL_LOG": "Full error saved in kkr-query2xlsx.log",
@@ -2397,11 +2463,14 @@ I18N: dict[str, dict[str, str]] = {
         "CONSOLE_INVALID_SELECTION": "Nieprawidłowy wybór. Spróbuj ponownie.",
         "CONSOLE_SAVED_PATH": "Wyniki zapytania zapisano w: {path}",
         "CONSOLE_NO_ROWS": "Zapytanie nie zwróciło żadnych wierszy.",
+        "CONSOLE_NO_ROWS_NOTHING_SAVED": "Brak wierszy, nic nie zapisano.",
+        "CONSOLE_NO_ROWS_SAVED_EMPTY": "Brak wierszy, zapisano pusty plik: {path}",
         "CONSOLE_SQL_TIME": "Czas pobrania danych (SQL): {seconds:.2f} s",
         "CONSOLE_EXPORT_TIME": "Czas eksportu ({fmt}): {seconds:.2f} s",
         "CONSOLE_TOTAL_TIME": "Czas łączny: {seconds:.2f} s",
         "CONSOLE_PROMPT_PASSWORD": "Hasło dla połączenia '{name}': ",
         "CLI_DIAG_ODBC_HELP": "Wypisz diagnostykę ODBC i zakończ.",
+        "CLI_LIST_CONNECTIONS_HELP": "Wypisz zapisane połączenia i zakończ.",
         "CLI_SELF_TEST_HELP": "Uruchom wewnętrzne testy (smoke tests) i zakończ.",
         "DEFAULT_MSSQL_NAME": "Domyślne MSSQL",
         "FRAME_MSSQL": "MSSQL (ODBC)",
@@ -2752,6 +2821,9 @@ I18N: dict[str, dict[str, str]] = {
             "Sprawdź lokalizację pliku."
         ),
         "ERR_SQL_SOURCE": "Źródło SQL:",
+        "SQL_SOURCE_FILE": "Źródło SQL: {path}",
+        "SQL_EXECUTING": "Wykonywanie SQL ({mode}):\n{sql}",
+        "SQL_EXEC_FAILED": "Wykonanie SQL nie powiodło się ({mode}): {error}\n{sql}",
         "ERR_DB_MESSAGE": "Komunikat bazy (fragment):",
         "ERR_SQL_PREVIEW": "SQL (początek):",
         "ERR_FULL_LOG": "Pełny błąd zapisany w pliku kkr-query2xlsx.log",
@@ -5557,6 +5629,7 @@ def _run_query_to_rows(
     sql_query,
     timeout_seconds: int = 0,
     cancel_event: threading.Event | None = None,
+    sql_source_path: str | None = None,
 ):
     """
     Execute SQL with retry/deadlock handling and return:
@@ -5569,6 +5642,7 @@ def _run_query_to_rows(
     last_exception = None
     timeout_seconds = max(0, int(timeout_seconds or 0))
     backend = _engine_backend_name(engine)
+    _log_sql_executing(sql_query, sql_source_path=sql_source_path)
 
     for attempt in range(1, max_retries + 1):
         done = None
@@ -5738,11 +5812,12 @@ def _run_query_to_rows(
                     attempt,
                     max_retries,
                     wait_seconds,
+                    sql_source_path=sql_source_path,
                 )
                 time.sleep(wait_seconds)
                 continue
 
-            _log_sql_exception("DBAPIError while executing SQL.", sql_query)
+            _log_sql_exception("DBAPIError while executing SQL.", sql_query, sql_source_path=sql_source_path, error=e)
             raise
 
         except (UserCancelledError, QueryTimeoutError) as e:
@@ -5768,6 +5843,7 @@ def _run_query_to_rows(
             _log_sql_exception(
                 "Unexpected error while executing SQL.",
                 sql_query,
+                sql_source_path=sql_source_path,
             )
             raise
         finally:
@@ -5792,9 +5868,9 @@ def format_error_for_ui(
     """Log full error and return a shortened message for UI display."""
     # pełny traceback + SQL tylko do loga
     if context == "export":
-        _log_sql_exception("Export failed.", sql_query)
+        _log_sql_exception("Export failed.", sql_query, sql_source_path=sql_source_path, error=exc)
     else:
-        _log_sql_exception("Query failed.", sql_query)
+        _log_sql_exception("Query failed.", sql_query, sql_source_path=sql_source_path, error=exc)
 
     orig = getattr(exc, "orig", exc)
     orig_s = str(orig).strip() if orig is not None else ""
@@ -6017,6 +6093,7 @@ def run_export(
     export_timeout_seconds: int = 0,
     cancel_event: threading.Event | None = None,
     phase_callback: Optional[Callable[[str], None]] = None,
+    sql_source_path: str | None = None,
 ):
     """Execute SQL, export the result, and return timing + row count details."""
     if phase_callback is not None:
@@ -6026,6 +6103,7 @@ def run_export(
         sql_query,
         timeout_seconds=db_timeout_seconds,
         cancel_event=cancel_event,
+        sql_source_path=sql_source_path,
     )
     rows_count = len(rows)
     columns_count = len(columns)
@@ -6090,6 +6168,7 @@ def run_export_to_template(
     export_timeout_seconds: int = 0,
     cancel_event: threading.Event | None = None,
     phase_callback: Optional[Callable[[str], None]] = None,
+    sql_source_path: str | None = None,
 ):
     """
     Execute SQL, copy XLSX template and paste data into given sheet starting at start_cell.
@@ -6104,6 +6183,7 @@ def run_export_to_template(
         sql_query,
         timeout_seconds=db_timeout_seconds,
         cancel_event=cancel_event,
+        sql_source_path=sql_source_path,
     )
     rows_count = len(rows)
     columns_count = len(columns)
@@ -6347,6 +6427,7 @@ def run_console(
         override_path=(output_override.strip() if output_override else None),
         prefer_dir_for_extensionless_nonexistent=True,
     )
+    output_existed_before = os.path.exists(output_file_path)
 
     try:
         sql_dur, export_dur, total_dur, rows_count = run_export(
@@ -6357,6 +6438,7 @@ def run_console(
             csv_profile=selected_csv_profile,
             db_timeout_seconds=db_timeout_seconds,
             export_timeout_seconds=export_timeout_seconds,
+            sql_source_path=sql_query_file_path,
         )
     except XlsxSizeError as exc:
         print(str(exc))
@@ -6386,10 +6468,11 @@ def run_console(
         except Exception as exc:  # noqa: BLE001
             LOGGER.warning("SQL archive failed: %s", exc, exc_info=True)
 
-    if rows_count > 0:
-        print(t("CONSOLE_SAVED_PATH", path=output_file_path))
-    else:
-        print(t("CONSOLE_NO_ROWS"))
+    _print_console_export_result(
+        output_file_path,
+        rows_count,
+        existed_before=output_existed_before,
+    )
     print(t("CONSOLE_SQL_TIME", seconds=sql_dur))
     if rows_count > 0:
         print(t("CONSOLE_EXPORT_TIME", fmt=output_format, seconds=export_dur))
@@ -6437,6 +6520,7 @@ def run_console_noninteractive(
         override_path=(output_override.strip() if output_override else None),
         prefer_dir_for_extensionless_nonexistent=True,
     )
+    output_existed_before = os.path.exists(output_file_path)
 
     try:
         sql_dur, export_dur, total_dur, rows_count = run_export(
@@ -6447,6 +6531,7 @@ def run_console_noninteractive(
             csv_profile=selected_csv_profile,
             db_timeout_seconds=db_timeout_seconds,
             export_timeout_seconds=export_timeout_seconds,
+            sql_source_path=resolved_sql_path,
         )
     except (XlsxSizeError, QueryTimeoutError, ExportTimeoutError) as exc:
         print(str(exc))
@@ -6474,16 +6559,30 @@ def run_console_noninteractive(
         except Exception as exc:  # noqa: BLE001
             LOGGER.warning("SQL archive failed: %s", exc, exc_info=True)
 
-    if rows_count > 0:
-        print(t("CONSOLE_SAVED_PATH", path=output_file_path))
-    else:
-        print(t("CONSOLE_NO_ROWS"))
+    _print_console_export_result(
+        output_file_path,
+        rows_count,
+        existed_before=output_existed_before,
+    )
     print(t("CONSOLE_SQL_TIME", seconds=sql_dur))
     if rows_count > 0:
         print(t("CONSOLE_EXPORT_TIME", fmt=output_format, seconds=export_dur))
         print(t("CONSOLE_TOTAL_TIME", seconds=total_dur))
 
     return 0
+
+
+def _print_console_export_result(
+    output_file_path: str, rows_count: int, *, existed_before: bool
+) -> None:
+    if rows_count > 0:
+        print(t("CONSOLE_SAVED_PATH", path=output_file_path))
+        return
+
+    if not existed_before and os.path.exists(output_file_path):
+        print(t("CONSOLE_NO_ROWS_SAVED_EMPTY", path=output_file_path))
+    else:
+        print(t("CONSOLE_NO_ROWS_NOTHING_SAVED"))
 
 
 def _create_mssql_frame(parent):
@@ -10360,6 +10459,7 @@ def run_gui(connection_store, output_directory):
                     export_timeout_seconds=export_timeout_seconds,
                     cancel_event=cancel_state["event"],
                     phase_callback=phase_cb,
+                    sql_source_path=params.get("sql_source_path", ""),
                 )
             else:
                 sql_duration, export_duration, total_duration, rows_count = run_export(
@@ -10372,6 +10472,7 @@ def run_gui(connection_store, output_directory):
                     export_timeout_seconds=export_timeout_seconds,
                     cancel_event=cancel_state["event"],
                     phase_callback=phase_cb,
+                    sql_source_path=params.get("sql_source_path", ""),
                 )
 
             return {
@@ -11754,6 +11855,11 @@ if __name__ == "__main__":
     grp = parser.add_mutually_exclusive_group()
     grp.add_argument("--connection", help=t("CLI_CONNECTION_HELP"))
     grp.add_argument("--demo", action="store_true", help=t("CLI_DEMO_HELP"))
+    parser.add_argument(
+        "--list-connections",
+        action="store_true",
+        help=t("CLI_LIST_CONNECTIONS_HELP"),
+    )
     parser.add_argument("--lang", choices=["en", "pl"], help=t("CLI_LANG_HELP"))
     parser.add_argument("--diag-odbc", action="store_true", help=t("CLI_DIAG_ODBC_HELP"))
     parser.add_argument(
@@ -11902,6 +12008,16 @@ if __name__ == "__main__":
             sys.exit(1)
         sys.exit(0)
 
+    if args.list_connections:
+        store = load_connections()
+        names = [c.get("name", "") for c in (store.get("connections") or []) if c.get("name")]
+        if names:
+            for name in names:
+                print(name)
+        else:
+            print("<none>")
+        sys.exit(0)
+
     headless = bool(args.sql)
     prefer_gui_prompt = not (headless or args.console)
 
@@ -11968,7 +12084,7 @@ if __name__ == "__main__":
                     [c.get("name", "") for c in (connection_store.get("connections") or []) if c.get("name")]
                 ) or "<none>"
                 print(t("CLI_CONNECTION_NOT_FOUND", name=wanted, available=available))
-                sys.exit(1)
+                sys.exit(2)
             selected_connection = found
 
         if not selected_connection:

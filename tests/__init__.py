@@ -5,10 +5,6 @@ import warnings
 
 
 warnings.simplefilter("error", ResourceWarning)
-RESOURCEWARNING_AS_ERROR_CONFIGURED = any(
-    action == "error" and category is ResourceWarning
-    for action, _message, category, *_ in warnings.filters
-)
 
 
 def load_tests(loader, tests, pattern):
