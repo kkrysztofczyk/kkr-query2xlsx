@@ -635,7 +635,7 @@ class ExportProgressWindow:
 
 # --- App version -------------------------------------------------------------
 
-APP_VERSION = "0.4.2"  # bump manually for releases
+APP_VERSION = "0.4.3"  # bump manually for releases
 
 MSSQL_SAFE_SET_SQL = """\
 SET NOCOUNT ON;
@@ -1825,6 +1825,12 @@ I18N: dict[str, dict[str, str]] = {
         "LBL_DB_TIMEOUT_MIN": "DB timeout (minutes) - execution + fetch",
         "LBL_EXPORT_TIMEOUT_MIN": "Export timeout (minutes) - XLSX/CSV generation",
         "LBL_TIMEOUT_NOTE": "0 = no limit. Defaults: 3 minutes each.",
+        "CHK_OUTPUT_FILENAME_STAMP": "Add datetime stamp to output filename",
+        "LBL_OUTPUT_FILENAME_STAMP_PATTERN": "Pattern:",
+        "LBL_OUTPUT_FILENAME_STAMP_PLACE": "Place:",
+        "LBL_OUTPUT_FILENAME_STAMP_PREVIEW": "Preview:",
+        "OUTPUT_FILENAME_STAMP_PLACE_PREFIX": "Prefix (start)",
+        "OUTPUT_FILENAME_STAMP_PLACE_SUFFIX": "Suffix (end, before extension)",
         "CHK_SQL_HIGHLIGHT": "Syntax highlighting (Chlorophyll)",
         "LBL_SQL_DIALECT": "SQL dialect",
         "MSG_DONE": "Done.",
@@ -2090,6 +2096,7 @@ I18N: dict[str, dict[str, str]] = {
         "ERR_EXPORT": "Export error. Full details in log.",
         "FRAME_DB_CONNECTION": "Database connection",
         "FRAME_ADVANCED": "Advanced",
+        "CHK_SHOW_ADVANCED": "Show advanced",
         "LBL_CONNECTION": "Connection:",
         "BTN_MANAGE_CONNECTIONS": "Manage connections...",
         "BTN_EDIT_CONNECTION": "Edit connection",
@@ -2104,6 +2111,7 @@ I18N: dict[str, dict[str, str]] = {
         "FRAME_SQL_SOURCE": "SQL query source",
         "FRAME_OUTPUT_FORMAT": "Output format",
         "FRAME_TEMPLATE_OPTIONS": "XLSX template options (GUI)",
+        "CHK_SHOW_TEMPLATE_OPTIONS": "Show template options",
         "FRAME_RESULTS": "Result and actions",
         "LBL_SELECTED_SQL": "Selected SQL file:",
         "BTN_SELECT_SQL": "Select SQL file",
@@ -2395,6 +2403,12 @@ I18N: dict[str, dict[str, str]] = {
         "LBL_DB_TIMEOUT_MIN": "Limit czasu DB (minuty) - wykonanie + pobieranie",
         "LBL_EXPORT_TIMEOUT_MIN": "Limit czasu eksportu (minuty) - generowanie XLSX/CSV",
         "LBL_TIMEOUT_NOTE": "0 = brak limitu. Domyślnie: po 3 minuty.",
+        "CHK_OUTPUT_FILENAME_STAMP": "Dodaj znacznik daty/czasu do nazwy pliku wyjściowego",
+        "LBL_OUTPUT_FILENAME_STAMP_PATTERN": "Wzór:",
+        "LBL_OUTPUT_FILENAME_STAMP_PLACE": "Pozycja:",
+        "LBL_OUTPUT_FILENAME_STAMP_PREVIEW": "Podgląd:",
+        "OUTPUT_FILENAME_STAMP_PLACE_PREFIX": "Prefiks (początek)",
+        "OUTPUT_FILENAME_STAMP_PLACE_SUFFIX": "Sufiks (koniec, przed rozszerzeniem)",
         "CHK_SQL_HIGHLIGHT": "Podświetlanie składni (Chlorophyll)",
         "LBL_SQL_DIALECT": "Dialekt SQL",
         "MSG_DONE": "Gotowe.",
@@ -2679,6 +2693,7 @@ I18N: dict[str, dict[str, str]] = {
         "ERR_EXPORT": "Błąd eksportu. Pełne szczegóły w logu.",
         "FRAME_DB_CONNECTION": "Połączenie z bazą danych",
         "FRAME_ADVANCED": "Zaawansowane",
+        "CHK_SHOW_ADVANCED": "Pokaż zaawansowane",
         "LBL_CONNECTION": "Połączenie:",
         "BTN_MANAGE_CONNECTIONS": "Zarządzaj połączeniami...",
         "BTN_EDIT_CONNECTION": "Edytuj połączenie",
@@ -2693,6 +2708,7 @@ I18N: dict[str, dict[str, str]] = {
         "FRAME_SQL_SOURCE": "Źródło zapytania SQL",
         "FRAME_OUTPUT_FORMAT": "Format wyjściowy",
         "FRAME_TEMPLATE_OPTIONS": "Opcje template XLSX (GUI)",
+        "CHK_SHOW_TEMPLATE_OPTIONS": "Pokaż opcje template",
         "FRAME_RESULTS": "Wynik i akcje",
         "LBL_SELECTED_SQL": "Wybrany plik SQL:",
         "BTN_SELECT_SQL": "Wybierz plik SQL",
@@ -3008,6 +3024,108 @@ def _center_window(win, parent=None):
     win.geometry(f"+{x}+{y}")
 
 
+def apply_main_window_geometry(root, saved_geometry: str | None) -> None:
+    """Apply persisted geometry with sane minimum bounds + primary-screen centering."""
+    root.minsize(MIN_MAIN_WINDOW_WIDTH, MIN_MAIN_WINDOW_HEIGHT)
+
+    default_parsed = _parse_geometry_string(DEFAULT_MAIN_WINDOW_GEOMETRY)
+
+    parsed = _parse_geometry_string(saved_geometry) if saved_geometry else None
+
+    try:
+        sw = int(root.winfo_screenwidth())
+        sh = int(root.winfo_screenheight())
+    except Exception:  # noqa: BLE001
+        default_geo = default_parsed or (
+            MIN_MAIN_WINDOW_WIDTH,
+            MIN_MAIN_WINDOW_HEIGHT,
+            None,
+            None,
+        )
+        w, h, _x, _y = default_geo
+        root.geometry(f"{w}x{h}")
+        root.update_idletasks()
+        return
+
+    if default_parsed:
+        default_geo = (default_parsed[0], default_parsed[1], None, None)
+    else:
+        default_geo = (
+            MIN_MAIN_WINDOW_WIDTH,
+            MIN_MAIN_WINDOW_HEIGHT,
+            None,
+            None,
+        )
+
+    w, h, x, y = parsed if parsed else default_geo
+
+    if w < MIN_MAIN_WINDOW_WIDTH or h < MIN_MAIN_WINDOW_HEIGHT:
+        w, h, x, y = default_geo
+
+    # Clamp size so it won't restore too wide/tall on larger displays
+    # (while still respecting the minsize above)
+    max_w = max(MIN_MAIN_WINDOW_WIDTH, sw - 40)
+    max_h = max(MIN_MAIN_WINDOW_HEIGHT, sh - 80)
+    w = min(max(w, MIN_MAIN_WINDOW_WIDTH), max_w)
+    h = min(max(h, MIN_MAIN_WINDOW_HEIGHT), max_h)
+
+    def _is_multi_monitor() -> bool:
+        try:
+            return (
+                root.winfo_vrootx() != 0
+                or root.winfo_vrooty() != 0
+                or root.winfo_vrootwidth() != sw
+                or root.winfo_vrootheight() != sh
+            )
+        except Exception:  # noqa: BLE001
+            return False
+
+    # Center on primary screen
+    cx = max((sw - w) // 2, 0)
+    cy = max((sh - h) // 2, 0)
+
+    if _is_multi_monitor():
+        # Always open on primary when multiple monitors are present
+        px, py = cx, cy
+    else:
+        # Single monitor: keep offsets if valid; otherwise center
+        if x is None or y is None:
+            px, py = cx, cy
+        else:
+            # Tk semantics: negative offsets are from right/bottom screen edge
+            px = x if x >= 0 else (sw - w + x)
+            py = y if y >= 0 else (sh - h + y)
+            px = min(max(px, 0), max(sw - w, 0))
+            py = min(max(py, 0), max(sh - h, 0))
+
+    root.geometry(f"{w}x{h}+{px}+{py}")
+    root.update_idletasks()
+
+
+def main_window_geometry_to_save(root) -> str:
+    """Return persisted main window geometry, discarding tiny/invalid values."""
+    root.update_idletasks()
+    geo = root.winfo_geometry()
+    parsed = _parse_geometry_string(geo)
+    if not parsed:
+        return DEFAULT_MAIN_WINDOW_GEOMETRY
+    w, h, _x, _y = parsed
+    if w < MIN_MAIN_WINDOW_WIDTH or h < MIN_MAIN_WINDOW_HEIGHT:
+        return DEFAULT_MAIN_WINDOW_GEOMETRY
+    return geo
+
+
+def persist_main_window_geometry(app_dir: Path, geometry: str) -> None:
+    """Persist only window geometry while keeping current UI settings intact."""
+    cfg = load_ui_config(app_dir)
+    ui_cfg = cfg.get("ui")
+    if not isinstance(ui_cfg, dict):
+        ui_cfg = {}
+        cfg["ui"] = ui_cfg
+    ui_cfg["window_geometry"] = str(geometry or "")
+    save_ui_config(app_dir, cfg)
+
+
 def _center_toplevel_on_parent(win: "tk.Toplevel", parent: "tk.Misc") -> None:
     """Center `win` on `parent` (or screen) and clamp to visible bounds."""
     win.update_idletasks()
@@ -3261,6 +3379,29 @@ UI_CONFIG_FILENAME = "kkr-query2xlsx.user.json"
 LEGACY_CSV_PROFILES_PATH = _build_path("csv_profiles.json")
 SQL_ARCHIVE_DIR = _build_path("sql_archive")
 
+MIN_MAIN_WINDOW_WIDTH = 900
+MIN_MAIN_WINDOW_HEIGHT = 650
+DEFAULT_MAIN_WINDOW_GEOMETRY = "900x760"
+
+# Strict Tk geometry: "WxH" or "WxH±X±Y" (no trailing garbage).
+_GEOMETRY_RE = re.compile(
+    r"^(?P<w>\d+)x(?P<h>\d+)(?:(?P<x>[+-]\d+)(?P<y>[+-]\d+))?$"
+)
+
+
+def _parse_geometry_string(geo: str) -> tuple[int, int, int | None, int | None] | None:
+    geo = (geo or "").strip()
+    m = _GEOMETRY_RE.match(geo)
+    if not m:
+        return None
+    w = int(m["w"])
+    h = int(m["h"])
+    x = m.group("x")
+    y = m.group("y")
+    if (x is None) != (y is None):
+        return None
+    return w, h, (int(x) if x is not None else None), (int(y) if y is not None else None)
+
 SECURE_SAMPLE_PATH = os.path.join(BASE_DIR, "secure.sample.json")
 QUERIES_SAMPLE_PATH = os.path.join(BASE_DIR, "queries.sample.txt")
 
@@ -3308,6 +3449,10 @@ def _default_ui_config() -> dict:
             "sql_highlight_enabled": False,
             "hide_template_naming_hint": False,
             "hide_data_dir_notice": False,
+            "window_geometry": None,
+            "output_filename_stamp_enabled": False,
+            "output_filename_stamp_pattern": "[YYYY-MM-DD]",
+            "output_filename_stamp_place": "suffix",
         }
     }
 
@@ -3343,6 +3488,20 @@ def load_ui_config(app_dir: Path) -> dict:
             cfg["ui"]["hide_data_dir_notice"] = raw_data_dir
         elif isinstance(raw_data_dir, int) and raw_data_dir in (0, 1):
             cfg["ui"]["hide_data_dir_notice"] = bool(raw_data_dir)
+        raw_geometry = ui_section.get("window_geometry")
+        if isinstance(raw_geometry, str):
+            cfg["ui"]["window_geometry"] = raw_geometry
+        raw_stamp_enabled = ui_section.get("output_filename_stamp_enabled")
+        if isinstance(raw_stamp_enabled, bool):
+            cfg["ui"]["output_filename_stamp_enabled"] = raw_stamp_enabled
+        elif isinstance(raw_stamp_enabled, int) and raw_stamp_enabled in (0, 1):
+            cfg["ui"]["output_filename_stamp_enabled"] = bool(raw_stamp_enabled)
+        raw_stamp_pattern = ui_section.get("output_filename_stamp_pattern")
+        if isinstance(raw_stamp_pattern, str):
+            cfg["ui"]["output_filename_stamp_pattern"] = raw_stamp_pattern
+        raw_stamp_place = ui_section.get("output_filename_stamp_place")
+        if raw_stamp_place in ("prefix", "suffix"):
+            cfg["ui"]["output_filename_stamp_place"] = raw_stamp_place
     return cfg
 
 
@@ -3369,6 +3528,20 @@ def save_ui_config(app_dir: Path, data: dict) -> None:
             normalized["ui"]["hide_data_dir_notice"] = raw_data_dir
         elif isinstance(raw_data_dir, int) and raw_data_dir in (0, 1):
             normalized["ui"]["hide_data_dir_notice"] = bool(raw_data_dir)
+        raw_geometry = ui_section.get("window_geometry")
+        if isinstance(raw_geometry, str):
+            normalized["ui"]["window_geometry"] = raw_geometry
+        raw_stamp_enabled = ui_section.get("output_filename_stamp_enabled")
+        if isinstance(raw_stamp_enabled, bool):
+            normalized["ui"]["output_filename_stamp_enabled"] = raw_stamp_enabled
+        elif isinstance(raw_stamp_enabled, int) and raw_stamp_enabled in (0, 1):
+            normalized["ui"]["output_filename_stamp_enabled"] = bool(raw_stamp_enabled)
+        raw_stamp_pattern = ui_section.get("output_filename_stamp_pattern")
+        if isinstance(raw_stamp_pattern, str):
+            normalized["ui"]["output_filename_stamp_pattern"] = raw_stamp_pattern
+        raw_stamp_place = ui_section.get("output_filename_stamp_place")
+        if raw_stamp_place in ("prefix", "suffix"):
+            normalized["ui"]["output_filename_stamp_place"] = raw_stamp_place
 
         path = Path(app_dir) / UI_CONFIG_FILENAME
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -4912,6 +5085,65 @@ def _sanitize_filename_part(value: str, max_len: int = 80) -> str:
         return "unknown"
 
     return cleaned[:max_len]
+
+
+def _render_output_filename_stamp(pattern: str, dt: datetime | None = None) -> str:
+    rendered = pattern or ""
+    stamp_dt = dt or datetime.now()
+    token_map = {
+        "YYYY": stamp_dt.strftime("%Y"),
+        "MM": stamp_dt.strftime("%m"),
+        "DD": stamp_dt.strftime("%d"),
+        "hh": stamp_dt.strftime("%H"),
+        "mm": stamp_dt.strftime("%M"),
+        "ss": stamp_dt.strftime("%S"),
+    }
+    for token, replacement in token_map.items():
+        rendered = rendered.replace(token, replacement)
+    return rendered
+
+
+def _sanitize_filename_stamp(value: str, max_len: int = 80) -> str:
+    cleaned = (value or "").strip()
+    if not cleaned:
+        return ""
+    cleaned = re.sub(r"[\x00-\x1f\x7f]+", "-", cleaned)
+    cleaned = re.sub(r'[\\/:*?"<>|]+', "-", cleaned)
+    cleaned = re.sub(r"[-_\s]+", "-", cleaned)
+    cleaned = cleaned.strip(" .-_")
+    if not cleaned:
+        return ""
+    return cleaned[:max_len].strip(" .-_")
+
+
+def apply_output_filename_stamp(
+    file_name: str,
+    *,
+    enabled: bool,
+    pattern: str,
+    place: str,
+    dt: datetime | None = None,
+) -> str:
+    if not enabled:
+        return file_name
+    raw_pattern = pattern or ""
+    if not raw_pattern.strip():
+        return file_name
+    lead_m = re.match(r"^\s+", raw_pattern)
+    trail_m = re.search(r"\s+$", raw_pattern)
+    lead_ws_len = len(lead_m.group(0)) if lead_m else 0
+    trail_ws_len = len(trail_m.group(0)) if trail_m else 0
+    rendered = _render_output_filename_stamp(raw_pattern.strip(), dt=dt)
+    stamp = _sanitize_filename_stamp(rendered)
+    if not stamp:
+        return file_name
+
+    stem, ext = os.path.splitext(file_name)
+    if place == "prefix":
+        separator = (" " * trail_ws_len) if trail_ws_len else ""
+        return f"{stamp}{separator}{file_name}"
+    separator = (" " * lead_ws_len) if lead_ws_len else ""
+    return f"{stem}{separator}{stamp}{ext}"
 
 
 def write_sql_archive_entry(
@@ -8472,6 +8704,25 @@ def run_gui(connection_store, output_directory):
         value=int(load_persisted_export_timeout_seconds() / 60)
     )
     ui_config = load_ui_config(Path(DATA_DIR))
+    ui_section = ui_config.get("ui") or {}
+    output_stamp_enabled_var = tk.BooleanVar(
+        value=bool(ui_section.get("output_filename_stamp_enabled", False))
+    )
+    output_stamp_pattern_var = tk.StringVar(
+        value=str(ui_section.get("output_filename_stamp_pattern", "[YYYY-MM-DD]"))
+    )
+    output_stamp_place_var = tk.StringVar(
+        value=(
+            ui_section.get("output_filename_stamp_place")
+            if ui_section.get("output_filename_stamp_place") in ("prefix", "suffix")
+            else "suffix"
+        )
+    )
+    output_stamp_place_display_var = tk.StringVar(value="")
+    output_stamp_place_combo = None
+    output_stamp_preview_var = tk.StringVar(value="")
+    output_stamp_preview_after_id = {"id": None}
+    apply_main_window_geometry(root, ui_section.get("window_geometry"))
     _show_data_dir_notice_once(
         root,
         ui_config,
@@ -8480,9 +8731,7 @@ def run_gui(connection_store, output_directory):
         base_dir=BASE_DIR,
         lang=(lang_var.get() or "").lower(),
     )
-    sql_highlight_enabled = bool(
-        (ui_config.get("ui") or {}).get("sql_highlight_enabled", False)
-    )
+    sql_highlight_enabled = bool(ui_section.get("sql_highlight_enabled", False))
     if sql_highlight_enabled and (CodeView is None or not SQL_LEXER_CLASSES):
         sql_highlight_enabled = False
     sql_highlight_var = tk.BooleanVar(value=sql_highlight_enabled)
@@ -8496,6 +8745,8 @@ def run_gui(connection_store, output_directory):
     sheet_name_var = tk.StringVar(value="")
     start_cell_var = tk.StringVar(value="A2")
     include_header_var = tk.BooleanVar(value=False)
+    show_advanced_var = tk.BooleanVar(value=False)
+    show_template_options_var = tk.BooleanVar(value=False)
     template_state = {
         "sheet_combobox": None,
         "choose_button": None,
@@ -8528,6 +8779,81 @@ def run_gui(connection_store, output_directory):
         config.setdefault("ui", {})["sql_highlight_enabled"] = bool(enabled)
         save_ui_config(Path(DATA_DIR), config)
 
+    def _output_stamp_place_to_label(value: str) -> str:
+        if value == "prefix":
+            return t("OUTPUT_FILENAME_STAMP_PLACE_PREFIX")
+        return t("OUTPUT_FILENAME_STAMP_PLACE_SUFFIX")
+
+    def _output_stamp_label_to_place(value: str) -> str:
+        if value == t("OUTPUT_FILENAME_STAMP_PLACE_PREFIX"):
+            return "prefix"
+        return "suffix"
+
+    def refresh_output_stamp_place_options() -> None:
+        if output_stamp_place_combo is None:
+            return
+        values = [
+            t("OUTPUT_FILENAME_STAMP_PLACE_PREFIX"),
+            t("OUTPUT_FILENAME_STAMP_PLACE_SUFFIX"),
+        ]
+        output_stamp_place_combo.configure(values=values)
+        current = output_stamp_place_var.get()
+        if current not in ("prefix", "suffix"):
+            current = "suffix"
+            output_stamp_place_var.set(current)
+        output_stamp_place_display_var.set(_output_stamp_place_to_label(current))
+
+    def persist_output_filename_stamp_settings() -> None:
+        config = load_ui_config(Path(DATA_DIR))
+        ui_cfg = config.setdefault("ui", {})
+        ui_cfg["output_filename_stamp_enabled"] = bool(output_stamp_enabled_var.get())
+        ui_cfg["output_filename_stamp_pattern"] = str(output_stamp_pattern_var.get() or "")
+        place = output_stamp_place_var.get()
+        ui_cfg["output_filename_stamp_place"] = (
+            place if place in ("prefix", "suffix") else "suffix"
+        )
+        save_ui_config(Path(DATA_DIR), config)
+
+    def _render_output_filename_preview() -> None:
+        preview = apply_output_filename_stamp(
+            "report__123rows.xlsx",
+            enabled=bool(output_stamp_enabled_var.get()),
+            pattern=output_stamp_pattern_var.get(),
+            place=output_stamp_place_var.get(),
+        )
+        output_stamp_preview_var.set(preview)
+
+    def _update_output_stamp_controls_state() -> None:
+        state = tk.NORMAL if output_stamp_enabled_var.get() else tk.DISABLED
+        output_stamp_pattern_entry.config(state=state)
+        output_stamp_place_combo.config(state=("readonly" if state == tk.NORMAL else tk.DISABLED))
+
+    def on_output_stamp_enabled_toggle() -> None:
+        persist_output_filename_stamp_settings()
+        _update_output_stamp_controls_state()
+        _render_output_filename_preview()
+
+    def on_output_stamp_pattern_change(*_args) -> None:  # noqa: ANN001
+        persist_output_filename_stamp_settings()
+        _render_output_filename_preview()
+
+    def on_output_stamp_pattern_focus_out(_event=None):  # noqa: ANN001
+        persist_output_filename_stamp_settings()
+        _render_output_filename_preview()
+
+    def on_output_stamp_place_change(_event=None):  # noqa: ANN001
+        output_stamp_place_var.set(_output_stamp_label_to_place(output_stamp_place_display_var.get()))
+        persist_output_filename_stamp_settings()
+        _render_output_filename_preview()
+
+    def schedule_output_stamp_preview_refresh() -> None:
+        if not root.winfo_exists():
+            return
+        _render_output_filename_preview()
+        output_stamp_preview_after_id["id"] = root.after(
+            30000, schedule_output_stamp_preview_refresh
+        )
+
     def reset_sql_dialect_for_connection(conn_type: str) -> None:
         sql_dialect_var.set(_dialect_from_db_kind(conn_type))
         rebuild = sql_editor_state.get("rebuild")
@@ -8540,6 +8866,36 @@ def run_gui(connection_store, output_directory):
         resolved = resolve_path(path)
         selected_sql_path_full.set(resolved)
         sql_label_var.set(shorten_path(path))
+        refresh_run_state()
+
+    def _has_sql_source() -> bool:
+        if pasted_sql_state["sql"] and pasted_sql_state["report_name"]:
+            return True
+        return bool(selected_sql_path_full.get())
+
+    def _template_ok() -> bool:
+        if not use_template_var.get():
+            return True
+        if format_var.get() != "xlsx":
+            return False
+        return bool(template_path_var.get() and sheet_name_var.get())
+
+    def refresh_run_state() -> None:
+        btn = start_button_holder.get("widget")
+        if btn is None:
+            return
+
+        # If export is running, keep Start disabled (run_export_gui manages it).
+        ev = cancel_state.get("event")
+        if ev is not None and not ev.is_set():
+            return
+
+        connected = (
+            engine_holder.get("engine") is not None
+            and get_connection_by_name(selected_connection_var.get()) is not None
+        )
+        ready = connected and _has_sql_source() and _template_ok()
+        btn.config(state=(tk.NORMAL if ready else tk.DISABLED))
 
     def set_connection_status(message=None, connected=False, key=None, **params):
         if key:
@@ -8551,10 +8907,7 @@ def run_gui(connection_store, output_directory):
                 display_params["type"] = _db_type_labels().get(type_key, type_key)
             message = t(key, **display_params)
         connection_status_var.set(message or "")
-        btn = start_button_holder.get("widget")
-        if btn is not None:
-            btn_state = tk.NORMAL if connected else tk.DISABLED
-            btn.config(state=btn_state)
+        refresh_run_state()
 
     def apply_engine(new_engine):
         old_engine = engine_holder.get("engine")
@@ -8770,6 +9123,20 @@ def run_gui(connection_store, output_directory):
         # ignore subsequent WM_DELETE requests; _reset_run_state() will close.
         if ev is not None and ev.is_set() and close_state.get("after_cancel"):
             return
+
+        after_id = output_stamp_preview_after_id.get("id")
+        if after_id:
+            try:
+                root.after_cancel(after_id)
+            except Exception:  # noqa: BLE001
+                pass
+            output_stamp_preview_after_id["id"] = None
+
+        if "PYTEST_CURRENT_TEST" not in os.environ:
+            persist_main_window_geometry(
+                Path(DATA_DIR),
+                main_window_geometry_to_save(root),
+            )
         root.destroy()
 
     def show_error_popup(ui_msg, *, sql_query: str | None = None, sql_source_path: str | None = None):
@@ -9524,6 +9891,7 @@ def run_gui(connection_store, output_directory):
             pasted_sql_state["report_name"] = normalized_name
             selected_sql_path_full.set("")
             sql_label_var.set(f"{t('LBL_SQL_PASTED')} {normalized_name}")
+            refresh_run_state()
             sql_editor_state["dialog"] = None
             sql_editor_state["widget"] = None
             sql_editor_state["rebuild"] = None
@@ -9621,6 +9989,7 @@ def run_gui(connection_store, output_directory):
         update_template_controls_state()
         update_csv_profile_controls_state()
         _refresh_template_ui()
+        refresh_run_state()
 
     def _sync_save_as_extension(show_info: bool = False) -> None:
         raw = (save_as_path_var.get() or "").strip()
@@ -9648,6 +10017,7 @@ def run_gui(connection_store, output_directory):
         update_template_controls_state()
         update_csv_profile_controls_state()
         _sync_save_as_extension(show_info=False)
+        refresh_run_state()
 
     def choose_template_file():
         path = filedialog.askopenfilename(
@@ -9662,6 +10032,7 @@ def run_gui(connection_store, output_directory):
         use_template_var.set(True)
         on_toggle_template()
         _refresh_template_ui()
+        refresh_run_state()
         _show_template_naming_hint_once(
             root,
             ui_config,
@@ -10125,6 +10496,12 @@ def run_gui(connection_store, output_directory):
                 output_file_name = f"{base_name}.xlsx"
             else:
                 output_file_name = os.path.splitext(base_name)[0] + ".xlsx"
+            output_file_name = apply_output_filename_stamp(
+                output_file_name,
+                enabled=bool(output_stamp_enabled_var.get()),
+                pattern=output_stamp_pattern_var.get(),
+                place=output_stamp_place_var.get(),
+            )
             output_override = (save_as_path_var.get() or "").strip()
             output_file_path, ext_mismatch = normalize_output_file_path(
                 output_directory=output_directory,
@@ -10168,6 +10545,12 @@ def run_gui(connection_store, output_directory):
             output_file_name = os.path.splitext(base_name)[0] + (
                 ".xlsx" if output_format == "xlsx" else ".csv"
             )
+        output_file_name = apply_output_filename_stamp(
+            output_file_name,
+            enabled=bool(output_stamp_enabled_var.get()),
+            pattern=output_stamp_pattern_var.get(),
+            place=output_stamp_place_var.get(),
+        )
         output_override = (save_as_path_var.get() or "").strip()
         output_file_path, ext_mismatch = normalize_output_file_path(
             output_directory=output_directory,
@@ -10206,15 +10589,12 @@ def run_gui(connection_store, output_directory):
         except Exception:  # noqa: BLE001
             pass
         try:
-            btn_cancel.grid()
+            btn_cancel.pack(side="left", padx=(0, 8))
             lbl_export_info.grid()
             lbl_export_info_value.grid()
         except Exception:  # noqa: BLE001
             pass
-        try:
-            btn_start.config(state=tk.NORMAL)
-        except Exception:  # noqa: BLE001
-            pass
+        refresh_run_state()
         if close_state.get("after_cancel"):
             root.after(0, root.destroy)
 
@@ -10248,10 +10628,7 @@ def run_gui(connection_store, output_directory):
                 sql_query=sql_query,
                 sql_source_path=sql_src,
             )
-            try:
-                btn_start.config(state=tk.NORMAL)
-            except Exception:
-                pass
+            refresh_run_state()
             return
     
         try:
@@ -10264,7 +10641,7 @@ def run_gui(connection_store, output_directory):
         cancel_state["event"] = threading.Event()
         btn_cancel.config(state=tk.NORMAL)
         try:
-            btn_cancel.grid_remove()
+            btn_cancel.pack_forget()
             lbl_export_info.grid_remove()
             lbl_export_info_value.grid_remove()
         except Exception:  # noqa: BLE001
@@ -10707,7 +11084,7 @@ def run_gui(connection_store, output_directory):
         connection_controls,
         textvariable=selected_connection_var,
         state="readonly",
-        width=50,
+        width=42,
     )
     connection_combo.grid(row=0, column=1, sticky="we", padx=(5, 0))
     connections_state["combobox"] = connection_combo
@@ -10756,58 +11133,254 @@ def run_gui(connection_store, output_directory):
     advanced_frame = ttk.LabelFrame(
         connection_frame, text=t("FRAME_ADVANCED"), padding=(10, 8)
     )
-    advanced_frame.grid(row=2, column=0, sticky="we", pady=(8, 0))
+    advanced_frame_grid_kwargs = {"row": 3, "column": 0, "sticky": "we", "pady": (8, 0)}
+    advanced_frame.grid(**advanced_frame_grid_kwargs)
     i18n_widgets["advanced_frame"] = advanced_frame
 
+    resize_state = {
+        "programmatic": False,
+        "open": set(),
+        "baseline_h": None,
+        "last_auto_h": None,
+        "last_auto_w": None,
+        "user_resized": False,
+    }
+
+    def _clear_programmatic_resize() -> None:
+        resize_state["programmatic"] = False
+
+    def _set_window_height(width: int, height: int) -> None:
+        resize_state["programmatic"] = True
+        try:
+            root.geometry(f"{width}x{height}")
+            root.update_idletasks()
+        finally:
+            root.after_idle(_clear_programmatic_resize)
+
+    def _on_root_configure(event):  # noqa: ANN001
+        if event.widget is not root:
+            return
+        if resize_state.get("programmatic"):
+            return
+        current_height = int(root.winfo_height() or 0)
+        current_width = int(root.winfo_width() or 0)
+        if current_height <= 0 or current_width <= 0:
+            return
+
+        if not resize_state.get("open"):
+            return
+
+        last_auto_h = int(resize_state.get("last_auto_h") or 0)
+        last_auto_w = int(resize_state.get("last_auto_w") or 0)
+        if (
+            last_auto_h
+            and last_auto_w
+            and abs(current_height - last_auto_h) <= 2
+            and abs(current_width - last_auto_w) <= 2
+        ):
+            resize_state["last_auto_h"] = current_height
+            resize_state["last_auto_w"] = current_width
+            return
+
+        resize_state["user_resized"] = True
+
+    root.bind("<Configure>", _on_root_configure, add="+")
+
+    def _keep_window_size(prev_w: int, prev_h: int) -> int:
+        # Keep width stable, but allow vertical growth to fit expanded sections.
+        try:
+            if prev_w <= 150 or prev_h <= 150:
+                return prev_h
+            root.update_idletasks()
+            req_h = max(1, int(root.winfo_reqheight() or 1))
+            cur_h = max(prev_h, int(root.winfo_height() or 1))
+            target_h = max(cur_h, req_h)
+
+            try:
+                vroot_h = int(root.winfo_vrootheight() or 0)
+                if vroot_h > 0:
+                    target_h = min(target_h, max(vroot_h - 80, 300))
+            except Exception:  # noqa: BLE001
+                pass
+
+            _set_window_height(prev_w, target_h)
+            return target_h
+        except Exception:  # noqa: BLE001
+            return prev_h
+
+    def _toggle_advanced_frame(*_):
+        prev_w, prev_h = root.winfo_width(), root.winfo_height()
+        if show_advanced_var.get():
+            if not resize_state["open"]:
+                resize_state["baseline_h"] = prev_h
+                resize_state["user_resized"] = False
+            advanced_frame.grid(**advanced_frame_grid_kwargs)
+            auto_h = _keep_window_size(prev_w, prev_h)
+            resize_state["open"].add("advanced")
+            resize_state["last_auto_h"] = auto_h
+            resize_state["last_auto_w"] = int(root.winfo_width() or prev_w)
+            return
+
+        advanced_frame.grid_remove()
+        resize_state["open"].discard("advanced")
+
+        if resize_state["open"]:
+            return
+
+        baseline_h = int(resize_state.get("baseline_h") or 0)
+        last_auto_h = int(resize_state.get("last_auto_h") or 0)
+        current_h = int(root.winfo_height() or 0)
+        should_shrink = bool(
+            baseline_h
+            and last_auto_h
+            and not resize_state.get("user_resized")
+            and abs(current_h - last_auto_h) <= 2
+        )
+
+        if should_shrink:
+            root.update_idletasks()
+            req_h = int(root.winfo_reqheight() or 0)
+            target_h = max(baseline_h, req_h, MIN_MAIN_WINDOW_HEIGHT)
+            try:
+                vroot_h = int(root.winfo_vrootheight() or 0)
+                if vroot_h > 0:
+                    target_h = min(target_h, max(vroot_h - 80, 300))
+            except Exception:  # noqa: BLE001
+                pass
+            _set_window_height(prev_w, target_h)
+
+        resize_state["baseline_h"] = None
+        resize_state["last_auto_h"] = None
+        resize_state["last_auto_w"] = None
+        resize_state["user_resized"] = False
+
+    chk_show_advanced = ttk.Checkbutton(
+        connection_frame,
+        text=t("CHK_SHOW_ADVANCED"),
+        variable=show_advanced_var,
+        command=_toggle_advanced_frame,
+    )
+    chk_show_advanced.grid(row=2, column=0, sticky="w", pady=(8, 0))
+    i18n_widgets["chk_show_advanced"] = chk_show_advanced
+
+    advanced_left = ttk.Frame(advanced_frame)
+    advanced_right = ttk.Frame(advanced_frame)
+    advanced_left.grid(row=0, column=0, sticky="nw")
+    advanced_right.grid(row=0, column=1, sticky="new", padx=(24, 0))
+    advanced_frame.columnconfigure(0, weight=1)
+    advanced_frame.columnconfigure(1, weight=1)
+    advanced_right.columnconfigure(1, weight=1)
+
     chk_archive_sql = ttk.Checkbutton(
-        advanced_frame,
+        advanced_left,
         text=t("CHK_ARCHIVE_SQL"),
         variable=archive_sql_var,
         command=on_archive_sql_toggle,
     )
-    chk_archive_sql.grid(row=0, column=0, columnspan=2, sticky="w")
+    chk_archive_sql.grid(row=0, column=0, sticky="w")
     i18n_widgets["chk_archive_sql"] = chk_archive_sql
 
-    advanced_frame.columnconfigure(0, weight=1)
-    advanced_frame.columnconfigure(1, weight=0)
+    row_db_timeout = ttk.Frame(advanced_left)
+    row_db_timeout.grid(row=1, column=0, sticky="we", pady=(6, 0))
+    row_db_timeout.columnconfigure(2, weight=1)
 
-    lbl_db_timeout = ttk.Label(advanced_frame, text=t("LBL_DB_TIMEOUT_MIN"))
-    lbl_db_timeout.grid(row=1, column=0, sticky="w", pady=(6, 0))
+    lbl_db_timeout = ttk.Label(row_db_timeout, text=t("LBL_DB_TIMEOUT_MIN"))
+    lbl_db_timeout.grid(row=0, column=0, sticky="w", padx=(0, 8))
     i18n_widgets["lbl_db_timeout"] = lbl_db_timeout
 
     sp_db_timeout = ttk.Spinbox(
-        advanced_frame,
+        row_db_timeout,
         from_=0,
         to=1440,
         textvariable=db_timeout_min_var,
         width=6,
         command=persist_timeouts_from_ui,
     )
-    sp_db_timeout.grid(row=1, column=1, sticky="e", pady=(6, 0))
+    sp_db_timeout.grid(row=0, column=1, sticky="w")
     sp_db_timeout.bind("<FocusOut>", lambda *_: persist_timeouts_from_ui())
     sp_db_timeout.bind("<Return>", lambda *_: persist_timeouts_from_ui())
 
-    lbl_export_timeout = ttk.Label(advanced_frame, text=t("LBL_EXPORT_TIMEOUT_MIN"))
-    lbl_export_timeout.grid(row=2, column=0, sticky="w", pady=(6, 0))
+    row_export_timeout = ttk.Frame(advanced_left)
+    row_export_timeout.grid(row=2, column=0, sticky="we", pady=(6, 0))
+    row_export_timeout.columnconfigure(2, weight=1)
+
+    lbl_export_timeout = ttk.Label(row_export_timeout, text=t("LBL_EXPORT_TIMEOUT_MIN"))
+    lbl_export_timeout.grid(row=0, column=0, sticky="w", padx=(0, 8))
     i18n_widgets["lbl_export_timeout"] = lbl_export_timeout
 
     sp_export_timeout = ttk.Spinbox(
-        advanced_frame,
+        row_export_timeout,
         from_=0,
         to=1440,
         textvariable=export_timeout_min_var,
         width=6,
         command=persist_timeouts_from_ui,
     )
-    sp_export_timeout.grid(row=2, column=1, sticky="e", pady=(6, 0))
+    sp_export_timeout.grid(row=0, column=1, sticky="w")
     sp_export_timeout.bind("<FocusOut>", lambda *_: persist_timeouts_from_ui())
     sp_export_timeout.bind("<Return>", lambda *_: persist_timeouts_from_ui())
 
     lbl_timeout_note = ttk.Label(
-        advanced_frame, text=t("LBL_TIMEOUT_NOTE"), foreground="gray40"
+        advanced_left, text=t("LBL_TIMEOUT_NOTE"), foreground="gray40"
     )
-    lbl_timeout_note.grid(row=3, column=0, columnspan=2, sticky="w", pady=(6, 0))
+    lbl_timeout_note.grid(row=3, column=0, sticky="w", pady=(6, 0))
     i18n_widgets["lbl_timeout_note"] = lbl_timeout_note
+
+    chk_output_filename_stamp = ttk.Checkbutton(
+        advanced_right,
+        text=t("CHK_OUTPUT_FILENAME_STAMP"),
+        variable=output_stamp_enabled_var,
+        command=on_output_stamp_enabled_toggle,
+    )
+    chk_output_filename_stamp.grid(row=0, column=0, columnspan=2, sticky="w")
+    i18n_widgets["chk_output_filename_stamp"] = chk_output_filename_stamp
+
+    lbl_output_stamp_pattern = ttk.Label(
+        advanced_right, text=t("LBL_OUTPUT_FILENAME_STAMP_PATTERN")
+    )
+    lbl_output_stamp_pattern.grid(row=1, column=0, sticky="w", padx=(0, 8), pady=(6, 0))
+    i18n_widgets["lbl_output_stamp_pattern"] = lbl_output_stamp_pattern
+
+    output_stamp_pattern_entry = ttk.Entry(
+        advanced_right,
+        textvariable=output_stamp_pattern_var,
+        width=22,
+    )
+    output_stamp_pattern_entry.grid(row=1, column=1, sticky="we", pady=(6, 0))
+    output_stamp_pattern_var.trace_add("write", on_output_stamp_pattern_change)
+    output_stamp_pattern_entry.bind("<FocusOut>", on_output_stamp_pattern_focus_out)
+
+    lbl_output_stamp_place = ttk.Label(
+        advanced_right, text=t("LBL_OUTPUT_FILENAME_STAMP_PLACE")
+    )
+    lbl_output_stamp_place.grid(row=2, column=0, sticky="w", padx=(0, 8), pady=(6, 0))
+    i18n_widgets["lbl_output_stamp_place"] = lbl_output_stamp_place
+
+    output_stamp_place_combo = ttk.Combobox(
+        advanced_right,
+        state="readonly",
+        width=25,
+        textvariable=output_stamp_place_display_var,
+        values=[],
+    )
+    output_stamp_place_combo.grid(row=2, column=1, sticky="w", pady=(6, 0))
+    output_stamp_place_combo.bind("<<ComboboxSelected>>", on_output_stamp_place_change)
+
+    lbl_output_stamp_preview = ttk.Label(advanced_right, text=t("LBL_OUTPUT_FILENAME_STAMP_PREVIEW"))
+    lbl_output_stamp_preview.grid(row=3, column=0, sticky="nw", padx=(0, 8), pady=(6, 0))
+    i18n_widgets["lbl_output_stamp_preview"] = lbl_output_stamp_preview
+
+    lbl_output_stamp_preview_value = ttk.Label(
+        advanced_right,
+        textvariable=output_stamp_preview_var,
+        foreground="gray40",
+    )
+    lbl_output_stamp_preview_value.grid(row=3, column=1, sticky="w", pady=(6, 0))
+
+    refresh_output_stamp_place_options()
+    _update_output_stamp_controls_state()
+    _render_output_filename_preview()
+    schedule_output_stamp_preview_refresh()
 
     source_frame = ttk.LabelFrame(root, text=t("FRAME_SQL_SOURCE"), padding=(10, 10))
     source_frame.pack(fill=tk.X, padx=10, pady=(10, 5))
@@ -10820,26 +11393,88 @@ def run_gui(connection_store, output_directory):
     template_frame = ttk.LabelFrame(
         root, text=t("FRAME_TEMPLATE_OPTIONS"), padding=(10, 10)
     )
-    template_frame.pack(fill=tk.X, padx=10, pady=5)
+    template_pack_kwargs = {"fill": tk.X, "padx": 10, "pady": 5}
     i18n_widgets["template_frame"] = template_frame
+
+    def _toggle_template_frame(*_):
+        prev_w, prev_h = root.winfo_width(), root.winfo_height()
+        if show_template_options_var.get():
+            if not resize_state["open"]:
+                resize_state["baseline_h"] = prev_h
+                resize_state["user_resized"] = False
+            template_frame.pack(before=result_frame, **template_pack_kwargs)
+            auto_h = _keep_window_size(prev_w, prev_h)
+            resize_state["open"].add("template")
+            resize_state["last_auto_h"] = auto_h
+            resize_state["last_auto_w"] = int(root.winfo_width() or prev_w)
+            return
+
+        template_frame.pack_forget()
+        resize_state["open"].discard("template")
+
+        if resize_state["open"]:
+            return
+
+        baseline_h = int(resize_state.get("baseline_h") or 0)
+        last_auto_h = int(resize_state.get("last_auto_h") or 0)
+        current_h = int(root.winfo_height() or 0)
+        should_shrink = bool(
+            baseline_h
+            and last_auto_h
+            and not resize_state.get("user_resized")
+            and abs(current_h - last_auto_h) <= 2
+        )
+
+        if should_shrink:
+            root.update_idletasks()
+            req_h = int(root.winfo_reqheight() or 0)
+            target_h = max(baseline_h, req_h, MIN_MAIN_WINDOW_HEIGHT)
+            try:
+                vroot_h = int(root.winfo_vrootheight() or 0)
+                if vroot_h > 0:
+                    target_h = min(target_h, max(vroot_h - 80, 300))
+            except Exception:  # noqa: BLE001
+                pass
+            _set_window_height(prev_w, target_h)
+
+        resize_state["baseline_h"] = None
+        resize_state["last_auto_h"] = None
+        resize_state["last_auto_w"] = None
+        resize_state["user_resized"] = False
+
+    chk_show_template = ttk.Checkbutton(
+        root,
+        text=t("CHK_SHOW_TEMPLATE_OPTIONS"),
+        variable=show_template_options_var,
+        command=_toggle_template_frame,
+    )
+    chk_show_template.pack(fill=tk.X, padx=10, pady=(0, 2))
+    i18n_widgets["chk_show_template"] = chk_show_template
 
     result_frame = ttk.LabelFrame(root, text=t("FRAME_RESULTS"), padding=(10, 10))
     result_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(5, 10))
     i18n_widgets["result_frame"] = result_frame
 
+    _toggle_template_frame()
+
     source_frame.columnconfigure(1, weight=1)
     source_frame.columnconfigure(2, weight=0)
     format_frame.columnconfigure(1, weight=1)
     template_frame.columnconfigure(1, weight=1)
+    result_frame.columnconfigure(0, weight=0)
     result_frame.columnconfigure(1, weight=1)
+    result_frame.columnconfigure(2, weight=1)
     result_frame.rowconfigure(3, weight=1)
 
     lbl_selected_sql = ttk.Label(source_frame, text=t("LBL_SELECTED_SQL"))
     lbl_selected_sql.grid(row=0, column=0, sticky="nw")
     i18n_widgets["lbl_selected_sql"] = lbl_selected_sql
-    ttk.Label(source_frame, textvariable=sql_label_var, wraplength=600, justify="left").grid(
-        row=0, column=1, columnspan=3, sticky="we"
+    lbl_sql_value = ttk.Label(
+        source_frame,
+        textvariable=sql_label_var,
+        justify="left",
     )
+    lbl_sql_value.grid(row=0, column=1, columnspan=3, sticky="we")
 
     btn_select_sql = ttk.Button(source_frame, text=t("BTN_SELECT_SQL"), command=choose_sql_file)
     btn_select_sql.grid(
@@ -10868,7 +11503,7 @@ def run_gui(connection_store, output_directory):
     )
     i18n_widgets["btn_paste_sql"] = btn_paste_sql
 
-    radio_xlsx = tk.Radiobutton(
+    radio_xlsx = ttk.Radiobutton(
         format_frame,
         text=t("FORMAT_XLSX"),
         variable=format_var,
@@ -10877,7 +11512,7 @@ def run_gui(connection_store, output_directory):
     )
     radio_xlsx.grid(row=0, column=0, sticky="w")
     i18n_widgets["radio_xlsx"] = radio_xlsx
-    radio_csv = tk.Radiobutton(
+    radio_csv = ttk.Radiobutton(
         format_frame,
         text=t("FORMAT_CSV"),
         variable=format_var,
@@ -10917,9 +11552,12 @@ def run_gui(connection_store, output_directory):
     csv_profile_state["manage_button"] = csv_profile_manage_btn
     i18n_widgets["csv_profile_manage_btn"] = csv_profile_manage_btn
 
-    ttk.Label(format_frame, textvariable=default_csv_label_var, justify="left", wraplength=600).grid(
-        row=2, column=0, columnspan=4, sticky="w", pady=(5, 0)
+    lbl_default_csv = ttk.Label(
+        format_frame,
+        textvariable=default_csv_label_var,
+        justify="left",
     )
+    lbl_default_csv.grid(row=2, column=0, columnspan=4, sticky="w", pady=(5, 0))
 
     lbl_save_as = ttk.Label(format_frame, text=t("LBL_SAVE_AS"))
     lbl_save_as.grid(row=3, column=0, sticky="w", pady=(8, 0))
@@ -10966,12 +11604,12 @@ def run_gui(connection_store, output_directory):
     choose_template_btn.grid(row=1, column=1, sticky="w", pady=(5, 0))
     template_state["choose_button"] = choose_template_btn
     i18n_widgets["choose_template_btn"] = choose_template_btn
-    ttk.Label(
+    lbl_template_path = ttk.Label(
         template_frame,
         textvariable=template_label_var,
-        wraplength=600,
         justify="left",
-    ).grid(row=2, column=0, columnspan=2, sticky="we")
+    )
+    lbl_template_path.grid(row=2, column=0, columnspan=2, sticky="we")
 
     lbl_template_sheet = ttk.Label(template_frame, text=t("LBL_TEMPLATE_SHEET"))
     lbl_template_sheet.grid(row=3, column=0, sticky="w", pady=(5, 0))
@@ -10984,6 +11622,7 @@ def run_gui(connection_store, output_directory):
     )
     sheet_combobox.grid(row=3, column=1, sticky="w", pady=(5, 0))
     template_state["sheet_combobox"] = sheet_combobox
+    sheet_combobox.bind("<<ComboboxSelected>>", lambda *_: refresh_run_state())
 
     lbl_template_start_cell = ttk.Label(template_frame, text=t("LBL_TEMPLATE_START_CELL"))
     lbl_template_start_cell.grid(row=4, column=0, sticky="w", pady=(5, 0))
@@ -11005,47 +11644,66 @@ def run_gui(connection_store, output_directory):
     _refresh_template_ui()
     update_csv_profile_controls_state()
 
-    btn_start = ttk.Button(result_frame, text=t("BTN_START"), command=run_export_gui)
-    btn_start.grid(row=0, column=0, pady=(0, 10), sticky="w")
+    style = ttk.Style(root)
+    # Avoid hardcoding font size (DPI/scaling issues). Keep system default size, just set weight=bold.
+    primary_btn_font = None
+    try:
+        base_font = tkfont.nametofont("TkDefaultFont")
+        primary_btn_font = tkfont.Font(root, font=base_font)
+        primary_btn_font.configure(weight="bold")
+        style.configure("Primary.TButton", padding=(14, 8), font=primary_btn_font)
+    except Exception:  # noqa: BLE001
+        style.configure("Primary.TButton", padding=(14, 8))
+
+    runbar = ttk.Frame(result_frame)
+    runbar.grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 10))
+
+    toolsbar = ttk.Frame(result_frame)
+    toolsbar.grid(row=0, column=2, sticky="e", pady=(0, 10))
+
+    btn_start = ttk.Button(runbar, text=t("BTN_START"), command=run_export_gui)
+    btn_start.pack(side="left", padx=(0, 8))
+    btn_start.configure(style="Primary.TButton")
     start_button_holder["widget"] = btn_start
+    refresh_run_state()
     i18n_widgets["btn_start"] = btn_start
     btn_cancel = ttk.Button(
-        result_frame,
+        runbar,
         text=t("BTN_CANCEL_RUN"),
         command=request_cancel,
         state=tk.DISABLED,
     )
-    btn_cancel.grid(row=0, column=1, padx=(10, 0), pady=(0, 10), sticky="w")
+    btn_cancel.pack(side="left", padx=(0, 8))
     i18n_widgets["btn_cancel"] = btn_cancel
     btn_report_issue = ttk.Button(
-        result_frame,
+        toolsbar,
         text=t("BTN_REPORT_ISSUE"),
         command=lambda: open_github_issue_chooser(parent=root),
     )
-    btn_report_issue.grid(row=0, column=2, padx=(10, 0), pady=(0, 10), sticky="w")
+    btn_report_issue.pack(side="left", padx=(0, 8))
     i18n_widgets["btn_report_issue"] = btn_report_issue
     btn_check_updates = ttk.Button(
-        result_frame,
+        toolsbar,
         text=t("BTN_CHECK_UPDATES"),
         command=check_updates_gui,
     )
-    btn_check_updates.grid(row=0, column=3, padx=(10, 0), pady=(0, 10), sticky="w")
+    btn_check_updates.pack(side="left", padx=(0, 8))
     i18n_widgets["btn_check_updates"] = btn_check_updates
     btn_help = ttk.Button(
-        result_frame,
+        toolsbar,
         text=t("BTN_HELP"),
         command=show_help_window,
     )
-    btn_help.grid(row=0, column=4, padx=(10, 0), pady=(0, 10), sticky="w")
+    btn_help.pack(side="left", padx=(0, 8))
     i18n_widgets["btn_help"] = btn_help
     btn_open_logs = ttk.Button(
-        result_frame, text=t("BTN_OPEN_LOGS"), command=open_logs_folder
+        toolsbar, text=t("BTN_OPEN_LOGS"), command=open_logs_folder
     )
-    btn_open_logs.grid(row=0, column=5, padx=(10, 0), pady=(0, 10), sticky="w")
+    btn_open_logs.pack(side="left", padx=(0, 8))
     i18n_widgets["btn_open_logs"] = btn_open_logs
 
     lbl_project_page = tk.Label(
-        result_frame, text=t("LBL_PROJECT_PAGE"), fg="blue", cursor="hand2"
+        toolsbar, text=t("LBL_PROJECT_PAGE"), fg="blue", cursor="hand2"
     )
     _project_font = tkfont.Font(lbl_project_page, lbl_project_page.cget("font"))
     _project_font.configure(underline=True)
@@ -11053,9 +11711,7 @@ def run_gui(connection_store, output_directory):
     lbl_project_page.bind(
         "<Button-1>", lambda *_: webbrowser.open(REPO_URL)
     )
-    lbl_project_page.grid(
-        row=0, column=6, padx=(10, 0), pady=(2, 10), sticky="w"
-    )
+    lbl_project_page.pack(side="left", pady=(2, 0))
     i18n_widgets["lbl_project_page"] = lbl_project_page
 
     refresh_connection_combobox()
@@ -11072,7 +11728,6 @@ def run_gui(connection_store, output_directory):
         result_frame,
         textvariable=result_info_var,
         justify="left",
-        wraplength=600,
     )
     lbl_export_info_value.grid(row=1, column=1, columnspan=3, sticky="w")
 
@@ -11112,17 +11767,41 @@ def run_gui(connection_store, output_directory):
     btn_open_file.config(state=tk.DISABLED)
     btn_open_folder.config(state=tk.DISABLED)
 
+    def _bind_wrap(label: ttk.Label, container: tk.Widget, pad: int = 20) -> None:
+        def _upd(_e=None):
+            width = container.winfo_width() or label.winfo_width() or 0
+            label.config(wraplength=max(width - pad, 200))
+
+        container.bind("<Configure>", _upd, add="+")
+        label.bind("<Configure>", _upd, add="+")
+        _upd()
+
+    _bind_wrap(lbl_sql_value, source_frame)
+    _bind_wrap(lbl_default_csv, format_frame)
+    _bind_wrap(lbl_template_path, template_frame)
+    _bind_wrap(lbl_export_info_value, result_frame)
+    _bind_wrap(lbl_output_stamp_preview_value, advanced_frame)
+    _toggle_advanced_frame()
+    _toggle_template_frame()
+
     def apply_i18n():
         root.title(f"{t('APP_TITLE_FULL')} {get_app_version_label()}")
         connection_frame.config(text=t("FRAME_DB_CONNECTION"))
         advanced_frame.config(text=t("FRAME_ADVANCED"))
+        chk_show_advanced.config(text=t("CHK_SHOW_ADVANCED"))
         source_frame.config(text=t("FRAME_SQL_SOURCE"))
         format_frame.config(text=t("FRAME_OUTPUT_FORMAT"))
         template_frame.config(text=t("FRAME_TEMPLATE_OPTIONS"))
+        chk_show_template.config(text=t("CHK_SHOW_TEMPLATE_OPTIONS"))
         result_frame.config(text=t("FRAME_RESULTS"))
         lbl_connection.config(text=t("LBL_CONNECTION"))
         lbl_language.config(text=t("LBL_LANGUAGE"))
         chk_archive_sql.config(text=t("CHK_ARCHIVE_SQL"))
+        chk_output_filename_stamp.config(text=t("CHK_OUTPUT_FILENAME_STAMP"))
+        lbl_output_stamp_pattern.config(text=t("LBL_OUTPUT_FILENAME_STAMP_PATTERN"))
+        lbl_output_stamp_place.config(text=t("LBL_OUTPUT_FILENAME_STAMP_PLACE"))
+        lbl_output_stamp_preview.config(text=t("LBL_OUTPUT_FILENAME_STAMP_PREVIEW"))
+        refresh_output_stamp_place_options()
         btn_manage_connections.config(text=t("BTN_MANAGE_CONNECTIONS"))
         btn_test_connection.config(text=t("BTN_TEST_CONNECTION"))
         lbl_selected_sql.config(text=t("LBL_SELECTED_SQL"))
@@ -11160,10 +11839,10 @@ def run_gui(connection_store, output_directory):
         btn_odbc_diagnostics.config(text=t("BTN_ODBC_DIAGNOSTICS"))
         refresh_csv_profile_controls(csv_profile_state["config"].get("default_profile"))
         if connection_status_state["key"]:
-            is_connected = False
-            status_btn = start_button_holder.get("widget")
-            if status_btn is not None:
-                is_connected = status_btn.cget("state") == tk.NORMAL
+            is_connected = (
+                engine_holder.get("engine") is not None
+                and get_connection_by_name(selected_connection_var.get()) is not None
+            )
             set_connection_status(
                 connected=is_connected,
                 key=connection_status_state["key"],
@@ -11182,7 +11861,37 @@ def run_gui(connection_store, output_directory):
 
     lang_combo.bind("<<ComboboxSelected>>", on_lang_change)
 
-    _center_window(root)
+    def _run_if_enabled(_event=None):
+        btn = start_button_holder.get("widget")
+        if btn is not None and btn.cget("state") == tk.NORMAL:
+            run_export_gui()
+        return "break"
+
+    def _cancel_if_running(_event=None):
+        ev = cancel_state.get("event")
+        if ev is not None and not ev.is_set():
+            request_cancel()
+            return "break"
+        return None
+
+    def _open_sql_file_shortcut(_event=None):
+        choose_sql_file()
+        return "break"
+
+    def _open_paste_sql_shortcut(_event=None):
+        open_paste_sql_dialog()
+        return "break"
+
+    def _test_connection_shortcut(_event=None):
+        test_connection_only()
+        return "break"
+
+    root.bind("<Control-o>", _open_sql_file_shortcut)
+    root.bind("<Control-Shift-v>", _open_paste_sql_shortcut)
+    root.bind("<F5>", _test_connection_shortcut)
+    root.bind("<Control-Return>", _run_if_enabled)
+    root.bind("<Escape>", _cancel_if_running)
+
     root.protocol("WM_DELETE_WINDOW", on_close)
 
     _dbg("run_gui(): entering mainloop()")

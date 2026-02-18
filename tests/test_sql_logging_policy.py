@@ -54,7 +54,7 @@ class SqlLoggingPolicyTests(unittest.TestCase):
     def test_default_logs_excerpt_only(self):
         os.environ.pop("KKR_LOG_FULL_SQL", None)
         secret = "SECRET_ABC_123"
-        sql = f"SELECT '" + ("A" * 7000) + secret + "' AS x;"
+        sql = "SELECT '" + ("A" * 7000) + secret + "' AS x;"
 
         engine = create_engine("sqlite:///:memory:", poolclass=NullPool)
         try:
@@ -71,7 +71,7 @@ class SqlLoggingPolicyTests(unittest.TestCase):
     def test_env_enabled_logs_full_sql(self):
         os.environ["KKR_LOG_FULL_SQL"] = "1"
         secret = "SECRET_ABC_123"
-        sql = f"SELECT '" + ("A" * 7000) + secret + "' AS x;"
+        sql = "SELECT '" + ("A" * 7000) + secret + "' AS x;"
 
         engine = create_engine("sqlite:///:memory:", poolclass=NullPool)
         try:
