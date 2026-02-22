@@ -43,3 +43,4 @@ Thumbs.db
 .idea/
 .vscode/
 *.bat
+*kkr-query2xlsx.user.json*

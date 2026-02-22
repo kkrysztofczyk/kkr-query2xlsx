@@ -635,7 +635,7 @@ class ExportProgressWindow:
 
 # --- App version -------------------------------------------------------------
 
-APP_VERSION = "0.4.3"  # bump manually for releases
+APP_VERSION = "0.4.4"  # bump manually for releases
 
 MSSQL_SAFE_SET_SQL = """\
 SET NOCOUNT ON;
@@ -5129,6 +5129,7 @@ def apply_output_filename_stamp(
     raw_pattern = pattern or ""
     if not raw_pattern.strip():
         return file_name
+
     lead_m = re.match(r"^\s+", raw_pattern)
     trail_m = re.search(r"\s+$", raw_pattern)
     lead_ws_len = len(lead_m.group(0)) if lead_m else 0
@@ -5140,10 +5141,19 @@ def apply_output_filename_stamp(
 
     stem, ext = os.path.splitext(file_name)
     if place == "prefix":
-        separator = (" " * trail_ws_len) if trail_ws_len else ""
+        # Separator between stamp and original filename:
+        # prefer trailing whitespace ("[YYYY]   "), otherwise use leading ("   [YYYY]").
+        separator_len = trail_ws_len if trail_ws_len else lead_ws_len
+        separator = (" " * separator_len) if separator_len else ""
         return f"{stamp}{separator}{file_name}"
-    separator = (" " * lead_ws_len) if lead_ws_len else ""
-    return f"{stem}{separator}{stamp}{ext}"
+
+    # suffix: stem + leading_ws + stamp + trailing_ws + ext
+    before = (" " * lead_ws_len) if lead_ws_len else ""
+    after = (" " * trail_ws_len) if trail_ws_len else ""
+    # Avoid filenames ending with space when there's no extension.
+    if not ext:
+        after = ""
+    return f"{stem}{before}{stamp}{after}{ext}"
 
 
 def write_sql_archive_entry(
@@ -12267,6 +12277,71 @@ def _selftest_apply_mssql_safe_set() -> bool:
     return ok
 
 
+def _selftest_apply_output_filename_stamp_whitespace() -> bool:
+    dt = datetime(2026, 2, 18, 12, 0, 0)
+    cases = [
+        (
+            "suffix_trailing_spaces_preserved_before_extension",
+            "vlt_event_log.xlsx",
+            True,
+            "[YYYY-MM-DD] ",
+            "suffix",
+            "vlt_event_log[2026-02-18] .xlsx",
+        ),
+        (
+            "suffix_leading_spaces_between_stem_and_stamp",
+            "vlt_event_log.xlsx",
+            True,
+            " [YYYY-MM-DD]",
+            "suffix",
+            "vlt_event_log [2026-02-18].xlsx",
+        ),
+        (
+            "prefix_trailing_spaces_between_stamp_and_name",
+            "vlt_event_log.xlsx",
+            True,
+            "[YYYY-MM-DD] ",
+            "prefix",
+            "[2026-02-18] vlt_event_log.xlsx",
+        ),
+        (
+            "prefix_leading_spaces_should_be_used_as_separator",
+            "vlt_event_log.xlsx",
+            True,
+            " [YYYY-MM-DD]",
+            "prefix",
+            "[2026-02-18] vlt_event_log.xlsx",
+        ),
+        (
+            "pattern_only_spaces_is_noop",
+            "vlt_event_log.xlsx",
+            True,
+            " ",
+            "suffix",
+            "vlt_event_log.xlsx",
+        ),
+    ]
+
+    ok = True
+    for name, file_name, enabled, pattern, place, expected in cases:
+        got = apply_output_filename_stamp(
+            file_name,
+            enabled=enabled,
+            pattern=pattern,
+            place=place,
+            dt=dt,
+        )
+        if got == expected:
+            print(f"[OK] apply_output_filename_stamp(): {name}")
+        else:
+            print(
+                f"[FAIL] apply_output_filename_stamp(): {name} "
+                f"expected={expected!r} got={got!r}"
+            )
+            ok = False
+    return ok
+
+
 def _can_write_text_stream(stream) -> bool:
     """Return True when ``stream`` looks writable and is not marked as closed."""
     try:
@@ -12456,6 +12531,27 @@ def run_self_test_report() -> tuple[bool, str]:
             ok = False
     except Exception as exc:  # noqa: BLE001
         lines.append(f"[FAIL] _apply_mssql_safe_set() self-test crashed: {type(exc).__name__}: {exc}")
+        ok = False
+
+    # 6) apply_output_filename_stamp() whitespace handling self-test (string-only)
+    try:
+        capture = io.StringIO()
+        with contextlib.redirect_stdout(capture):
+            stamp_ws_ok = _selftest_apply_output_filename_stamp_whitespace()
+        emitted = capture.getvalue().strip()
+        if emitted:
+            lines.extend(emitted.splitlines())
+
+        if stamp_ws_ok:
+            lines.append("[OK] apply_output_filename_stamp() whitespace cases")
+        else:
+            lines.append("[FAIL] apply_output_filename_stamp() whitespace cases")
+            ok = False
+    except Exception as exc:  # noqa: BLE001
+        lines.append(
+            "[FAIL] apply_output_filename_stamp() whitespace self-test crashed: "
+            f"{type(exc).__name__}: {exc}"
+        )
         ok = False
 
     lines.append("")
