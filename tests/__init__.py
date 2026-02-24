@@ -4,6 +4,7 @@ import os
 import warnings
 
 
+# Treat ResourceWarning as errors in tests to catch file handle leaks
 warnings.simplefilter("error", ResourceWarning)
 
 

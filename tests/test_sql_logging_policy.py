@@ -107,6 +107,23 @@ class SqlLoggingPolicyTests(unittest.TestCase):
         self.assertIn("SQL execution failed (excerpt): boom", logs)
         self.assertIn("Traceback (most recent call last)", logs)
 
+
+    def test_sql_exception_logging_handles_missing_traceback(self):
+        """Verify _log_sql_exception does not crash when traceback is missing."""
+        fake_error = Exception("test error")
+        fake_error.__traceback__ = None
+
+        def emit():
+            self.app._log_sql_exception(
+                "Test error",
+                "SELECT * FROM test",
+                error=fake_error,
+            )
+
+        logs = self._capture_sql_logs(emit)
+
+        self.assertIn("SQL execution failed (excerpt): test error", logs)
+
     def test_exception_path_uses_excerpt_when_full_disabled(self):
         os.environ.pop("KKR_LOG_FULL_SQL", None)
         secret = "SECRET_ABC_123"

@@ -127,7 +127,12 @@ def _ensure_runtime_dependencies(*, show_gui: bool = True) -> None:
     raise RuntimeError(msg)
 
 
-def _sql_log_excerpt(sql: str, *, max_chars: int = 5000, max_lines: int = 200) -> str:
+def _sql_log_excerpt(sql: str, *, max_chars: int = 800, max_lines: int = 50) -> str:
+    """Create a concise SQL excerpt for logging.
+
+    Default limits (800 chars, 50 lines) are enough for most queries
+    while keeping logs readable. Use KKR_LOG_FULL_SQL=1 for full SQL.
+    """
     return _sql_excerpt_preserve_lines(sql, max_chars=max_chars, max_lines=max_lines)
 
 
@@ -175,6 +180,18 @@ def _log_sql_exception(
     sql_source_path: str | None = None,
     error: BaseException | None = None,
 ) -> None:
+    """Log SQL execution failure with full context.
+
+    Args:
+        message: Error description.
+        sql_query: The SQL that failed.
+        sql_source_path: Path to SQL source file (optional).
+        error: The exception object (optional).
+
+    Note:
+        This function unwraps SQLAlchemy DBAPIError to log the underlying
+        database driver error with its original traceback for better diagnostics.
+    """
     sql_for_log, mode = _sql_for_log(sql_query)
     source = _sql_source_for_log(sql_source_path)
     context_parts = []
@@ -184,15 +201,30 @@ def _log_sql_exception(
         context_parts.append(t("SQL_SOURCE_FILE", path=source))
     if context_parts:
         LOGGER.error(" | ".join(context_parts))
+    # Unwrap SQLAlchemy DBAPIError to get the actual database driver error.
     err_obj = getattr(error, "orig", error) if error is not None else None
     err_text = str(err_obj) if err_obj is not None else message
+
+    # Determine exc_info: prefer unwrapped error and fallback gracefully.
+    exc_info = None
     if isinstance(err_obj, BaseException):
-        exc_info = (type(err_obj), err_obj, err_obj.__traceback__)
+        tb = getattr(err_obj, "__traceback__", None)
+        if tb is not None:
+            exc_info = (type(err_obj), err_obj, tb)
+        else:
+            exc_info = err_obj
     elif isinstance(error, BaseException):
-        exc_info = (type(error), error, error.__traceback__)
+        tb = getattr(error, "__traceback__", None)
+        if tb is not None:
+            exc_info = (type(error), error, tb)
+        else:
+            exc_info = error
     else:
         exc_info = True
-    LOGGER.error(t("SQL_EXEC_FAILED", error=err_text, mode=mode, sql=sql_for_log), exc_info=exc_info)
+    LOGGER.error(
+        t("SQL_EXEC_FAILED", error=err_text, mode=mode, sql=sql_for_log),
+        exc_info=exc_info,
+    )
 
 
 def _log_sql_warning(message: str, sql_query: str, *args, sql_source_path: str | None = None) -> None:
@@ -201,7 +233,7 @@ def _log_sql_warning(message: str, sql_query: str, *args, sql_source_path: str |
     if source:
         LOGGER.warning(t("SQL_SOURCE_FILE", path=source))
     formatted = message % args if args else message
-    LOGGER.warning(t("SQL_EXEC_FAILED", error=formatted, mode=mode, sql=sql_for_log))
+    LOGGER.warning(t("SQL_EXEC_WARNING", error=formatted, mode=mode, sql=sql_for_log))
 
 
 def _xlsx_get_sheetnames(xlsx_path: str) -> list[str]:
@@ -420,7 +452,7 @@ def _get_base_dir() -> str:
 
 
 BASE_DIR = _get_base_dir()
-DATA_DIR = BASE_DIR  # default: tak jak dziś; zmienimy tylko gdy brak praw zapisu
+DATA_DIR = BASE_DIR  # default: same as BASE_DIR; will change only if no write access
 
 
 def _set_data_dir(new_dir: str) -> None:
@@ -430,7 +462,7 @@ def _set_data_dir(new_dir: str) -> None:
 
     DATA_DIR = os.path.abspath(new_dir)
 
-    # przelicz ścieżki zależne od _build_path()
+    # Recalculate all paths that depend on DATA_DIR via _build_path()
     SECURE_PATH = _build_path("secure.txt")
     QUERIES_PATH = _build_path("queries.txt")
     APP_CONFIG_PATH = _build_path("kkr-query2xlsx.json")
@@ -635,7 +667,7 @@ class ExportProgressWindow:
 
 # --- App version -------------------------------------------------------------
 
-APP_VERSION = "0.4.4"  # bump manually for releases
+APP_VERSION = "0.4.5"  # bump manually for releases
 
 MSSQL_SAFE_SET_SQL = """\
 SET NOCOUNT ON;
@@ -685,8 +717,8 @@ def _ensure_engine_mssql_set_hook(engine) -> None:
 
     @event.listens_for(engine, "connect")
     def _kkr_mssql_connect(dbapi_conn, conn_record):  # noqa: ANN001
-        # pyodbc.Connection nie ma __dict__ -> nie można doklejać atrybutów setattr().
-        # Stan trzymamy w SQLAlchemy ConnectionRecord.info (per-connection w puli).
+        # pyodbc.Connection has no __dict__ -> setattr attributes cannot be attached.
+        # Keep state in SQLAlchemy ConnectionRecord.info (per pooled connection).
         info = None
         try:
             info = getattr(conn_record, "info", None)
@@ -698,15 +730,15 @@ def _ensure_engine_mssql_set_hook(engine) -> None:
         try:
             cur = dbapi_conn.cursor()
         except Exception as exc:  # noqa: BLE001
-            # Nie blokuj całego połączenia, jeśli nie uda się utworzyć kursora.
+            # Do not block the entire connection if cursor creation fails.
             LOGGER.warning("MSSQL session prolog: cannot create cursor: %s", exc, exc_info=True)
             return
         try:
             if _apply_mssql_safe_set(cur) and isinstance(info, dict):
                 info["kkr_mssql_safe_set_done"] = True
         except Exception as exc:  # noqa: BLE001
-            # _apply_mssql_safe_set() loguje standardowe ścieżki failover.
-            # Tu logujemy tylko naprawdę niespodziewane wyjątki.
+            # _apply_mssql_safe_set() already logs standard failover paths.
+            # Log only truly unexpected exceptions here.
             LOGGER.warning("MSSQL session prolog unexpected error: %s", exc, exc_info=True)
         finally:
             try:
@@ -809,42 +841,29 @@ def _parse_retry_hint(headers) -> str | None:  # noqa: ANN001
     retry_after_fallback_str: str | None = None
     retry_after_ts: str | None = None
 
-    try:
-        retry_after = headers.get("retry-after")
-    except Exception:  # noqa: BLE001
-        retry_after = None
+    retry_after = headers.get("retry-after")
     if retry_after is not None:
         s = str(retry_after).strip()
         if s:
             if s.isdigit():
-                try:
-                    seconds = int(s)
-                except (OverflowError, ValueError):
-                    seconds = None
-                if seconds is not None and 0 <= seconds <= _UPD_MAX_RETRY_AFTER_SECONDS:
+                seconds = int(s)
+                if 0 <= seconds <= _UPD_MAX_RETRY_AFTER_SECONDS:
                     retry_after_ts = _format_local_ts(time.time() + seconds)
             else:
                 retry_after_fallback_str = s[:64]
 
-    try:
-        reset_raw = headers.get("x-ratelimit-reset")
-    except Exception:  # noqa: BLE001
-        reset_raw = None
+    reset_raw = headers.get("x-ratelimit-reset") if headers else None
     if reset_raw is not None:
         s = str(reset_raw).strip()
         if s.isdigit():
-            try:
-                reset_ts = int(s)
-            except (OverflowError, ValueError):
-                reset_ts = None
-            if reset_ts is not None:
-                now = int(time.time())
-                if 0 <= reset_ts <= now + _UPD_MAX_RESET_FUTURE_SECONDS:
-                    try:
-                        dt = datetime.fromtimestamp(reset_ts)
-                        return dt.strftime("%Y-%m-%d %H:%M:%S")
-                    except (OverflowError, OSError, ValueError):
-                        pass
+            reset_ts = int(s)
+            now = int(time.time())
+            if 0 <= reset_ts <= now + _UPD_MAX_RESET_FUTURE_SECONDS:
+                try:
+                    dt = datetime.fromtimestamp(reset_ts)
+                    return dt.strftime("%Y-%m-%d %H:%M:%S")
+                except (OverflowError, OSError, ValueError):
+                    pass
 
     if retry_after_ts:
         return retry_after_ts
@@ -1115,7 +1134,7 @@ def _apply_pending_updater_update() -> None:
         LOGGER.warning("Failed to replace updater: %s", exc, exc_info=True)
         return
 
-    # Sprzątanie configu tylko best-effort.
+    # Config cleanup is best-effort only.
     if not cfg_loaded_for_staged_lookup:
         try:
             cfg = load_app_config()
@@ -1414,7 +1433,7 @@ def _best_exception_message(exc: BaseException) -> str:
         candidates.append(msg)
     if not candidates:
         return ""
-    return min(candidates, key=len)
+    return candidates[0]
 
 
 def _package_version(package_name: str) -> Optional[str]:
@@ -2268,6 +2287,8 @@ I18N: dict[str, dict[str, str]] = {
         "SQL_SOURCE_FILE": "SQL source: {path}",
         "SQL_EXECUTING": "Executing SQL ({mode}):\n{sql}",
         "SQL_EXEC_FAILED": "SQL execution failed ({mode}): {error}\n{sql}",
+        "SQL_EXEC_WARNING": "SQL warning ({mode}): {error}\n{sql}",
+        "SQL_EXEC_RETRYING": "SQL retrying after transient error ({mode}): {error}\n{sql}",
         "ERR_DB_MESSAGE": "Database message (excerpt):",
         "ERR_SQL_PREVIEW": "SQL (start):",
         "ERR_FULL_LOG": "Full error saved in kkr-query2xlsx.log",
@@ -2840,6 +2861,8 @@ I18N: dict[str, dict[str, str]] = {
         "SQL_SOURCE_FILE": "Źródło SQL: {path}",
         "SQL_EXECUTING": "Wykonywanie SQL ({mode}):\n{sql}",
         "SQL_EXEC_FAILED": "Wykonanie SQL nie powiodło się ({mode}): {error}\n{sql}",
+        "SQL_EXEC_WARNING": "Ostrzeżenie SQL ({mode}): {error}\n{sql}",
+        "SQL_EXEC_RETRYING": "Ponowna próba SQL po błędzie przejściowym ({mode}): {error}\n{sql}",
         "ERR_DB_MESSAGE": "Komunikat bazy (fragment):",
         "ERR_SQL_PREVIEW": "SQL (początek):",
         "ERR_FULL_LOG": "Pełny błąd zapisany w pliku kkr-query2xlsx.log",
@@ -2960,6 +2983,39 @@ I18N: dict[str, dict[str, str]] = {
         ),
     },
 }
+
+
+def _validate_i18n_completeness() -> list[str]:
+    """Validate that all i18n keys exist in all languages. Returns list of errors."""
+    errors: list[str] = []
+
+    # Get all keys from English (the reference language)
+    en_keys = set(I18N.get("en", {}).keys())
+
+    # Check each non-English language
+    for lang_code, lang_dict in I18N.items():
+        if lang_code == "en":
+            continue
+
+        lang_keys = set(lang_dict.keys())
+
+        # Keys missing in this language
+        missing = en_keys - lang_keys
+        if missing:
+            errors.append(
+                f"Language '{lang_code}' is missing {len(missing)} keys: "
+                f"{', '.join(sorted(list(missing)[:5]))}{'...' if len(missing) > 5 else ''}"
+            )
+
+        # Extra keys in this language (typos/unused)
+        extra = lang_keys - en_keys
+        if extra:
+            errors.append(
+                f"Language '{lang_code}' has {len(extra)} unexpected keys: "
+                f"{', '.join(sorted(list(extra)[:5]))}{'...' if len(extra) > 5 else ''}"
+            )
+
+    return errors
 
 
 def _detect_lang() -> str:
@@ -3168,7 +3224,7 @@ def _center_toplevel_on_parent(win: "tk.Toplevel", parent: "tk.Misc") -> None:
 
 def open_github_issue_chooser(parent=None) -> None:
     version = get_app_version_label()
-    # GitHub Issue Forms: przekazanie wartości do pola "App version"
+    # GitHub Issue Forms: pass value to the "App version" field
     url = f"{GITHUB_ISSUE_CHOOSER_URL}?app_version={quote_plus(version)}"
     try:
         ok = webbrowser.open_new_tab(url)
@@ -3930,7 +3986,7 @@ def to_storage_path(path: str) -> str:
 
 
 def is_sql_path(path: str) -> bool:
-    # Filtr w oknie wyboru to nie walidacja -> walidujemy w kodzie
+    # File dialog filter is not validation -> validate in code
     return (path or "").strip().lower().endswith(".sql")
 
 
@@ -4357,7 +4413,7 @@ def _setup_logger():
     logger.setLevel(logging.INFO)
     logger.propagate = False
 
-    # Nie dodawaj handlerów ponownie przy imporcie
+    # Do not add handlers again on import
     if not logger.handlers:
         global LOG_DIR, LOG_FILE_PATH
         candidates: list[str] = [os.path.join(DATA_DIR, "logs")]
@@ -4479,8 +4535,8 @@ def _log_unhandled_exception(exc_type, exc_value, exc_traceback):
         exc_info=(exc_type, exc_value, exc_traceback),
     )
 
-    # Jeśli uruchomione z konsoli (python.exe) - pokaż traceback na stderr,
-    # bo inaczej wygląda jak "normalne zamknięcie".
+    # If launched from console (python.exe), print traceback to stderr,
+    # otherwise it can look like a "normal shutdown".
     try:
         if sys.stderr is not None:
             sys.__excepthook__(exc_type, exc_value, exc_traceback)
@@ -6108,7 +6164,7 @@ def format_error_for_ui(
     context: Literal["sql", "export"] = "sql",
 ) -> str:
     """Log full error and return a shortened message for UI display."""
-    # pełny traceback + SQL tylko do loga
+    # Full traceback + SQL goes only to logs
     if context == "export":
         _log_sql_exception("Export failed.", sql_query, sql_source_path=sql_source_path, error=exc)
     else:
@@ -6444,7 +6500,7 @@ def run_export_to_template(
     export_start = time.perf_counter()
     try:
         deadline = _deadline(int(export_timeout_seconds or 0))
-        # Zawsze kopiujemy template, nawet jeśli nie ma wierszy z SQL
+        # Always copy template, even when there are no SQL rows
         _raise_if_cancelled(cancel_event)
         if phase_callback is not None:
             phase_callback("export_template")
@@ -8651,10 +8707,10 @@ def open_csv_profiles_manager_gui(
     # 1) Set keyboard focus to the list of profiles
     listbox.focus_set()
 
-    # 2) Esc korzysta z on_close (uwzględnia niezapisane zmiany)
+    # 2) Esc uses on_close (includes unsaved changes handling)
     dlg.bind("<Escape>", lambda *_: on_close())
 
-    # 3) Profesjonalne centrowanie względem okna rodzica (aplikacji)
+    # 3) Properly center relative to parent window (application)
     dlg.update()
     _center_window(dlg, root)
 
@@ -9992,7 +10048,7 @@ def run_gui(connection_store, output_directory):
             manage_btn.config(state=manage_state)
 
     def on_toggle_template():
-        # Template jest sensowny tylko dla XLSX; jeśli zaznaczono template przy CSV, przełącz na XLSX.
+        # Template is meaningful only for XLSX; if selected for CSV, switch to XLSX.
         if use_template_var.get() and format_var.get() != "xlsx":
             format_var.set("xlsx")
 
@@ -10106,7 +10162,7 @@ def run_gui(connection_store, output_directory):
         dlg.grab_set()
         dlg.resizable(True, True)
 
-        # Uwaga: nie modyfikuj query_paths_state przed udanym zapisem (bez efektów ubocznych).
+        # Note: do not modify query_paths_state before a successful save (no side effects).
         raw_paths = load_query_paths()
         paths = []
         seen_keys = set()
@@ -10237,7 +10293,7 @@ def run_gui(connection_store, output_directory):
 
             new_key = query_path_key(new_path)
 
-            # Duplikaty sprawdzamy po kluczu pliku (z pominięciem edytowanego indeksu)
+            # Check duplicates by file key (excluding the edited index)
             for j, existing in enumerate(paths):
                 if j == idx:
                     continue
@@ -10248,7 +10304,7 @@ def run_gui(connection_store, output_directory):
                     )
                     return
 
-            # Opcjonalna polerka: ostrzeż, ale nie blokuj (sieciówki / dyski zewnętrzne)
+            # Optional polish: warn, but do not block (network/external drives)
             resolved_new_path = resolve_path(new_path)
             if not os.path.isfile(resolved_new_path):
                 messagebox.showwarning(
@@ -10256,7 +10312,7 @@ def run_gui(connection_store, output_directory):
                     t("WARN_FILE_MISSING_BODY", path=resolved_new_path),
                 )
 
-            # Zapis „ładnej” wersji ścieżki (bez normcase)
+            # Save a "pretty" path version (without normcase)
             paths[idx] = to_storage_path(new_path)
 
             refresh_list()
@@ -11992,7 +12048,7 @@ def _find_unclosed_openpyxl_workbooks(source: str) -> list[str]:
         return []
 
     def _expr_contains_load_workbook(expr: ast.AST) -> bool:
-        # łapie: load_workbook(...), load_workbook(...).sheetnames, itd.
+        # Catches: load_workbook(...), load_workbook(...).sheetnames, etc.
         return any(_is_load_workbook_call(n) for n in ast.walk(expr))
 
     def _is_immediate_load_workbook_close(expr: ast.AST) -> bool:
@@ -12226,7 +12282,7 @@ def _selftest_apply_mssql_safe_set() -> bool:
 
     cur_batch_fallback = _FakeCursor("batch_fails_singles_ok")
     result_batch_fallback = _apply_mssql_safe_set(cur_batch_fallback)
-    # expected ma być niezależnym "oracle" (bez duplikacji split/strip z implementacji)
+    # expected should be an independent "oracle" (without duplicating implementation split/strip)
     expected_stmt_calls = [
         "SET NOCOUNT ON",
         "SET ANSI_NULLS ON",
@@ -12348,6 +12404,20 @@ def _can_write_text_stream(stream) -> bool:
         return stream is not None and hasattr(stream, "write") and not getattr(stream, "closed", False)
     except Exception:
         return False
+
+
+def _selftest_i18n_completeness() -> bool:
+    """Verify all i18n keys exist in all languages."""
+    errors = _validate_i18n_completeness()
+
+    if not errors:
+        print("[OK] i18n: All translation keys are complete")
+        return True
+
+    print("[FAIL] i18n: Translation completeness issues:")
+    for error in errors:
+        print(f"  - {error}")
+    return False
 
 
 def run_self_test() -> bool:
@@ -12554,6 +12624,24 @@ def run_self_test_report() -> tuple[bool, str]:
         )
         ok = False
 
+    # 7) i18n completeness self-test
+    try:
+        capture = io.StringIO()
+        with contextlib.redirect_stdout(capture):
+            i18n_ok = _selftest_i18n_completeness()
+        emitted = capture.getvalue().strip()
+        if emitted:
+            lines.extend(emitted.splitlines())
+
+        if i18n_ok:
+            lines.append("[OK] i18n completeness")
+        else:
+            lines.append("[FAIL] i18n completeness")
+            ok = False
+    except Exception as exc:  # noqa: BLE001
+        lines.append(f"[FAIL] i18n completeness self-test crashed: {type(exc).__name__}: {exc}")
+        ok = False
+
     lines.append("")
     lines.append("SELF-TEST: OK" if ok else "SELF-TEST: FAIL")
     report = "\n".join(lines)
@@ -12641,6 +12729,13 @@ if __name__ == "__main__":
     if os.environ.get("KKR_DEBUG_EXIT") == "1":
         _install_debug_sys_exit_hook()
         _dbg("entered __main__")
+
+    if os.environ.get("KKR_DEBUG") == "1":
+        i18n_errors = _validate_i18n_completeness()
+        if i18n_errors:
+            print("WARNING: i18n validation failed:", file=sys.stderr)
+            for err in i18n_errors:
+                print(f"  {err}", file=sys.stderr)
 
     early_parser = argparse.ArgumentParser(add_help=False)
     early_parser.add_argument("--lang", choices=["en", "pl"])
@@ -12813,16 +12908,6 @@ if __name__ == "__main__":
             sys.exit(1)
         sys.exit(0)
 
-    if args.list_connections:
-        store = load_connections()
-        names = [c.get("name", "") for c in (store.get("connections") or []) if c.get("name")]
-        if names:
-            for name in names:
-                print(name)
-        else:
-            print("<none>")
-        sys.exit(0)
-
     headless = bool(args.sql)
     prefer_gui_prompt = not (headless or args.console)
 
@@ -12837,6 +12922,16 @@ if __name__ == "__main__":
         prefer_gui_prompt=prefer_gui_prompt,
         headless=headless,
     )
+
+    if args.list_connections:
+        store = load_connections()
+        names = [c.get("name", "") for c in (store.get("connections") or []) if c.get("name")]
+        if names:
+            for name in names:
+                print(name)
+        else:
+            print("<none>")
+        sys.exit(0)
 
     if args.lang:
         set_lang(args.lang)

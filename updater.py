@@ -223,42 +223,29 @@ def _parse_retry_hint(headers) -> str | None:  # noqa: ANN001
     retry_after_fallback_str: str | None = None
     retry_after_ts: str | None = None
 
-    try:
-        retry_after = headers.get("retry-after")
-    except Exception:  # noqa: BLE001
-        retry_after = None
+    retry_after = headers.get("retry-after")
     if retry_after is not None:
         s = str(retry_after).strip()
         if s:
             if s.isdigit():
-                try:
-                    seconds = int(s)
-                except (OverflowError, ValueError):
-                    seconds = None
-                if seconds is not None and 0 <= seconds <= _UPD_MAX_RETRY_AFTER_SECONDS:
+                seconds = int(s)
+                if 0 <= seconds <= _UPD_MAX_RETRY_AFTER_SECONDS:
                     retry_after_ts = _format_local_ts(time.time() + seconds)
             else:
                 retry_after_fallback_str = s[:64]
 
-    try:
-        reset_raw = headers.get("x-ratelimit-reset")
-    except Exception:  # noqa: BLE001
-        reset_raw = None
+    reset_raw = headers.get("x-ratelimit-reset") if headers else None
     if reset_raw is not None:
         s = str(reset_raw).strip()
         if s.isdigit():
-            try:
-                reset_ts = int(s)
-            except (OverflowError, ValueError):
-                reset_ts = None
-            if reset_ts is not None:
-                now = int(time.time())
-                if 0 <= reset_ts <= now + _UPD_MAX_RESET_FUTURE_SECONDS:
-                    try:
-                        dt = datetime.fromtimestamp(reset_ts)
-                        return dt.strftime("%Y-%m-%d %H:%M:%S")
-                    except (OverflowError, OSError, ValueError):
-                        pass
+            reset_ts = int(s)
+            now = int(time.time())
+            if 0 <= reset_ts <= now + _UPD_MAX_RESET_FUTURE_SECONDS:
+                try:
+                    dt = datetime.fromtimestamp(reset_ts)
+                    return dt.strftime("%Y-%m-%d %H:%M:%S")
+                except (OverflowError, OSError, ValueError):
+                    pass
 
     if retry_after_ts:
         return retry_after_ts
