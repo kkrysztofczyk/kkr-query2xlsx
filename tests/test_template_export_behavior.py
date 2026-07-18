@@ -102,6 +102,33 @@ class TemplateExportBehaviorTests(unittest.TestCase):
             # On any exception, output must be cleaned up.
             self.assertFalse(output_path.exists())
 
+    def test_template_export_missing_sheet_raises_and_preserves_existing_target(self):
+        with tempfile.TemporaryDirectory() as td:
+            template_path = Path(td) / "template.xlsx"
+            output_path = Path(td) / "target.xlsx"
+            _make_template_xlsx(template_path, sheet_name="Sheet1")
+            output_path.write_bytes(b"old-target-content")
+
+            with mock.patch.object(
+                self.app,
+                "_run_query_to_rows",
+                return_value=([(1,)], ["col"], 0.1, 10.0),
+            ):
+                with self.assertRaises(ValueError):
+                    self.app.run_export_to_template(
+                        engine=object(),
+                        sql_query="SELECT 1",
+                        template_path=str(template_path),
+                        output_file_path=str(output_path),
+                        sheet_name="MissingSheet",
+                        start_cell="A1",
+                        include_header=False,
+                        cancel_event=threading.Event(),
+                    )
+
+            self.assertTrue(output_path.exists())
+            self.assertEqual(output_path.read_bytes(), b"old-target-content")
+
     def test_template_export_no_rows_does_not_load_workbook_and_is_byte_copy(self):
         with tempfile.TemporaryDirectory() as td:
             template_path = Path(td) / "template.xlsx"
@@ -286,6 +313,41 @@ class TemplateExportBehaviorTests(unittest.TestCase):
                     )
 
             self.assertFalse(output_path.exists())
+
+    def test_template_export_cancelled_before_final_replace_preserves_existing_target(self):
+        cancel_evt = threading.Event()
+        with tempfile.TemporaryDirectory() as td:
+            template_path = Path(td) / "template.xlsx"
+            output_path = Path(td) / "target.xlsx"
+            _make_template_xlsx(template_path, sheet_name="Sheet1")
+            output_path.write_bytes(b"old-target-content")
+
+            real_copyfile = self.app.shutil.copyfile
+
+            def _copy_then_cancel(src, dst):
+                real_copyfile(src, dst)
+                cancel_evt.set()
+
+            with mock.patch.object(
+                self.app,
+                "_run_query_to_rows",
+                return_value=([], ["col"], 0.1, 10.0),
+            ), mock.patch.object(self.app.shutil, "copyfile", side_effect=_copy_then_cancel):
+                with self.assertRaises(self.app.UserCancelledError):
+                    self.app.run_export_to_template(
+                        engine=object(),
+                        sql_query="SELECT 1",
+                        template_path=str(template_path),
+                        output_file_path=str(output_path),
+                        sheet_name="Sheet1",
+                        start_cell="A1",
+                        include_header=False,
+                        cancel_event=cancel_evt,
+                    )
+
+            self.assertEqual(output_path.read_bytes(), b"old-target-content")
+            temp_candidates = list(Path(td).glob(".target.xlsx.*.tmp"))
+            self.assertEqual(temp_candidates, [])
 
 
 if __name__ == "__main__":

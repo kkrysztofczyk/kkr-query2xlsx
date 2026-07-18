@@ -4,7 +4,7 @@
 
 # kkr-query2xlsx
 
-Run **SQL queries from `.sql` files** and export results to **Excel (XLSX)** or **CSV** — either with a simple **GUI (Tkinter)** or from the **CLI**.
+Run **SQL queries from `.sql` files** and export results to **Excel (XLSX)**, **CSV**, or **SQLite** — either with a simple **GUI (Tkinter)** or from the **CLI**.
 
 If you ever:
 - copy/pasted query results into Excel,
@@ -20,7 +20,7 @@ If you ever:
 ## Beta testers wanted (20-30 people)
 
 - I’m looking for 20-30 beta testers (active: bugs + questions + UX feedback)
-- Try the demo SQLite + export XLSX/CSV on your OS
+- Try the demo SQLite + export XLSX/CSV/SQLite on your OS
 - Report issues/ideas here: https://github.com/kkrysztofczyk/kkr-query2xlsx/issues/new/choose
 - Reminder: don’t paste secrets/PII/production SQL
 
@@ -31,13 +31,14 @@ If you ever:
 **kkr-query2xlsx** is a lightweight SQL runner that:
 1. takes a `.sql` file,
 2. runs it against a chosen database connection,
-3. exports the result to **XLSX** or **CSV**,
+3. exports the result to **XLSX**, **CSV**, or **SQLite**,
 4. writes it into a predictable output folder (`generated_reports/`).
 
 It also includes quality-of-life features like:
 - retry handling for deadlocks,
 - CSV profiles (delimiter/encoding/quoting/date format, etc.),
 - exporting into an existing XLSX template (GUI),
+- exporting query results into a local SQLite database/table with `replace` or `append`,
 - a demo SQLite database + example queries (so you can try it immediately).
 
 ---
@@ -127,7 +128,7 @@ This repo includes:
 1. Start the app
 2. Select connection: **Demo SQLite**
 3. Choose a query from `examples/queries`
-4. Choose output format: **XLSX** or **CSV**
+4. Choose output format: **XLSX**, **CSV**, or **SQLite**
 5. Click **Start**
 6. Your file will appear in: `generated_reports/`
 
@@ -150,7 +151,7 @@ kkr-query2xlsx.exe -c --demo
 Then in the CLI:
 
 - Pick any `.sql` file (e.g. from `examples/queries/` or from your `queries.txt` list)
-- Choose output format: XLSX or CSV
+- Choose output format: XLSX, CSV, or SQLite
 - The exported file will be saved into: `generated_reports/`
 
 Use a specific saved connection by name:
@@ -164,16 +165,22 @@ Note: without `--demo` / `--connection`, console mode uses the “current” con
 #### Non-interactive (no prompts)
 
 ```bash
-# Demo DB + jeden plik SQL + XLSX (bez promptów)
+# Demo DB + one SQL file + XLSX (no prompts)
 python main.pyw --demo --sql examples/queries/example.sql --format xlsx
 
-# Demo DB + CSV + zapis do konkretnego katalogu
+# Demo DB + CSV + save to a specific directory
 python main.pyw --demo --sql examples/queries/example.sql --format csv --output generated_reports/
 
-# Użycie zapisanej konfiguracji połączenia (bez promptów)
+# Demo DB + SQLite + create/replace a table inside one database file
+python main.pyw --demo --sql examples/queries/example.sql --format sqlite --output generated_reports/demo_export.sqlite --sqlite-table example_rows --sqlite-mode replace
+
+# Use a saved connection configuration (no prompts)
 python main.pyw --connection "My MSSQL" --sql C:/reports/sales.sql --format xlsx --output C:/exports/
 
-# Archiwizacja SQL + metadane
+# Append to an existing SQLite table
+python main.pyw --connection "My MSSQL" --sql C:/reports/sales.sql --format sqlite --output C:/exports/sales.sqlite --sqlite-table sales_snapshot --sqlite-mode append
+
+# SQL archive + metadata
 python main.pyw --connection "My MSSQL" --sql C:/reports/sales.sql --format xlsx --archive-sql
 ```
 
@@ -182,6 +189,9 @@ Notes:
 - `--sql` runs fully headless: no prompts, no password dialogs, and no Tk/GUI windows (also when data-dir bootstrap fails).
 - If the connection requires a password and it is not stored, `--sql` exits with code 1; use a stored password, `Trusted_Connection`, or `--demo`.
 - `--output` works the same as in interactive mode (`-c`): it may point to a file or directory.
+- For `--format sqlite`, `--output` points to the SQLite database file (for example `report.sqlite` or `report.db`).
+- For `--format sqlite`, `--sqlite-table` defaults to a safe table name derived from the report/SQL filename.
+- `--sqlite-mode replace` recreates the table; `--sqlite-mode append` inserts into an existing matching schema.
 - `--demo` and `--connection` work as before; without them, `last_selected` from `secure.txt` is used.
 - `--archive-sql` also works in non-interactive mode.
 
@@ -200,9 +210,23 @@ Tip:
 ### Run your own query
 1. Create or select a connection
 2. Pick a `.sql` file (or pick from the list in `queries.txt`)
-3. Choose export format (XLSX/CSV)
+3. Choose export format (XLSX/CSV/SQLite)
 4. Click **Start**
 5. Use **Open file** / **Open folder** buttons after export
+
+### SQLite export (GUI)
+When you choose **SQLite** in the GUI:
+- XLSX template options are disabled.
+- CSV profile controls are disabled.
+- You can set:
+  - the SQLite database file path,
+  - the SQLite table name,
+  - write mode: `replace` or `append`.
+
+Recommended defaults:
+- save to `generated_reports/<report_name>.sqlite`
+- use a sanitized table name based on the report name
+- keep write mode as `replace` unless you intentionally append snapshots
 
 ### Export into an existing Excel template (GUI only)
 If enabled, the app:
@@ -264,7 +288,7 @@ Timeouts:
 ```
 Notes:
 - `db_seconds` covers **execution + fetch** time.
-- `export_seconds` covers **XLSX/CSV generation** time.
+- `export_seconds` covers **XLSX/CSV/SQLite generation** time.
 - `0` means **no limit**.
 
 Important:
@@ -292,7 +316,7 @@ Your private workspace (keep local, not in public git):
 The app has **two independent timeouts** (default: **3 minutes** each, `0 = no limit`):
 
 1) **DB timeout** — execution + fetch.
-2) **Export timeout** — XLSX/CSV generation.
+2) **Export timeout** — XLSX/CSV/SQLite generation.
 
 ### DB timeout (best-effort per backend/driver)
 - **PostgreSQL**: sets `statement_timeout` in the session (reliable) + watchdog cancel as fallback.
@@ -302,7 +326,7 @@ The app has **two independent timeouts** (default: **3 minutes** each, `0 = no l
 
 > Note: “cancel” is best‑effort. Depending on the driver and server configuration, server-side work may not stop immediately.
 
-### Export timeout (XLSX/CSV)
+### Export timeout (XLSX/CSV/SQLite)
 - Applies to file generation only.
 - Export is streamed and the deadline is checked every N rows.
 - On timeout the export is interrupted and the partially written file is removed (best-effort).
@@ -357,6 +381,23 @@ python -m unittest discover -s tests -p "test_*.py" -v
 ```
 
 ---
+
+## Troubleshooting
+
+### SQLite file is locked
+- Close DB Browser for SQLite, Excel add-ins, scripts, or any other tool that may have the `.sqlite` / `.db` file open.
+- Retry the export after the other process releases the file.
+- If you append into a shared database from automation, prefer one writer at a time.
+
+### Table already exists
+- Use `--sqlite-mode replace` (or GUI mode `replace`) when you want to recreate the table from scratch.
+- Use `append` only when the existing table already has the same column names as the query result.
+
+### Append fails because the schema does not match
+- In v1, append checks column-name compatibility before inserting rows.
+- If the table schema differs from the query output, either:
+  - export to a new table name, or
+  - run once with `replace` to rebuild the table.
 
 ## Troubleshooting (Windows)
 

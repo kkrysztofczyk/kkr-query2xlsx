@@ -471,6 +471,23 @@ def _set_data_dir(new_dir: str) -> None:
     _attach_logger_file_handler(_build_path("logs"))
 
 
+def _set_data_dir_paths_only(new_dir: str) -> None:
+    """Switch DATA_DIR and path globals without creating/changing log files.
+
+    Intended for read-only CLI commands such as --list-connections.
+    """
+    global DATA_DIR
+    global SECURE_PATH, QUERIES_PATH, APP_CONFIG_PATH, LEGACY_CSV_PROFILES_PATH, SQL_ARCHIVE_DIR
+
+    DATA_DIR = os.path.abspath(new_dir)
+
+    SECURE_PATH = _build_path("secure.txt")
+    QUERIES_PATH = _build_path("queries.txt")
+    APP_CONFIG_PATH = _build_path("kkr-query2xlsx.json")
+    LEGACY_CSV_PROFILES_PATH = _build_path("csv_profiles.json")
+    SQL_ARCHIVE_DIR = _build_path("sql_archive")
+
+
 def get_default_user_data_dir() -> str:
     app_name = "kkr-query2xlsx"
     if sys.platform == "win32":
@@ -667,7 +684,7 @@ class ExportProgressWindow:
 
 # --- App version -------------------------------------------------------------
 
-APP_VERSION = "0.4.5"  # bump manually for releases
+APP_VERSION = "0.4.6"  # bump manually for releases
 
 MSSQL_SAFE_SET_SQL = """\
 SET NOCOUNT ON;
@@ -835,30 +852,39 @@ def _format_local_ts(ts: float) -> str | None:
 
 
 def _parse_retry_hint(headers) -> str | None:  # noqa: ANN001
-    if not headers:
-        return None
-
     retry_after_fallback_str: str | None = None
     retry_after_ts: str | None = None
 
-    retry_after = headers.get("retry-after")
+    try:
+        retry_after = headers.get("retry-after") if headers else None
+    except Exception:  # noqa: BLE001
+        retry_after = None
     if retry_after is not None:
         s = str(retry_after).strip()
         if s:
             if s.isdigit():
-                seconds = int(s)
-                if 0 <= seconds <= _UPD_MAX_RETRY_AFTER_SECONDS:
+                try:
+                    seconds = int(s)
+                except (OverflowError, ValueError):
+                    seconds = None
+                if seconds is not None and 0 <= seconds <= _UPD_MAX_RETRY_AFTER_SECONDS:
                     retry_after_ts = _format_local_ts(time.time() + seconds)
             else:
                 retry_after_fallback_str = s[:64]
 
-    reset_raw = headers.get("x-ratelimit-reset") if headers else None
+    try:
+        reset_raw = headers.get("x-ratelimit-reset") if headers else None
+    except Exception:  # noqa: BLE001
+        reset_raw = None
     if reset_raw is not None:
         s = str(reset_raw).strip()
         if s.isdigit():
-            reset_ts = int(s)
+            try:
+                reset_ts = int(s)
+            except (OverflowError, ValueError):
+                reset_ts = None
             now = int(time.time())
-            if 0 <= reset_ts <= now + _UPD_MAX_RESET_FUTURE_SECONDS:
+            if reset_ts is not None and 0 <= reset_ts <= now + _UPD_MAX_RESET_FUTURE_SECONDS:
                 try:
                     dt = datetime.fromtimestamp(reset_ts)
                     return dt.strftime("%Y-%m-%d %H:%M:%S")
@@ -1842,7 +1868,7 @@ I18N: dict[str, dict[str, str]] = {
         "LBL_LANGUAGE": "Language",
         "CHK_ARCHIVE_SQL": "Archive SQL (save query + metadata)",
         "LBL_DB_TIMEOUT_MIN": "DB timeout (minutes) - execution + fetch",
-        "LBL_EXPORT_TIMEOUT_MIN": "Export timeout (minutes) - XLSX/CSV generation",
+        "LBL_EXPORT_TIMEOUT_MIN": "Export timeout (minutes) - XLSX/CSV/SQLite generation",
         "LBL_TIMEOUT_NOTE": "0 = no limit. Defaults: 3 minutes each.",
         "CHK_OUTPUT_FILENAME_STAMP": "Add datetime stamp to output filename",
         "LBL_OUTPUT_FILENAME_STAMP_PATTERN": "Pattern:",
@@ -1857,7 +1883,7 @@ I18N: dict[str, dict[str, str]] = {
         "MSG_CONFIRM_CANCEL_AND_EXIT": "Export is running. Cancel and exit?",
         "ERR_TITLE": "Error",
         "WARN_TITLE": "Warning",
-        "APP_TITLE_FULL": "KKr SQL to XLSX/CSV",
+        "APP_TITLE_FULL": "KKr SQL to XLSX/CSV/SQLite",
         "BROWSER_OPEN_FAIL_TITLE": "Unable to open browser",
         "BROWSER_OPEN_FAIL_BODY": (
             "Could not automatically open the link.\n"
@@ -1907,13 +1933,20 @@ I18N: dict[str, dict[str, str]] = {
         "CONSOLE_SELECT_RANGE": "Please enter a number between 0 and {max_idx}.",
         "CONSOLE_INVALID_INPUT": "Invalid input. Please enter a number.",
         "CONSOLE_NO_QUERIES": "No SQL query file paths found in queries.txt",
-        "CONSOLE_PROMPT_FORMAT": "Please enter the desired output format (xlsx or csv): ",
-        "CONSOLE_INVALID_FORMAT": "Invalid input. Please enter 'xlsx' or 'csv'.",
+        "CONSOLE_PROMPT_FORMAT": "Please enter the desired output format (xlsx, csv, or sqlite): ",
+        "CONSOLE_INVALID_FORMAT": "Invalid input. Please enter 'xlsx', 'csv', or 'sqlite'.",
         "CONSOLE_AVAILABLE_CSV_PROFILES": "Available CSV profiles:",
         "CONSOLE_DEFAULT_MARKER": " (default)",
         "CONSOLE_PROMPT_CSV_PROFILE": (
             "Enter CSV profile number to use or press Enter to use the default: "
         ),
+        "CONSOLE_PROMPT_SQLITE_TABLE": (
+            "Enter SQLite table name or press Enter to use '{table}': "
+        ),
+        "CONSOLE_PROMPT_SQLITE_MODE": (
+            "Enter SQLite write mode (replace/append) or press Enter for replace: "
+        ),
+        "CONSOLE_INVALID_SQLITE_MODE": "Invalid input. Please enter 'replace' or 'append'.",
         "CONSOLE_INVALID_SELECTION": "Invalid selection. Please try again.",
         "CONSOLE_SAVED_PATH": "Query results have been saved to: {path}",
         "CONSOLE_NO_ROWS": "The query did not return any rows.",
@@ -2003,6 +2036,9 @@ I18N: dict[str, dict[str, str]] = {
         "CSV_PROFILE_ESCAPE_HINT": "(escape char; empty = quoting)",
         "CSV_PROFILE_DOUBLEQUOTE": "Double quote in fields",
         "CSV_PROFILE_DATE_FORMAT": "Date format:",
+        "CSV_PROFILE_TIME_FORMAT": "Time format:",
+        "CSV_PROFILE_BOM": "Write UTF-8 BOM",
+        "CSV_PROFILE_DETECT_DATE_ONLY": "Date-only columns (strip midnight time)",
         "CSV_PROFILE_FIELD_SEPARATOR": "Field separator:",
         "CSV_PROFILE_WARNING_EMPTY": "Profile name cannot be empty.",
         "CSV_PROFILE_WARNING_EXISTS": "A profile with this name already exists.",
@@ -2039,6 +2075,7 @@ I18N: dict[str, dict[str, str]] = {
         "PROGRESS_EXPORTING_XLSX_TEMPLATE": "Exporting to XLSX (template)...",
         "PROGRESS_EXPORTING_XLSX": "Exporting to XLSX...",
         "PROGRESS_EXPORTING_CSV": "Exporting to CSV...",
+        "PROGRESS_EXPORTING_SQLITE": "Exporting to SQLite...",
         "ERR_NO_CONNECTION_TITLE": "No connection",
         "ERR_NO_CONNECTION_BODY": "No saved connections. Create and save a new connection.",
         "ERR_NO_CONNECTION_DELETE": "No connection to delete.",
@@ -2056,6 +2093,7 @@ I18N: dict[str, dict[str, str]] = {
         "TITLE_SELECT_TEMPLATE": "Select XLSX template file",
         "FILETYPE_EXCEL": "Excel files",
         "FILETYPE_CSV": "CSV files",
+        "FILETYPE_SQLITE_EXPORT": "SQLite database files",
         "ERR_TEMPLATE_TITLE": "Template error",
         "ERR_TEMPLATE_SHEETS": (
             "Cannot read sheets from the template file.\n\nTechnical details:\n{error}"
@@ -2102,9 +2140,11 @@ I18N: dict[str, dict[str, str]] = {
             "Total time: {total_time_hms} ({total_time:.2f} s)"
         ),
         "MSG_SAVED_DETAILS_CSV": "CSV profile: {profile}",
+        "MSG_SAVED_DETAILS_SQLITE": "SQLite table: {table} (mode: {mode})",
         "MSG_NO_ROWS": (
             "Query returned no rows.\nSQL time: {sql_time_hms} ({sql_time:.2f} s)"
         ),
+        "MSG_NO_ROWS_SQLITE_CLEARED": "SQLite table {table} was recreated and is now empty (replace, 0 rows).",
         "ERR_XLSX_TOO_LARGE": (
             "XLSX export skipped because the result would exceed Excel limits. "
             "Result: {rows} rows, {cols} columns. "
@@ -2173,9 +2213,16 @@ I18N: dict[str, dict[str, str]] = {
             "Please select a .sql text file."
         ),
         "ERR_CANNOT_OPEN_FILE": "Cannot open file: {error}",
+        "FORMAT_SQLITE": "SQLite",
         "LBL_SQL_PASTED": "Pasted SQL:",
         "ERR_NO_SQL_SOURCE": "Select a SQL file or paste SQL first.",
         "LBL_CSV_PROFILE": "CSV profile:",
+        "LBL_SQLITE_TABLE": "SQLite table:",
+        "LBL_SQLITE_MODE": "Write mode:",
+        "LBL_SQLITE_FILE": "SQLite file (optional):",
+        "LBL_SQLITE_FILE_HINT": "Default SQLite file location: {dir}",
+        "SQLITE_MODE_REPLACE": "replace",
+        "SQLITE_MODE_APPEND": "append",
         "BTN_MANAGE_CSV_PROFILES": "Manage CSV profiles",
         "CHK_USE_TEMPLATE": "Use template file (XLSX only, GUI only)",
         "LBL_TEMPLATE_FILE": "Template file:",
@@ -2246,11 +2293,13 @@ I18N: dict[str, dict[str, str]] = {
         "ERR_SELECT_TEMPLATE": "Select template file",
         "ERR_GENERIC": "Error",
         "ERR_TEMPLATE_MISSING_SHEET": "Worksheet '{sheet}' does not exist in template file.",
-        "CLI_DESC": "Run SQL files and export results to XLSX/CSV.",
+        "CLI_DESC": "Run SQL files and export results to XLSX/CSV/SQLite.",
         "CLI_LANG_HELP": "UI language (en/pl).",
         "CLI_CONSOLE_HELP": "Run in console mode.",
         "CLI_SQL_HELP": "Path to a .sql file to run (non-interactive mode).",
-        "CLI_FORMAT_HELP": "Output format for --sql: xlsx or csv.",
+        "CLI_FORMAT_HELP": "Output format for --sql: xlsx, csv, or sqlite.",
+        "CLI_SQLITE_TABLE_HELP": "SQLite table name for --format sqlite (defaults to a sanitized report name).",
+        "CLI_SQLITE_MODE_HELP": "SQLite write mode for --format sqlite: replace or append.",
         "CLI_CONNECTION_HELP": "Connection name to use in console mode (defaults to last_selected).",
         "CLI_LIST_CONNECTIONS_HELP": "List saved connections and exit.",
         "CLI_DEMO_HELP": "Use built-in demo SQLite database (ignores saved connections).",
@@ -2282,6 +2331,16 @@ I18N: dict[str, dict[str, str]] = {
         "ERR_NO_WRITE_PERMISSION": (
             "No permission to write the output file or the path is unavailable. "
             "Check the file location."
+        ),
+        "ERR_SQLITE_APPEND_SCHEMA_MISMATCH": (
+            "SQLite append failed for table '{table}' because the existing columns do not match the query.\n"
+            "Expected: {expected}\n"
+            "Actual: {actual}"
+        ),
+        "ERR_SQLITE_APPEND_NUMERIC_PRECISION": (
+            "Cannot append to '{table}': column '{column}' has '{col_type}' affinity "
+            "but value {value} requires TEXT storage to preserve precision. "
+            "Use replace mode to recreate the table with untyped columns."
         ),
         "ERR_SQL_SOURCE": "SQL source:",
         "SQL_SOURCE_FILE": "SQL source: {path}",
@@ -2331,6 +2390,11 @@ I18N: dict[str, dict[str, str]] = {
             "Invalid date format (use strftime syntax, e.g. %Y-%m-%d)."
         ),
         "CSV_PROFILE_DATE_PREVIEW": "Current time in this format: {example}",
+        "CSV_PROFILE_TIME_DEFAULT": "ISO 8601 default (example: {example})",
+        "CSV_PROFILE_TIME_INVALID": (
+            "Invalid time format (use strftime syntax, e.g. %H:%M:%S)."
+        ),
+        "CSV_PROFILE_TIME_PREVIEW": "Current time in this format: {example}",
         "CSV_PROFILE_BUILTIN_NOTICE": (
             "Built-in profile: changes cannot be saved or deleted. "
             "Use Save as new to create your own variant."
@@ -2401,6 +2465,24 @@ I18N: dict[str, dict[str, str]] = {
         "CSV_HELP_DATE_FORMAT_BODY": (
             "Optional strftime pattern, e.g. %Y-%m-%d or %d.%m.%Y. Leave empty to use Pandas defaults."
         ),
+        "CSV_HELP_TIME_FORMAT_TITLE": "Time format",
+        "CSV_HELP_TIME_FORMAT_BODY": (
+            "Optional strftime pattern for time values, e.g. %H:%M or %H:%M:%S. "
+            "When both date format and time format are set, datetime columns are formatted as "
+            "'<date format> <time format>'. Leave empty for ISO 8601 (HH:MM:SS)."
+        ),
+        "CSV_HELP_BOM_TITLE": "UTF-8 BOM",
+        "CSV_HELP_BOM_BODY": (
+            "Prepend a UTF-8 byte-order mark (BOM) to the file. "
+            "Required by Excel on Windows when opening UTF-8 CSV files directly. "
+            "Has no effect when encoding is not UTF-8."
+        ),
+        "CSV_HELP_DETECT_DATE_ONLY_TITLE": "Date-only detection",
+        "CSV_HELP_DETECT_DATE_ONLY_BODY": (
+            "Pre-scan all rows: if every datetime in a column is exactly midnight (00:00:00), "
+            "export only the date portion using the date format. "
+            "Columns with any non-midnight time are exported as full datetime."
+        ),
     },
     "pl": {
         # GUI
@@ -2422,7 +2504,7 @@ I18N: dict[str, dict[str, str]] = {
         "LBL_LANGUAGE": "Język",
         "CHK_ARCHIVE_SQL": "Archiwizuj SQL (zapisz zapytanie + metadane)",
         "LBL_DB_TIMEOUT_MIN": "Limit czasu DB (minuty) - wykonanie + pobieranie",
-        "LBL_EXPORT_TIMEOUT_MIN": "Limit czasu eksportu (minuty) - generowanie XLSX/CSV",
+        "LBL_EXPORT_TIMEOUT_MIN": "Limit czasu eksportu (minuty) - generowanie XLSX/CSV/SQLite",
         "LBL_TIMEOUT_NOTE": "0 = brak limitu. Domyślnie: po 3 minuty.",
         "CHK_OUTPUT_FILENAME_STAMP": "Dodaj znacznik daty/czasu do nazwy pliku wyjściowego",
         "LBL_OUTPUT_FILENAME_STAMP_PATTERN": "Wzór:",
@@ -2437,7 +2519,7 @@ I18N: dict[str, dict[str, str]] = {
         "MSG_CONFIRM_CANCEL_AND_EXIT": "Eksport trwa. Przerwać i zamknąć?",
         "ERR_TITLE": "Błąd",
         "WARN_TITLE": "Uwaga",
-        "APP_TITLE_FULL": "KKr SQL to XLSX/CSV",
+        "APP_TITLE_FULL": "KKr SQL to XLSX/CSV/SQLite",
         "BROWSER_OPEN_FAIL_TITLE": "Nie mogę otworzyć przeglądarki",
         "BROWSER_OPEN_FAIL_BODY": (
             "Nie udało się automatycznie otworzyć linku.\n"
@@ -2488,13 +2570,20 @@ I18N: dict[str, dict[str, str]] = {
         "CONSOLE_SELECT_RANGE": "Wpisz liczbę z zakresu 0-{max_idx}.",
         "CONSOLE_INVALID_INPUT": "Nieprawidłowe dane. Wpisz liczbę.",
         "CONSOLE_NO_QUERIES": "Brak ścieżek do plików SQL w queries.txt",
-        "CONSOLE_PROMPT_FORMAT": "Podaj format wyjściowy (xlsx lub csv): ",
-        "CONSOLE_INVALID_FORMAT": "Nieprawidłowe dane. Wpisz 'xlsx' lub 'csv'.",
+        "CONSOLE_PROMPT_FORMAT": "Podaj format wyjściowy (xlsx, csv lub sqlite): ",
+        "CONSOLE_INVALID_FORMAT": "Nieprawidłowe dane. Wpisz 'xlsx', 'csv' lub 'sqlite'.",
         "CONSOLE_AVAILABLE_CSV_PROFILES": "Dostępne profile CSV:",
         "CONSOLE_DEFAULT_MARKER": " (domyślny)",
         "CONSOLE_PROMPT_CSV_PROFILE": (
             "Podaj numer profilu CSV lub naciśnij Enter, aby użyć domyślnego: "
         ),
+        "CONSOLE_PROMPT_SQLITE_TABLE": (
+            "Podaj nazwę tabeli SQLite lub naciśnij Enter, aby użyć '{table}': "
+        ),
+        "CONSOLE_PROMPT_SQLITE_MODE": (
+            "Podaj tryb zapisu SQLite (replace/append) lub naciśnij Enter dla replace: "
+        ),
+        "CONSOLE_INVALID_SQLITE_MODE": "Nieprawidłowe dane. Wpisz 'replace' lub 'append'.",
         "CONSOLE_INVALID_SELECTION": "Nieprawidłowy wybór. Spróbuj ponownie.",
         "CONSOLE_SAVED_PATH": "Wyniki zapytania zapisano w: {path}",
         "CONSOLE_NO_ROWS": "Zapytanie nie zwróciło żadnych wierszy.",
@@ -2584,6 +2673,9 @@ I18N: dict[str, dict[str, str]] = {
         "CSV_PROFILE_ESCAPE_HINT": "(znak ucieczki; puste = cytowanie)",
         "CSV_PROFILE_DOUBLEQUOTE": "Podwajaj cudzysłowy w polach",
         "CSV_PROFILE_DATE_FORMAT": "Format daty:",
+        "CSV_PROFILE_TIME_FORMAT": "Format czasu:",
+        "CSV_PROFILE_BOM": "Zapisz nagłówek BOM (UTF-8)",
+        "CSV_PROFILE_DETECT_DATE_ONLY": "Kolumny tylko z datą (bez czasu północ)",
         "CSV_PROFILE_FIELD_SEPARATOR": "Separator pól:",
         "CSV_PROFILE_WARNING_EMPTY": "Nazwa profilu nie może być pusta.",
         "CSV_PROFILE_WARNING_EXISTS": "Profil o podanej nazwie już istnieje.",
@@ -2618,6 +2710,7 @@ I18N: dict[str, dict[str, str]] = {
         "PROGRESS_EXPORTING_XLSX_TEMPLATE": "Eksport do XLSX (template)...",
         "PROGRESS_EXPORTING_XLSX": "Eksport do XLSX...",
         "PROGRESS_EXPORTING_CSV": "Eksport do CSV...",
+        "PROGRESS_EXPORTING_SQLITE": "Eksport do SQLite...",
         "ERR_NO_CONNECTION_TITLE": "Brak połączenia",
         "ERR_NO_CONNECTION_BODY": "Brak zapisanych połączeń. Utwórz i zapisz nowe połączenie.",
         "ERR_NO_CONNECTION_DELETE": "Brak połączenia do usunięcia.",
@@ -2635,6 +2728,7 @@ I18N: dict[str, dict[str, str]] = {
         "TITLE_SELECT_TEMPLATE": "Wybierz plik template XLSX",
         "FILETYPE_EXCEL": "Pliki Excel",
         "FILETYPE_CSV": "Pliki CSV",
+        "FILETYPE_SQLITE_EXPORT": "Pliki bazy SQLite",
         "ERR_TEMPLATE_TITLE": "Błąd template",
         "ERR_TEMPLATE_SHEETS": (
             "Nie można odczytać arkuszy z pliku template.\n\n"
@@ -2700,10 +2794,12 @@ I18N: dict[str, dict[str, str]] = {
             "Czas łączny: {total_time_hms} ({total_time:.2f} s)"
         ),
         "MSG_SAVED_DETAILS_CSV": "Profil CSV: {profile}",
+        "MSG_SAVED_DETAILS_SQLITE": "Tabela SQLite: {table} (tryb: {mode})",
         "MSG_NO_ROWS": (
             "Zapytanie nie zwróciło wierszy.\n"
             "Czas SQL: {sql_time_hms} ({sql_time:.2f} s)"
         ),
+        "MSG_NO_ROWS_SQLITE_CLEARED": "Tabela SQLite {table} została odtworzona i jest teraz pusta (replace, 0 wierszy).",
         "ERR_XLSX_TOO_LARGE": (
             "Eksport XLSX pominięty, ponieważ wynik przekracza limity Excela. "
             "Wynik: {rows} wierszy, {cols} kolumn. "
@@ -2752,9 +2848,16 @@ I18N: dict[str, dict[str, str]] = {
         "ERR_EMPTY_SQL_BODY": "SQL nie może być pusty.",
         "ERR_INVALID_SQL_FILE_TITLE": "Nieprawidłowy plik SQL",
         "ERR_NO_FILE_SELECTED": "Nie wybrano pliku.",
+        "FORMAT_SQLITE": "SQLite",
         "LBL_SQL_PASTED": "Wklejony SQL:",
         "ERR_NO_SQL_SOURCE": "Wybierz plik SQL albo wklej SQL.",
         "LBL_CSV_PROFILE": "Profil CSV:",
+        "LBL_SQLITE_TABLE": "Tabela SQLite:",
+        "LBL_SQLITE_MODE": "Tryb zapisu:",
+        "LBL_SQLITE_FILE": "Plik SQLite (opcjonalnie):",
+        "LBL_SQLITE_FILE_HINT": "Domyślna lokalizacja pliku SQLite: {dir}",
+        "SQLITE_MODE_REPLACE": "replace",
+        "SQLITE_MODE_APPEND": "append",
         "BTN_MANAGE_CSV_PROFILES": "Zarządzaj profilami CSV",
         "CHK_USE_TEMPLATE": "Użyj pliku template (tylko dla XLSX, tylko w GUI)",
         "LBL_TEMPLATE_FILE": "Plik template:",
@@ -2825,11 +2928,13 @@ I18N: dict[str, dict[str, str]] = {
         "ERR_SELECT_TEMPLATE": "Wybierz plik template",
         "ERR_GENERIC": "Błąd",
         "ERR_TEMPLATE_MISSING_SHEET": "Arkusz '{sheet}' nie istnieje w pliku template.",
-        "CLI_DESC": "Uruchamiaj pliki SQL i eksportuj wyniki do XLSX/CSV.",
+        "CLI_DESC": "Uruchamiaj pliki SQL i eksportuj wyniki do XLSX/CSV/SQLite.",
         "CLI_LANG_HELP": "Język interfejsu (en/pl).",
         "CLI_CONSOLE_HELP": "Uruchom w trybie konsolowym.",
         "CLI_SQL_HELP": "Ścieżka do pliku .sql do uruchomienia (tryb bez interakcji).",
-        "CLI_FORMAT_HELP": "Format wyjściowy dla --sql: xlsx lub csv.",
+        "CLI_FORMAT_HELP": "Format wyjściowy dla --sql: xlsx, csv lub sqlite.",
+        "CLI_SQLITE_TABLE_HELP": "Nazwa tabeli SQLite dla --format sqlite (domyślnie: zsanityzowana nazwa raportu).",
+        "CLI_SQLITE_MODE_HELP": "Tryb zapisu SQLite dla --format sqlite: replace lub append.",
         "CLI_CONNECTION_HELP": "Nazwa połączenia dla trybu konsolowego (domyślnie: last_selected).",
         "CLI_DEMO_HELP": "Użyj wbudowanej bazy demo SQLite (ignoruje zapisane połączenia).",
         "CLI_OUTPUT_HELP": (
@@ -2856,6 +2961,16 @@ I18N: dict[str, dict[str, str]] = {
         "ERR_NO_WRITE_PERMISSION": (
             "Brak uprawnień do zapisu pliku docelowego lub ścieżka jest niedostępna. "
             "Sprawdź lokalizację pliku."
+        ),
+        "ERR_SQLITE_APPEND_SCHEMA_MISMATCH": (
+            "Append do SQLite nie powiódł się dla tabeli '{table}', ponieważ istniejące kolumny nie pasują do wyniku zapytania.\n"
+            "Oczekiwane: {expected}\n"
+            "Istniejące: {actual}"
+        ),
+        "ERR_SQLITE_APPEND_NUMERIC_PRECISION": (
+            "Nie można dołączyć do '{table}': kolumna '{column}' ma afinicję '{col_type}', "
+            "ale wartość {value} wymaga przechowywania jako TEXT, żeby zachować precyzję. "
+            "Użyj trybu replace, aby odtworzyć tabelę z kolumnami bez typów."
         ),
         "ERR_SQL_SOURCE": "Źródło SQL:",
         "SQL_SOURCE_FILE": "Źródło SQL: {path}",
@@ -2905,6 +3020,11 @@ I18N: dict[str, dict[str, str]] = {
             "Nieprawidłowy wzorzec daty (użyj składni strftime, np. %Y-%m-%d)."
         ),
         "CSV_PROFILE_DATE_PREVIEW": "Bieżący czas w tym formacie: {example}",
+        "CSV_PROFILE_TIME_DEFAULT": "Domyślny ISO 8601 (przykład: {example})",
+        "CSV_PROFILE_TIME_INVALID": (
+            "Nieprawidłowy wzorzec czasu (użyj składni strftime, np. %H:%M:%S)."
+        ),
+        "CSV_PROFILE_TIME_PREVIEW": "Bieżący czas w tym formacie: {example}",
         "CSV_PROFILE_BUILTIN_NOTICE": (
             "Profil wbudowany: nie można zapisać zmian ani usuwać. "
             "Użyj Zapisz jako nowy, aby stworzyć własny wariant."
@@ -2980,6 +3100,24 @@ I18N: dict[str, dict[str, str]] = {
         "CSV_HELP_DATE_FORMAT_BODY": (
             "Opcjonalny wzorzec strftime, np. %Y-%m-%d lub %d.%m.%Y. "
             "Pozostaw puste, aby użyć domyślnego formatowania Pandas."
+        ),
+        "CSV_HELP_TIME_FORMAT_TITLE": "Format czasu",
+        "CSV_HELP_TIME_FORMAT_BODY": (
+            "Opcjonalny wzorzec strftime dla wartości czasu, np. %H:%M lub %H:%M:%S. "
+            "Gdy ustawiony jest zarówno format daty, jak i czasu, kolumny datetime są formatowane jako "
+            "'<format daty> <format czasu>'. Pozostaw puste dla ISO 8601 (HH:MM:SS)."
+        ),
+        "CSV_HELP_BOM_TITLE": "Nagłówek BOM (UTF-8)",
+        "CSV_HELP_BOM_BODY": (
+            "Dołącz znacznik kolejności bajtów UTF-8 (BOM) do pliku. "
+            "Wymagany przez Excel w systemie Windows podczas bezpośredniego otwierania plików CSV w UTF-8. "
+            "Nie ma wpływu, gdy kodowanie nie jest UTF-8."
+        ),
+        "CSV_HELP_DETECT_DATE_ONLY_TITLE": "Wykrywanie tylko daty",
+        "CSV_HELP_DETECT_DATE_ONLY_BODY": (
+            "Wstępne skanowanie wszystkich wierszy: jeśli każda wartość datetime w kolumnie "
+            "ma dokładnie północ (00:00:00), eksportuj tylko część z datą używając formatu daty. "
+            "Kolumny z jakimkolwiek czasem innym niż północ są eksportowane jako pełne datetime."
         ),
     },
 }
@@ -3465,7 +3603,8 @@ QUERIES_SAMPLE_PATH = os.path.join(BASE_DIR, "queries.sample.txt")
 BUILTIN_CSV_PROFILES = [
     {
         "name": "CSV standard (comma, dot)",
-        "encoding": "utf-8-sig",
+        "encoding": "utf-8",
+        "bom": True,
         "delimiter": ",",
         "delimiter_replacement": "",
         "decimal": ".",
@@ -3475,10 +3614,13 @@ BUILTIN_CSV_PROFILES = [
         "escapechar": "",
         "doublequote": True,
         "date_format": "",
+        "time_format": "",
+        "detect_date_only": False,
     },
     {
         "name": "CSV Excel Europe (semicolon, comma)",
-        "encoding": "utf-8-sig",
+        "encoding": "utf-8",
+        "bom": True,
         "delimiter": ";",
         "delimiter_replacement": "",
         "decimal": ",",
@@ -3488,6 +3630,8 @@ BUILTIN_CSV_PROFILES = [
         "escapechar": "",
         "doublequote": True,
         "date_format": "",
+        "time_format": "",
+        "detect_date_only": False,
     },
 ]
 
@@ -4343,6 +4487,7 @@ def bootstrap_local_files():
 DEFAULT_CSV_PROFILE = {
     "name": "UTF-8 (comma)",
     "encoding": "utf-8",
+    "bom": False,
     "delimiter": ",",
     "delimiter_replacement": "",
     "decimal": ".",
@@ -4352,6 +4497,8 @@ DEFAULT_CSV_PROFILE = {
     "escapechar": "",
     "doublequote": True,
     "date_format": "",
+    "time_format": "",
+    "detect_date_only": False,
 }
 XLSX_MAX_ROWS = 1_048_576
 XLSX_MAX_COLS = 16_384
@@ -4362,6 +4509,14 @@ XLSX_MAX_COLS = 16_384
 LOG_DIR: str | None = None
 LOG_FILE_PATH: str | None = None
 LOG_FORMATTER = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s - %(message)s")
+
+
+def _is_readonly_list_connections_cli() -> bool:
+    """Return True when process was started with read-only --list-connections CLI."""
+    try:
+        return "--list-connections" in sys.argv[1:]
+    except Exception:
+        return False
 
 
 def _attach_logger_file_handler(log_dir: str) -> bool:
@@ -4416,6 +4571,12 @@ def _setup_logger():
     # Do not add handlers again on import
     if not logger.handlers:
         global LOG_DIR, LOG_FILE_PATH
+        if _is_readonly_list_connections_cli():
+            LOG_DIR = None
+            LOG_FILE_PATH = None
+            logger.addHandler(logging.NullHandler())
+            return logger
+
         candidates: list[str] = [os.path.join(DATA_DIR, "logs")]
 
         # Ostateczny fallback: temp.
@@ -4493,6 +4654,13 @@ def _startup_ask_yes_no(
 
 def _suggest_user_data_dir() -> str:
     return get_default_user_data_dir()
+
+
+def select_data_dir_for_readonly_cli() -> None:
+    """Select DATA_DIR for read-only CLI commands without creating work dirs or logs."""
+    user_dir = _suggest_user_data_dir()
+    selected_data_dir = select_startup_data_dir(BASE_DIR, user_dir)
+    _set_data_dir_paths_only(selected_data_dir)
 
 
 def _startup_show_error(title: str, message: str) -> None:
@@ -4770,10 +4938,15 @@ def _normalize_user_csv_profiles(raw_profiles):
         if not name or name in seen or is_builtin_csv_profile(name):
             continue
         seen.add(name)
+        raw_encoding = raw.get("encoding") or DEFAULT_CSV_PROFILE["encoding"]
+        bom_from_encoding = raw_encoding.lower() == "utf-8-sig"
+        norm_encoding = "utf-8" if bom_from_encoding else raw_encoding
+        bom = bool(raw.get("bom", bom_from_encoding))
         normalized_profiles.append(
             {
                 "name": name,
-                "encoding": raw.get("encoding") or DEFAULT_CSV_PROFILE["encoding"],
+                "encoding": norm_encoding,
+                "bom": bom,
                 "delimiter": raw.get("delimiter") or DEFAULT_CSV_PROFILE["delimiter"],
                 "delimiter_replacement": raw.get("delimiter_replacement", ""),
                 "decimal": raw.get("decimal") or DEFAULT_CSV_PROFILE["decimal"],
@@ -4788,6 +4961,8 @@ def _normalize_user_csv_profiles(raw_profiles):
                     else DEFAULT_CSV_PROFILE["doublequote"]
                 ),
                 "date_format": raw.get("date_format", ""),
+                "time_format": raw.get("time_format", ""),
+                "detect_date_only": bool(raw.get("detect_date_only", False)),
             }
         )
 
@@ -5050,7 +5225,21 @@ def bootstrap_data_dir_and_workdirs_or_exit(*, prefer_gui_prompt: bool = False, 
 
 
 def _expected_output_extension(output_format: str) -> str:
-    return ".xlsx" if (output_format or "").lower() == "xlsx" else ".csv"
+    normalized = (output_format or "").lower()
+    if normalized == "xlsx":
+        return ".xlsx"
+    if normalized == "sqlite":
+        return ".sqlite"
+    return ".csv"
+
+
+def _allowed_output_extensions(output_format: str) -> tuple[str, ...]:
+    normalized = (output_format or "").lower()
+    if normalized == "xlsx":
+        return (".xlsx",)
+    if normalized == "sqlite":
+        return (".sqlite", ".db", ".sqlite3")
+    return (".csv",)
 
 
 def _looks_like_directory(path: str) -> bool:
@@ -5089,6 +5278,7 @@ def normalize_output_file_path(
     Creates output_dir if missing.
     """
     expected_ext = _expected_output_extension(output_format)
+    allowed_exts = _allowed_output_extensions(output_format)
     override = (override_path or "").strip()
     ext_mismatch = False
 
@@ -5102,9 +5292,9 @@ def normalize_output_file_path(
             output_file_path = os.path.join(output_dir, default_file_name)
         else:
             root, ext = os.path.splitext(resolved)
-            ext_mismatch = bool(ext) and ext.lower() != expected_ext
+            ext_mismatch = bool(ext) and ext.lower() not in allowed_exts
             output_file_path = (
-                root + expected_ext if ext.lower() != expected_ext else resolved
+                root + expected_ext if ext.lower() not in allowed_exts else resolved
             )
             output_dir = os.path.dirname(output_file_path) or output_directory
     else:
@@ -6190,7 +6380,7 @@ def format_error_for_ui(
 
     hints: list[str] = []
     if isinstance(exc, PermissionError):
-        blocked_file = getattr(exc, "filename", "")
+        blocked_file = getattr(exc, "filename2", None) or getattr(exc, "filename", "")
         shortened = shorten_path(blocked_file, max_len=200) if blocked_file else ""
         exists = os.path.exists(blocked_file) if blocked_file else False
 
@@ -6229,6 +6419,18 @@ def _safe_remove(path: str) -> None:
         pass
 
 
+def _temp_output_path_for(final_path: str) -> str:
+    directory = os.path.dirname(os.path.abspath(final_path)) or "."
+    filename = os.path.basename(final_path)
+    fd, temp_path = tempfile.mkstemp(
+        prefix=f".{filename}.",
+        suffix=".tmp",
+        dir=directory,
+    )
+    os.close(fd)
+    return temp_path
+
+
 def _csv_quoting_value(quoting_name: str):
     mapping = {
         "minimal": csv.QUOTE_MINIMAL,
@@ -6239,16 +6441,51 @@ def _csv_quoting_value(quoting_name: str):
     return mapping.get((quoting_name or "minimal").lower(), csv.QUOTE_MINIMAL)
 
 
-def _coerce_csv_value(value, *, decimal_sep: str, date_format: Optional[str]):
+def _detect_date_only_columns(columns: list, rows: list) -> list[bool]:
+    """Return per-column flags: True when ALL datetime values in that column are midnight."""
+    import datetime as _dt
+
+    n = len(columns)
+    col_has_datetime = [False] * n
+    col_has_non_midnight = [False] * n
+    for row in rows or []:
+        for col_idx, value in enumerate(list(row)[:n]):
+            if isinstance(value, _dt.datetime):
+                col_has_datetime[col_idx] = True
+                if value.hour != 0 or value.minute != 0 or value.second != 0 or value.microsecond != 0:
+                    col_has_non_midnight[col_idx] = True
+    return [col_has_datetime[i] and not col_has_non_midnight[i] for i in range(n)]
+
+
+def _coerce_csv_value(
+    value,
+    *,
+    decimal_sep: str,
+    date_format: Optional[str],
+    time_format: Optional[str] = None,
+    detect_date_only: bool = False,
+):
     if value is None:
         return ""
     if isinstance(value, datetime):
+        if (
+            detect_date_only
+            and value.hour == 0
+            and value.minute == 0
+            and value.second == 0
+            and value.microsecond == 0
+        ):
+            return value.date().strftime(date_format) if date_format else value.date().isoformat()
+        if date_format and time_format:
+            return f"{value.date().strftime(date_format)} {value.time().strftime(time_format)}"
         return value.strftime(date_format) if date_format else value.isoformat(sep=" ")
     try:
         import datetime as _dt
 
         if isinstance(value, _dt.date) and not isinstance(value, _dt.datetime):
             return value.strftime(date_format) if date_format else value.isoformat()
+        if isinstance(value, _dt.time):
+            return value.strftime(time_format) if time_format else value.isoformat()
     except Exception:
         pass
 
@@ -6259,6 +6496,251 @@ def _coerce_csv_value(value, *, decimal_sep: str, date_format: Optional[str]):
         return s
 
     return str(value)
+
+
+def _sqlite_safe_table_name(value: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9_]+", "_", str(value or "").strip())
+    cleaned = re.sub(r"_+", "_", cleaned).strip("_")
+    if not cleaned:
+        cleaned = "results"
+    if cleaned[0].isdigit():
+        cleaned = f"t_{cleaned}"
+    return cleaned
+
+
+def _sqlite_safe_column_names(columns: list) -> list[str]:
+    """Preserve original column names; only fill blank names and deduplicate.
+    Deduplication is case-insensitive to match SQLite's column name semantics.
+    Names are quoted via _sqlite_quote_identifier when used in SQL.
+    """
+    assigned_ci: set[str] = set()  # lowercase keys for case-insensitive dedup
+    result: list[str] = []
+    for idx, column in enumerate(columns or [], start=1):
+        base = str(column or "").strip() or f"column_{idx}"
+        base_ci = base.lower()
+        if base_ci not in assigned_ci:
+            result.append(base)
+            assigned_ci.add(base_ci)
+        else:
+            n = 2
+            while f"{base_ci}_{n}" in assigned_ci:
+                n += 1
+            result.append(f"{base}_{n}")
+            assigned_ci.add(f"{base_ci}_{n}")
+    return result
+
+
+def _sqlite_quote_identifier(name: str) -> str:
+    return '"' + str(name or "").replace('"', '""') + '"'
+
+
+def _sqlite_column_affinity(declared_type: str) -> str:
+    """Compute SQLite type affinity following the official 5-rule algorithm."""
+    dt = (declared_type or "").upper().strip()
+    if "INT" in dt:
+        return "INTEGER"
+    if any(kw in dt for kw in ("CHAR", "CLOB", "TEXT")):
+        return "TEXT"
+    if not dt or "BLOB" in dt:
+        return "BLOB"
+    if any(kw in dt for kw in ("REAL", "FLOA", "DOUB")):
+        return "REAL"
+    return "NUMERIC"
+
+
+_PRECISION_RISKY_AFFINITIES = {"INTEGER", "REAL", "NUMERIC"}
+
+
+def _find_append_precision_risk(
+    safe_columns: list, schema_rows: list, rows: list | None = None
+) -> tuple | None:
+    """Return (col_name, col_type, value) if appending would silently coerce a large
+    int/Decimal to REAL.  Scans ALL rows because the first row may contain only small
+    values while later rows have oversized ones.
+    Returns None when no risk is detected.
+    """
+    type_by_name = {str(row[1]): (row[2] or "") for row in schema_rows}
+    n = len(safe_columns)
+
+    def _risk_for(col_idx: int, value):
+        if value is None or isinstance(value, bool):
+            return None
+        if not isinstance(value, (int, decimal.Decimal)):
+            return None
+        if not isinstance(_coerce_sqlite_value(value), str):
+            return None
+        col_name = safe_columns[col_idx]
+        col_type = type_by_name.get(col_name, "")
+        if _sqlite_column_affinity(col_type) in _PRECISION_RISKY_AFFINITIES:
+            return (col_name, col_type or _sqlite_column_affinity(col_type), value)
+        return None
+
+    for row in rows or []:
+        for col_idx, value in enumerate(list(row)[:n]):
+            risk = _risk_for(col_idx, value)
+            if risk:
+                return risk
+    return None
+
+
+_SQLITE_INT64_MIN = -(2**63)
+_SQLITE_INT64_MAX = 2**63 - 1
+
+
+def _sqlite_column_decl(column_name: str) -> str:
+    # Declare without affinity type so SQLite does not coerce values.
+    # Python sqlite3 binds int/float/str/bytes directly; without a type affinity
+    # large ints stored as TEXT are not silently converted to REAL.
+    return _sqlite_quote_identifier(column_name)
+
+
+def _coerce_sqlite_value(value):
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, decimal.Decimal):
+        # Always TEXT: preserves full precision without int64 overflow or float coercion
+        return str(value)
+    if isinstance(value, datetime):
+        return value.isoformat(sep=" ")
+    try:
+        import datetime as _dt
+
+        if isinstance(value, _dt.date) and not isinstance(value, _dt.datetime):
+            return value.isoformat()
+        if isinstance(value, _dt.time):
+            return value.isoformat()
+    except Exception:
+        pass
+    if isinstance(value, int):
+        if _SQLITE_INT64_MIN <= value <= _SQLITE_INT64_MAX:
+            return value
+        return str(value)  # big int → TEXT to avoid OverflowError
+    if isinstance(value, (float, str, bytes)):
+        return value
+    return str(value)
+
+
+def _sqlite_default_table_name(report_label: str) -> str:
+    base = os.path.splitext(os.path.basename(report_label or ""))[0]
+    return _sqlite_safe_table_name(base or "results")
+
+
+def _export_rows_to_sqlite(
+    output_file_path: str,
+    table_name: str,
+    write_mode: str,
+    columns: list,
+    rows: list,
+    timeout_seconds: int,
+    cancel_event: threading.Event | None = None,
+) -> None:
+    deadline = _deadline(timeout_seconds)
+    safe_table_name = _sqlite_safe_table_name(table_name)
+    safe_columns = _sqlite_safe_column_names(list(columns or []))
+    if not safe_columns:
+        raise ValueError("SQLite export requires at least one result column.")
+    create_columns = [_sqlite_column_decl(col_name) for col_name in safe_columns]
+    quoted_columns = [_sqlite_quote_identifier(name) for name in safe_columns]
+    insert_sql = (
+        f"INSERT INTO {_sqlite_quote_identifier(safe_table_name)} "
+        f"({', '.join(quoted_columns)}) VALUES ({', '.join(['?'] * len(quoted_columns))})"
+    )
+
+    conn = sqlite3.connect(output_file_path)
+    cur = None
+    try:
+        cur = conn.cursor()
+        cur.execute("PRAGMA busy_timeout = 5000")
+        cur.execute("BEGIN IMMEDIATE")
+        table_exists = (
+            cur.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name = ?",
+                (safe_table_name,),
+            ).fetchone()
+            is not None
+        )
+
+        normalized_mode = (write_mode or "replace").strip().lower()
+        if normalized_mode == "replace":
+            cur.execute(f"DROP TABLE IF EXISTS {_sqlite_quote_identifier(safe_table_name)}")
+            cur.execute(
+                f"CREATE TABLE {_sqlite_quote_identifier(safe_table_name)} "
+                f"({', '.join(create_columns)})"
+            )
+        else:
+            if not table_exists:
+                cur.execute(
+                    f"CREATE TABLE {_sqlite_quote_identifier(safe_table_name)} "
+                    f"({', '.join(create_columns)})"
+                )
+            else:
+                existing_rows = cur.execute(
+                    f"PRAGMA table_info({_sqlite_quote_identifier(safe_table_name)})"
+                ).fetchall()
+                existing_columns = [str(row[1]) for row in existing_rows]
+                if existing_columns != safe_columns:
+                    raise ValueError(
+                        t(
+                            "ERR_SQLITE_APPEND_SCHEMA_MISMATCH",
+                            table=safe_table_name,
+                            expected=", ".join(safe_columns),
+                            actual=", ".join(existing_columns),
+                        )
+                    )
+                risk = _find_append_precision_risk(safe_columns, existing_rows, rows)
+                if risk:
+                    col_name, col_type, value = risk
+                    raise ValueError(
+                        t(
+                            "ERR_SQLITE_APPEND_NUMERIC_PRECISION",
+                            table=safe_table_name,
+                            column=col_name,
+                            col_type=col_type,
+                            value=str(value),
+                        )
+                    )
+
+        for idx, row in enumerate(rows or [], start=1):
+            if idx % 100 == 0:
+                _raise_if_cancelled(cancel_event)
+                _check_deadline(
+                    deadline,
+                    ExportTimeoutError,
+                    _export_timeout_msg(timeout_seconds),
+                )
+            values = list(row)
+            if len(values) != len(safe_columns):
+                raise ValueError(
+                    f"SQLite export row width mismatch: expected {len(safe_columns)} values, got {len(values)}."
+                )
+            coerced_row = tuple(_coerce_sqlite_value(value) for value in values)
+            cur.execute(insert_sql, coerced_row)
+
+        _raise_if_cancelled(cancel_event)
+        _check_deadline(
+            deadline,
+            ExportTimeoutError,
+            _export_timeout_msg(timeout_seconds),
+        )
+        conn.commit()
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
+    finally:
+        try:
+            if cur is not None:
+                cur.close()
+        except Exception:
+            pass
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 def _export_rows_to_csv(
@@ -6272,7 +6754,10 @@ def _export_rows_to_csv(
     deadline = _deadline(timeout_seconds)
     profile = profile or DEFAULT_CSV_PROFILE
 
-    encoding = profile.get("encoding") or DEFAULT_CSV_PROFILE["encoding"]
+    raw_encoding = profile.get("encoding") or DEFAULT_CSV_PROFILE["encoding"]
+    bom = bool(profile.get("bom", raw_encoding.lower() == "utf-8-sig"))
+    encoding = "utf-8" if raw_encoding.lower() == "utf-8-sig" else raw_encoding
+    file_encoding = f"{encoding}-sig" if (bom and encoding.lower() == "utf-8") else encoding
     delimiter = profile.get("delimiter") or DEFAULT_CSV_PROFILE["delimiter"]
     delimiter_replacement = profile.get("delimiter_replacement", "")
     quotechar = profile.get("quotechar") or DEFAULT_CSV_PROFILE["quotechar"]
@@ -6286,8 +6771,14 @@ def _export_rows_to_csv(
     )
     decimal_sep = profile.get("decimal") or DEFAULT_CSV_PROFILE["decimal"]
     date_format = profile.get("date_format") or None
+    time_format = profile.get("time_format") or None
+    detect_date_only = bool(profile.get("detect_date_only", False))
 
-    with open(output_file_path, "w", encoding=encoding, newline="") as f:
+    date_only_cols: list[bool] = (
+        _detect_date_only_columns(columns, rows) if detect_date_only else []
+    )
+
+    with open(output_file_path, "w", encoding=file_encoding, newline="") as f:
         writer = csv.writer(
             f,
             delimiter=delimiter,
@@ -6310,6 +6801,10 @@ def _export_rows_to_csv(
                 )
 
             values = list(row)
+            if len(values) != len(columns):
+                raise ValueError(
+                    f"CSV export row width mismatch: expected {len(columns)} values, got {len(values)}."
+                )
             if delimiter and delimiter_replacement:
                 values = [
                     (v.replace(delimiter, delimiter_replacement) if isinstance(v, str) else v)
@@ -6318,8 +6813,18 @@ def _export_rows_to_csv(
 
             writer.writerow(
                 [
-                    _coerce_csv_value(v, decimal_sep=decimal_sep, date_format=date_format)
-                    for v in values
+                    _coerce_csv_value(
+                        v,
+                        decimal_sep=decimal_sep,
+                        date_format=date_format,
+                        time_format=time_format,
+                        detect_date_only=(
+                            date_only_cols[col_idx]
+                            if col_idx < len(date_only_cols)
+                            else False
+                        ),
+                    )
+                    for col_idx, v in enumerate(values)
                 ]
             )
 
@@ -6386,6 +6891,8 @@ def run_export(
     output_file_path,
     output_format,
     csv_profile=None,
+    sqlite_table: str | None = None,
+    sqlite_mode: str = "replace",
     *,
     db_timeout_seconds: int = 0,
     export_timeout_seconds: int = 0,
@@ -6417,32 +6924,64 @@ def run_export(
         )
 
     export_duration = 0.0
-    if rows_count:
+    should_export = bool(rows_count) or (
+        output_format == "sqlite"
+        and (sqlite_mode or "replace").strip().lower() == "replace"
+    )
+
+    if should_export:
         _raise_if_cancelled(cancel_event)
+        output_existed_before_export = os.path.exists(output_file_path)
+        temp_output_path = None
+        actual_export_path = output_file_path
+        if output_format in {"xlsx", "csv"}:
+            temp_output_path = _temp_output_path_for(output_file_path)
+            actual_export_path = temp_output_path
         if phase_callback is not None:
-            phase_callback("export_xlsx" if output_format == "xlsx" else "export_csv")
+            if output_format == "xlsx":
+                phase_callback("export_xlsx")
+            elif output_format == "sqlite":
+                phase_callback("export_sqlite")
+            else:
+                phase_callback("export_csv")
         export_start = time.perf_counter()
         try:
             if output_format == "xlsx":
                 _export_rows_to_xlsx(
-                    output_file_path,
+                    actual_export_path,
                     columns=list(columns),
                     rows=rows,
                     timeout_seconds=int(export_timeout_seconds or 0),
                     cancel_event=cancel_event,
                 )
-            else:
+            elif output_format == "csv":
                 profile = csv_profile or DEFAULT_CSV_PROFILE
                 _export_rows_to_csv(
-                    output_file_path,
+                    actual_export_path,
                     columns=list(columns),
                     rows=rows,
                     profile=profile,
                     timeout_seconds=int(export_timeout_seconds or 0),
                     cancel_event=cancel_event,
                 )
+            else:
+                _export_rows_to_sqlite(
+                    output_file_path,
+                    table_name=sqlite_table or "results",
+                    write_mode=sqlite_mode,
+                    columns=list(columns),
+                    rows=rows,
+                    timeout_seconds=int(export_timeout_seconds or 0),
+                    cancel_event=cancel_event,
+                )
+            if temp_output_path is not None:
+                _raise_if_cancelled(cancel_event)
+                os.replace(temp_output_path, output_file_path)
         except Exception:
-            _safe_remove(output_file_path)
+            if temp_output_path is not None:
+                _safe_remove(temp_output_path)
+            elif output_format == "sqlite" and not output_existed_before_export:
+                _safe_remove(output_file_path)
             raise
         export_end = time.perf_counter()
         export_duration = export_end - export_start
@@ -6497,6 +7036,7 @@ def run_export_to_template(
         start_col=start_col,
     )
 
+    temp_output_path = _temp_output_path_for(output_file_path)
     export_start = time.perf_counter()
     try:
         deadline = _deadline(int(export_timeout_seconds or 0))
@@ -6509,7 +7049,7 @@ def run_export_to_template(
             ExportTimeoutError,
             _export_timeout_msg(export_timeout_seconds),
         )
-        shutil.copyfile(template_path, output_file_path)
+        shutil.copyfile(template_path, temp_output_path)
 
         # Allow user cancellation right after template copy.
         # Without this check, a cancellation triggered during/after the copy
@@ -6525,7 +7065,8 @@ def run_export_to_template(
         wb = None
         try:
             if rows_count:
-                wb = load_workbook(output_file_path)
+                with open(temp_output_path, "rb") as temp_xlsx:
+                    wb = load_workbook(temp_xlsx)
                 _check_deadline(
                     deadline,
                     ExportTimeoutError,
@@ -6571,13 +7112,15 @@ def run_export_to_template(
                     ExportTimeoutError,
                     _export_timeout_msg(export_timeout_seconds),
                 )
-                wb.save(output_file_path)
+                wb.save(temp_output_path)
                 _raise_if_cancelled(cancel_event)
                 _check_deadline(
                     deadline,
                     ExportTimeoutError,
                     _export_timeout_msg(export_timeout_seconds),
                 )
+            _raise_if_cancelled(cancel_event)
+            os.replace(temp_output_path, output_file_path)
         finally:
             if wb is not None:
                 try:
@@ -6585,7 +7128,7 @@ def run_export_to_template(
                 except Exception:
                     pass
     except Exception:
-        _safe_remove(output_file_path)
+        _safe_remove(temp_output_path)
         raise
 
     export_end = time.perf_counter()
@@ -6674,13 +7217,16 @@ def run_console(
         output_format = (
             input(t("CONSOLE_PROMPT_FORMAT")).strip().lower()
         )
-        if output_format in ["xlsx", "csv"]:
+        if output_format in ["xlsx", "csv", "sqlite"]:
             break
         print(t("CONSOLE_INVALID_FORMAT"))
 
+    base_name = os.path.basename(sql_query_file_path)
     selected_csv_profile = get_csv_profile(
             csv_config, csv_config.get("default_profile")
         ) or (csv_config.get("profiles") or [DEFAULT_CSV_PROFILE])[0]
+    sqlite_table = None
+    sqlite_mode = "replace"
     if output_format == "csv":
         profiles = csv_config.get("profiles", [])
         profile_names = [p.get("name") for p in profiles]
@@ -6710,20 +7256,32 @@ def run_console(
         prof_name = (selected_csv_profile.get("name") or "").strip()
         if prof_name:
             csv_config = remember_last_used_csv_profile(prof_name, csv_config)
+    elif output_format == "sqlite":
+        default_table = _sqlite_default_table_name(base_name)
+        table_input = input(t("CONSOLE_PROMPT_SQLITE_TABLE", table=default_table)).strip()
+        sqlite_table = _sqlite_safe_table_name(table_input or default_table)
+        while True:
+            mode_input = input(t("CONSOLE_PROMPT_SQLITE_MODE")).strip().lower()
+            if not mode_input:
+                sqlite_mode = "replace"
+                break
+            if mode_input in ("replace", "append"):
+                sqlite_mode = mode_input
+                break
+            print(t("CONSOLE_INVALID_SQLITE_MODE"))
 
     with open(sql_query_file_path, "rb") as file:
         content = file.read()
 
     sql_query = remove_bom(content).strip()
 
-    base_name = os.path.basename(sql_query_file_path)
-    output_file_name = os.path.splitext(base_name)[0] + (".xlsx" if output_format == "xlsx" else ".csv")
+    output_file_name = _default_output_file_name(base_name, output_format)
     output_file_path, _ = normalize_output_file_path(
         output_directory=output_directory,
         default_file_name=output_file_name,
         output_format=output_format,
         override_path=(output_override.strip() if output_override else None),
-        prefer_dir_for_extensionless_nonexistent=True,
+        prefer_dir_for_extensionless_nonexistent=(output_format != "sqlite"),
     )
     output_existed_before = os.path.exists(output_file_path)
 
@@ -6734,6 +7292,8 @@ def run_console(
             output_file_path,
             output_format,
             csv_profile=selected_csv_profile,
+            sqlite_table=sqlite_table,
+            sqlite_mode=sqlite_mode,
             db_timeout_seconds=db_timeout_seconds,
             export_timeout_seconds=export_timeout_seconds,
             sql_source_path=sql_query_file_path,
@@ -6770,6 +7330,9 @@ def run_console(
         output_file_path,
         rows_count,
         existed_before=output_existed_before,
+        output_format=output_format,
+        sqlite_table=sqlite_table,
+        sqlite_mode=sqlite_mode,
     )
     print(t("CONSOLE_SQL_TIME", seconds=sql_dur))
     if rows_count > 0:
@@ -6786,6 +7349,8 @@ def run_console_noninteractive(
     output_format,
     output_override,
     archive_sql,
+    sqlite_table=None,
+    sqlite_mode="replace",
 ) -> int:
     resolved_sql_path = resolve_path(sql_path)
     ok, msg = validate_sql_text_file(resolved_sql_path)
@@ -6808,15 +7373,13 @@ def run_console_noninteractive(
     export_timeout_seconds = load_persisted_export_timeout_seconds()
 
     base_name = os.path.basename(resolved_sql_path)
-    output_file_name = os.path.splitext(base_name)[0] + (
-        ".xlsx" if output_format == "xlsx" else ".csv"
-    )
+    output_file_name = _default_output_file_name(base_name, output_format)
     output_file_path, _ = normalize_output_file_path(
         output_directory=output_directory,
         default_file_name=output_file_name,
         output_format=output_format,
         override_path=(output_override.strip() if output_override else None),
-        prefer_dir_for_extensionless_nonexistent=True,
+        prefer_dir_for_extensionless_nonexistent=(output_format != "sqlite"),
     )
     output_existed_before = os.path.exists(output_file_path)
 
@@ -6827,6 +7390,8 @@ def run_console_noninteractive(
             output_file_path,
             output_format,
             csv_profile=selected_csv_profile,
+            sqlite_table=sqlite_table or _sqlite_default_table_name(base_name),
+            sqlite_mode=sqlite_mode,
             db_timeout_seconds=db_timeout_seconds,
             export_timeout_seconds=export_timeout_seconds,
             sql_source_path=resolved_sql_path,
@@ -6861,6 +7426,9 @@ def run_console_noninteractive(
         output_file_path,
         rows_count,
         existed_before=output_existed_before,
+        output_format=output_format,
+        sqlite_table=sqlite_table or _sqlite_default_table_name(base_name),
+        sqlite_mode=sqlite_mode,
     )
     print(t("CONSOLE_SQL_TIME", seconds=sql_dur))
     if rows_count > 0:
@@ -6871,16 +7439,34 @@ def run_console_noninteractive(
 
 
 def _print_console_export_result(
-    output_file_path: str, rows_count: int, *, existed_before: bool
+    output_file_path: str,
+    rows_count: int,
+    *,
+    existed_before: bool,
+    output_format: str = "",
+    sqlite_table: Optional[str] = None,
+    sqlite_mode: str = "replace",
 ) -> None:
     if rows_count > 0:
         print(t("CONSOLE_SAVED_PATH", path=output_file_path))
+        return
+
+    if (
+        output_format == "sqlite"
+        and sqlite_table
+        and (sqlite_mode or "replace").strip().lower() == "replace"
+    ):
+        print(t("MSG_NO_ROWS_SQLITE_CLEARED", table=sqlite_table))
         return
 
     if not existed_before and os.path.exists(output_file_path):
         print(t("CONSOLE_NO_ROWS_SAVED_EMPTY", path=output_file_path))
     else:
         print(t("CONSOLE_NO_ROWS_NOTHING_SAVED"))
+
+
+def _default_output_file_name(report_name: str, output_format: str) -> str:
+    return os.path.splitext(report_name)[0] + _expected_output_extension(output_format)
 
 
 def _create_mssql_frame(parent):
@@ -8052,6 +8638,7 @@ def _init_csv_profile_vars():
     return {
         "name": tk.StringVar(value=""),
         "encoding": tk.StringVar(value="utf-8"),
+        "bom": tk.BooleanVar(value=False),
         "delimiter": tk.StringVar(value=","),
         "delimiter_replacement": tk.StringVar(value=""),
         "decimal": tk.StringVar(value="."),
@@ -8061,30 +8648,77 @@ def _init_csv_profile_vars():
         "escapechar": tk.StringVar(value=""),
         "doublequote": tk.BooleanVar(value=True),
         "date_format": tk.StringVar(value=""),
+        "time_format": tk.StringVar(value=""),
+        "detect_date_only": tk.BooleanVar(value=False),
         "date_preview": tk.StringVar(value=""),
+        "time_preview": tk.StringVar(value=""),
     }
 
 
-def _validate_date_format(raw):
+# Cross-platform strftime directives accepted by the CSV profile validator.
+# Locale-based %c/%x/%X are allowed; non-portable platform extensions
+# such as %e, %k, and %l are rejected by this allowlist before strftime is called.
+_ALLOWED_STRFTIME_CODES = set("aAwdHbBmyYIMpSUWjxXzZf%GVuc")
+
+
+def _has_unknown_strftime_directive(raw: str) -> bool:
+    i = 0
+    while i < len(raw):
+        if raw[i] != "%":
+            i += 1
+            continue
+        i += 1
+        if i >= len(raw):
+            return True
+        if raw[i] not in _ALLOWED_STRFTIME_CODES:
+            return True
+        i += 1
+    return False
+
+
+def _validate_strftime_format(
+    raw: str,
+    *,
+    empty_example_fn,
+    key_default: str,
+    key_invalid: str,
+    key_preview: str,
+):
     if not raw:
-        example = datetime.now().isoformat(sep=" ", timespec="seconds")
-        return (
-            True,
-            t("CSV_PROFILE_DATE_DEFAULT", example=example),
-        )
+        return True, t(key_default, example=empty_example_fn())
+    if _has_unknown_strftime_directive(raw):
+        return False, t(key_invalid)
     try:
         example = datetime.now().strftime(raw)
     except (ValueError, TypeError):
-        return (
-            False,
-            t("CSV_PROFILE_DATE_INVALID"),
-        )
-    return True, t("CSV_PROFILE_DATE_PREVIEW", example=example)
+        return False, t(key_invalid)
+    return True, t(key_preview, example=example)
+
+
+def _validate_date_format(raw):
+    return _validate_strftime_format(
+        raw,
+        empty_example_fn=lambda: datetime.now().isoformat(sep=" ", timespec="seconds"),
+        key_default="CSV_PROFILE_DATE_DEFAULT",
+        key_invalid="CSV_PROFILE_DATE_INVALID",
+        key_preview="CSV_PROFILE_DATE_PREVIEW",
+    )
+
+
+def _validate_time_format(raw):
+    return _validate_strftime_format(
+        raw,
+        empty_example_fn=lambda: datetime.now().strftime("%H:%M:%S"),
+        key_default="CSV_PROFILE_TIME_DEFAULT",
+        key_invalid="CSV_PROFILE_TIME_INVALID",
+        key_preview="CSV_PROFILE_TIME_PREVIEW",
+    )
 
 
 def _load_csv_profile(vars_dict, profile):
     vars_dict["name"].set(profile.get("name", ""))
     vars_dict["encoding"].set(profile.get("encoding", ""))
+    vars_dict["bom"].set(bool(profile.get("bom", False)))
     vars_dict["delimiter"].set(profile.get("delimiter", ","))
     vars_dict["delimiter_replacement"].set(profile.get("delimiter_replacement", ""))
     vars_dict["decimal"].set(profile.get("decimal", "."))
@@ -8094,6 +8728,8 @@ def _load_csv_profile(vars_dict, profile):
     vars_dict["escapechar"].set(profile.get("escapechar", ""))
     vars_dict["doublequote"].set(bool(profile.get("doublequote", True)))
     vars_dict["date_format"].set(profile.get("date_format", ""))
+    vars_dict["time_format"].set(profile.get("time_format", ""))
+    vars_dict["detect_date_only"].set(bool(profile.get("detect_date_only", False)))
 
 
 def _read_csv_profile(vars_dict):
@@ -8101,10 +8737,15 @@ def _read_csv_profile(vars_dict):
     vars_dict["date_preview"].set(preview)
     if not valid_format:
         return None
+    valid_time_format, time_preview = _validate_time_format(vars_dict["time_format"].get())
+    vars_dict["time_preview"].set(time_preview)
+    if not valid_time_format:
+        return None
     return {
         "name": vars_dict["name"].get().strip(),
         "encoding": vars_dict["encoding"].get().strip()
         or DEFAULT_CSV_PROFILE["encoding"],
+        "bom": bool(vars_dict["bom"].get()),
         "delimiter": vars_dict["delimiter"].get() or DEFAULT_CSV_PROFILE["delimiter"],
         "delimiter_replacement": vars_dict["delimiter_replacement"].get(),
         "decimal": vars_dict["decimal"].get() or DEFAULT_CSV_PROFILE["decimal"],
@@ -8117,6 +8758,8 @@ def _read_csv_profile(vars_dict):
         "escapechar": vars_dict["escapechar"].get(),
         "doublequote": bool(vars_dict["doublequote"].get()),
         "date_format": vars_dict["date_format"].get(),
+        "time_format": vars_dict["time_format"].get(),
+        "detect_date_only": bool(vars_dict["detect_date_only"].get()),
     }
 
 
@@ -8165,6 +8808,18 @@ def _csv_field_help():
         "date_format": (
             t("CSV_HELP_DATE_FORMAT_TITLE"),
             t("CSV_HELP_DATE_FORMAT_BODY"),
+        ),
+        "time_format": (
+            t("CSV_HELP_TIME_FORMAT_TITLE"),
+            t("CSV_HELP_TIME_FORMAT_BODY"),
+        ),
+        "bom": (
+            t("CSV_HELP_BOM_TITLE"),
+            t("CSV_HELP_BOM_BODY"),
+        ),
+        "detect_date_only": (
+            t("CSV_HELP_DETECT_DATE_ONLY_TITLE"),
+            t("CSV_HELP_DETECT_DATE_ONLY_BODY"),
         ),
     }
 
@@ -8333,7 +8988,49 @@ def _build_csv_profile_form_ui(form_frame, form_vars, field_help):
     form_vars["date_format"].trace_add("write", update_date_preview)
     update_date_preview()
 
-    return update_date_preview, widgets
+    time_preview_var = form_vars["time_preview"]
+
+    def update_time_preview(*_args):  # noqa: ANN001
+        valid, preview = _validate_time_format(form_vars["time_format"].get())
+        time_preview_var.set(preview)
+        return valid
+
+    tk.Label(form_frame, text=t("CSV_PROFILE_TIME_FORMAT")).grid(row=12, column=0, sticky="w")
+    time_format_entry = tk.Entry(form_frame, textvariable=form_vars["time_format"])
+    time_format_entry.grid(row=12, column=1, columnspan=1, sticky="we")
+    widgets.append((time_format_entry, "normal"))
+    add_info_button(12, "time_format")
+    tk.Label(
+        form_frame,
+        textvariable=time_preview_var,
+        fg="gray",
+    ).grid(row=13, column=0, columnspan=4, sticky="w", pady=(2, 0))
+    form_vars["time_format"].trace_add("write", update_time_preview)
+    update_time_preview()
+
+    bom_check = tk.Checkbutton(
+        form_frame,
+        text=t("CSV_PROFILE_BOM"),
+        variable=form_vars["bom"],
+    )
+    bom_check.grid(row=14, column=0, columnspan=2, sticky="w")
+    widgets.append((bom_check, "normal"))
+    add_info_button(14, "bom")
+
+    detect_check = tk.Checkbutton(
+        form_frame,
+        text=t("CSV_PROFILE_DETECT_DATE_ONLY"),
+        variable=form_vars["detect_date_only"],
+    )
+    detect_check.grid(row=15, column=0, columnspan=2, sticky="w")
+    widgets.append((detect_check, "normal"))
+    add_info_button(15, "detect_date_only")
+
+    def update_all_previews(*_args):  # noqa: ANN001
+        update_date_preview()
+        update_time_preview()
+
+    return update_all_previews, widgets
 
 
 def _create_csv_profiles_dialog(root, csv_profile_state):
@@ -8454,7 +9151,7 @@ def open_csv_profiles_manager_gui(
     form_frame.columnconfigure(3, weight=1)
 
     form_vars = _init_csv_profile_vars()
-    update_date_preview, form_widgets = _build_csv_profile_form_ui(
+    update_all_previews, form_widgets = _build_csv_profile_form_ui(
         form_frame, form_vars, _csv_field_help()
     )
     builtin_notice_var = tk.StringVar(value="")
@@ -8462,7 +9159,7 @@ def open_csv_profiles_manager_gui(
         form_frame,
         textvariable=builtin_notice_var,
         fg="gray",
-    ).grid(row=12, column=0, columnspan=4, sticky="w", pady=(2, 0))
+    ).grid(row=16, column=0, columnspan=4, sticky="w", pady=(2, 0))
 
     def refresh_list():
         _sort_csv_profiles_in_place(working_profiles)
@@ -8502,7 +9199,7 @@ def open_csv_profiles_manager_gui(
         if idx < 0 or idx >= len(working_profiles):
             return
         _load_csv_profile(form_vars, working_profiles[idx])
-        update_date_preview()
+        update_all_previews()
         update_builtin_indicator(idx)
         current_profile_name["name"] = working_profiles[idx].get("name")
 
@@ -8744,6 +9441,9 @@ def run_gui(connection_store, output_directory):
     selected_csv_profile_var = tk.StringVar(value="")
     default_csv_label_var = tk.StringVar(value="")
     save_as_path_var = tk.StringVar(value="")
+    sqlite_table_var = tk.StringVar(value="")
+    sqlite_mode_var = tk.StringVar(value="replace")
+    sqlite_mode_display_var = tk.StringVar(value="")
     result_info_var = tk.StringVar(value="")
     last_output_path = {"path": None}
     engine_holder = {"engine": None}
@@ -8761,6 +9461,7 @@ def run_gui(connection_store, output_directory):
         value=connections_state["store"].get("last_selected") or ""
     )
     pasted_sql_state = {"sql": None, "report_name": None}
+    sqlite_defaults_state = {"last_auto_table": None}
     lang_var = tk.StringVar(
         value=_CURRENT_LANG.upper()
     )
@@ -8818,6 +9519,10 @@ def run_gui(connection_store, output_directory):
         "choose_button": None,
         "start_cell_entry": None,
         "include_header_check": None,
+    }
+    sqlite_state = {
+        "table_entry": None,
+        "mode_combo": None,
     }
     i18n_widgets = {}
 
@@ -8932,12 +9637,30 @@ def run_gui(connection_store, output_directory):
         resolved = resolve_path(path)
         selected_sql_path_full.set(resolved)
         sql_label_var.set(shorten_path(path))
+        _refresh_sqlite_defaults()
         refresh_run_state()
 
     def _has_sql_source() -> bool:
         if pasted_sql_state["sql"] and pasted_sql_state["report_name"]:
             return True
         return bool(selected_sql_path_full.get())
+
+    def _current_report_label_for_output() -> str:
+        if pasted_sql_state["report_name"]:
+            return pasted_sql_state["report_name"]
+        selected_path = (selected_sql_path_full.get() or "").strip()
+        if selected_path:
+            return os.path.basename(selected_path)
+        return "results.sql"
+
+    def _refresh_sqlite_defaults(*_args) -> None:
+        report_label = _current_report_label_for_output()
+        default_table = _sqlite_safe_table_name(_sqlite_default_table_name(report_label))
+        current_table = (sqlite_table_var.get() or "").strip()
+        last_auto = (sqlite_defaults_state.get("last_auto_table") or "").strip()
+        if not current_table or (last_auto and current_table == last_auto):
+            sqlite_table_var.set(default_table)
+            sqlite_defaults_state["last_auto_table"] = default_table
 
     def _template_ok() -> bool:
         if not use_template_var.get():
@@ -9957,6 +10680,7 @@ def run_gui(connection_store, output_directory):
             pasted_sql_state["report_name"] = normalized_name
             selected_sql_path_full.set("")
             sql_label_var.set(f"{t('LBL_SQL_PASTED')} {normalized_name}")
+            _refresh_sqlite_defaults()
             refresh_run_state()
             sql_editor_state["dialog"] = None
             sql_editor_state["widget"] = None
@@ -10047,6 +10771,53 @@ def run_gui(connection_store, output_directory):
             manage_state = tk.NORMAL if enabled else tk.DISABLED
             manage_btn.config(state=manage_state)
 
+    def update_sqlite_controls_state():
+        enabled = format_var.get() == "sqlite"
+        table_label = sqlite_state.get("table_label")
+        if table_label is not None:
+            if enabled:
+                table_label.grid()
+            else:
+                table_label.grid_remove()
+
+        table_entry = sqlite_state.get("table_entry")
+        if table_entry is not None:
+            if enabled:
+                table_entry.grid()
+                table_entry.config(state=tk.NORMAL)
+            else:
+                table_entry.grid_remove()
+
+        mode_label = sqlite_state.get("mode_label")
+        if mode_label is not None:
+            if enabled:
+                mode_label.grid()
+            else:
+                mode_label.grid_remove()
+
+        mode_combo = sqlite_state.get("mode_combo")
+        if mode_combo is not None:
+            if enabled:
+                mode_combo.grid()
+                mode_combo.config(state="readonly")
+            else:
+                mode_combo.grid_remove()
+
+    def update_save_as_labels() -> None:
+        try:
+            lbl_save_as
+            lbl_save_as_hint
+        except NameError:
+            return
+        label_key = "LBL_SQLITE_FILE" if format_var.get() == "sqlite" else "LBL_SAVE_AS"
+        hint_key = (
+            "LBL_SQLITE_FILE_HINT" if format_var.get() == "sqlite" else "LBL_SAVE_AS_HINT"
+        )
+        lbl_save_as.config(text=t(label_key))
+        lbl_save_as_hint.config(
+            text=t(hint_key, dir=shorten_path(output_directory, max_len=60))
+        )
+
     def on_toggle_template():
         # Template is meaningful only for XLSX; if selected for CSV, switch to XLSX.
         if use_template_var.get() and format_var.get() != "xlsx":
@@ -10063,9 +10834,11 @@ def run_gui(connection_store, output_directory):
             return
         if _looks_like_directory(raw):
             return
-        expected_ext = _expected_output_extension(format_var.get())
+        output_format = format_var.get()
+        expected_ext = _expected_output_extension(output_format)
+        allowed_exts = _allowed_output_extensions(output_format)
         root, ext = os.path.splitext(raw)
-        if ext.lower() == expected_ext:
+        if ext.lower() in allowed_exts:
             return
         adjusted_path = root + expected_ext
         save_as_path_var.set(adjusted_path)
@@ -10077,11 +10850,13 @@ def run_gui(connection_store, output_directory):
 
     def on_format_change(*_):
         """Keep template option consistent with selected output format."""
-        if format_var.get() == "csv":
+        if format_var.get() in {"csv", "sqlite"}:
             use_template_var.set(False)
 
         update_template_controls_state()
         update_csv_profile_controls_state()
+        update_sqlite_controls_state()
+        update_save_as_labels()
         _sync_save_as_extension(show_info=False)
         refresh_run_state()
 
@@ -10110,11 +10885,15 @@ def run_gui(connection_store, output_directory):
     def choose_save_as_path():
         output_format = format_var.get()
         default_ext = _expected_output_extension(output_format)
-        filetypes = (
-            [(t("FILETYPE_CSV"), "*.csv"), (t("FILETYPE_ALL"), "*.*")]
-            if output_format == "csv"
-            else [(t("FILETYPE_EXCEL"), "*.xlsx"), (t("FILETYPE_ALL"), "*.*")]
-        )
+        if output_format == "csv":
+            filetypes = [(t("FILETYPE_CSV"), "*.csv"), (t("FILETYPE_ALL"), "*.*")]
+        elif output_format == "sqlite":
+            filetypes = [
+                (t("FILETYPE_SQLITE_EXPORT"), "*.sqlite *.db *.sqlite3"),
+                (t("FILETYPE_ALL"), "*.*"),
+            ]
+        else:
+            filetypes = [(t("FILETYPE_EXCEL"), "*.xlsx"), (t("FILETYPE_ALL"), "*.*")]
         path = filedialog.asksaveasfilename(
             title=t("BTN_SAVE_AS"),
             defaultextension=default_ext,
@@ -10533,6 +11312,8 @@ def run_gui(connection_store, output_directory):
         use_template = use_template_var.get()
 
         csv_profile = None
+        sqlite_table = None
+        sqlite_mode = "replace"
         if output_format == "csv":
             csv_config = csv_profile_state["config"]
             profile_name = selected_csv_profile_var.get() or csv_config.get("default_profile")
@@ -10540,6 +11321,17 @@ def run_gui(connection_store, output_directory):
                 get_csv_profile(csv_config, profile_name)
                 or get_csv_profile(csv_config, csv_config.get("default_profile"))
                 or csv_config.get("profiles", [DEFAULT_CSV_PROFILE])[0]
+            )
+        elif output_format == "sqlite":
+            sqlite_table = _sqlite_safe_table_name(
+                (sqlite_table_var.get() or "").strip()
+                or _sqlite_default_table_name(base_name)
+            )
+            sqlite_table_var.set(sqlite_table)
+            sqlite_mode = (
+                sqlite_mode_var.get()
+                if sqlite_mode_var.get() in ("replace", "append")
+                else "replace"
             )
 
         if use_template:
@@ -10606,11 +11398,9 @@ def run_gui(connection_store, output_directory):
             }
 
         if use_pasted_sql:
-            output_file_name = base_name + (".xlsx" if output_format == "xlsx" else ".csv")
+            output_file_name = base_name + _expected_output_extension(output_format)
         else:
-            output_file_name = os.path.splitext(base_name)[0] + (
-                ".xlsx" if output_format == "xlsx" else ".csv"
-            )
+            output_file_name = _default_output_file_name(base_name, output_format)
         output_file_name = apply_output_filename_stamp(
             output_file_name,
             enabled=bool(output_stamp_enabled_var.get()),
@@ -10645,6 +11435,8 @@ def run_gui(connection_store, output_directory):
             "output_format": output_format,
             "output_file_path": output_file_path,
             "csv_profile": csv_profile,
+            "sqlite_table": sqlite_table,
+            "sqlite_mode": sqlite_mode,
             "use_template": False,
         }
 
@@ -10717,6 +11509,8 @@ def run_gui(connection_store, output_directory):
     
         output_format = params["output_format"]
         csv_profile = params.get("csv_profile")
+        sqlite_table = params.get("sqlite_table")
+        sqlite_mode = params.get("sqlite_mode", "replace")
     
         def _handle_export_error(exc: Exception):
             if isinstance(exc, XlsxSizeError):
@@ -10808,6 +11602,8 @@ def run_gui(connection_store, output_directory):
                 )
                 if output_format == "csv" and csv_profile:
                     msg += "\n" + t("MSG_SAVED_DETAILS_CSV", profile=csv_profile.get("name", ""))
+                if output_format == "sqlite" and sqlite_table:
+                    msg += "\n" + t("MSG_SAVED_DETAILS_SQLITE", table=sqlite_table, mode=sqlite_mode)
             else:
                 safe_sql_dur = _coerce_seconds(sql_dur)
                 msg = t(
@@ -10817,7 +11613,13 @@ def run_gui(connection_store, output_directory):
                 )
                 if output_format == "csv" and csv_profile:
                     msg += "\n" + t("MSG_SAVED_DETAILS_CSV", profile=csv_profile.get("name", ""))
-    
+                if (
+                    output_format == "sqlite"
+                    and sqlite_table
+                    and (sqlite_mode or "replace").strip().lower() == "replace"
+                ):
+                    msg += "\n" + t("MSG_NO_ROWS_SQLITE_CLEARED", table=sqlite_table)
+
             result_info_var.set(msg)
             messagebox.showinfo(t("MSG_DONE"), msg)
             btn_open_file.config(state=tk.NORMAL)
@@ -10887,6 +11689,8 @@ def run_gui(connection_store, output_directory):
                     report_step(t("PROGRESS_EXPORTING_CSV"))
                 elif phase == "export_xlsx":
                     report_step(t("PROGRESS_EXPORTING_XLSX"))
+                elif phase == "export_sqlite":
+                    report_step(t("PROGRESS_EXPORTING_SQLITE"))
 
             if params.get("use_template"):
                 template = params["template"]
@@ -10911,6 +11715,8 @@ def run_gui(connection_store, output_directory):
                     params["output_file_path"],
                     output_format,
                     csv_profile=csv_profile,
+                    sqlite_table=sqlite_table,
+                    sqlite_mode=sqlite_mode,
                     db_timeout_seconds=db_timeout_seconds,
                     export_timeout_seconds=export_timeout_seconds,
                     cancel_event=cancel_state["event"],
@@ -11587,6 +12393,15 @@ def run_gui(connection_store, output_directory):
     )
     radio_csv.grid(row=0, column=1, sticky="w")
     i18n_widgets["radio_csv"] = radio_csv
+    radio_sqlite = ttk.Radiobutton(
+        format_frame,
+        text=t("FORMAT_SQLITE"),
+        variable=format_var,
+        value="sqlite",
+        command=on_format_change,
+    )
+    radio_sqlite.grid(row=0, column=2, sticky="w")
+    i18n_widgets["radio_sqlite"] = radio_sqlite
 
     on_format_change()
 
@@ -11625,21 +12440,61 @@ def run_gui(connection_store, output_directory):
     )
     lbl_default_csv.grid(row=2, column=0, columnspan=4, sticky="w", pady=(5, 0))
 
+    lbl_sqlite_table = ttk.Label(format_frame, text=t("LBL_SQLITE_TABLE"))
+    lbl_sqlite_table.grid(row=3, column=0, sticky="w", pady=(8, 0))
+    sqlite_state["table_label"] = lbl_sqlite_table
+    i18n_widgets["lbl_sqlite_table"] = lbl_sqlite_table
+    ent_sqlite_table = ttk.Entry(format_frame, textvariable=sqlite_table_var, width=25)
+    ent_sqlite_table.grid(row=3, column=1, sticky="w", pady=(8, 0))
+    sqlite_state["table_entry"] = ent_sqlite_table
+    sqlite_table_var.trace_add("write", lambda *_: refresh_run_state())
+
+    lbl_sqlite_mode = ttk.Label(format_frame, text=t("LBL_SQLITE_MODE"))
+    lbl_sqlite_mode.grid(row=3, column=2, sticky="w", pady=(8, 0))
+    sqlite_state["mode_label"] = lbl_sqlite_mode
+    i18n_widgets["lbl_sqlite_mode"] = lbl_sqlite_mode
+    sqlite_mode_combo = ttk.Combobox(
+        format_frame,
+        textvariable=sqlite_mode_display_var,
+        state="readonly",
+        width=14,
+        values=[t("SQLITE_MODE_REPLACE"), t("SQLITE_MODE_APPEND")],
+    )
+    sqlite_mode_combo.grid(row=3, column=3, sticky="w", pady=(8, 0))
+    sqlite_state["mode_combo"] = sqlite_mode_combo
+
+    def _sqlite_mode_label_to_value(value: str) -> str:
+        if value == t("SQLITE_MODE_APPEND"):
+            return "append"
+        return "replace"
+
+    def _sqlite_mode_value_to_label(value: str) -> str:
+        return t("SQLITE_MODE_APPEND") if value == "append" else t("SQLITE_MODE_REPLACE")
+
+    sqlite_mode_var.set("replace")
+    sqlite_mode_display_var.set(_sqlite_mode_value_to_label("replace"))
+
+    def on_sqlite_mode_change(_event=None):  # noqa: ANN001
+        sqlite_mode_var.set(_sqlite_mode_label_to_value(sqlite_mode_display_var.get()))
+
+    sqlite_mode_combo.bind("<<ComboboxSelected>>", on_sqlite_mode_change)
+    update_sqlite_controls_state()
+
     lbl_save_as = ttk.Label(format_frame, text=t("LBL_SAVE_AS"))
-    lbl_save_as.grid(row=3, column=0, sticky="w", pady=(8, 0))
+    lbl_save_as.grid(row=4, column=0, sticky="w", pady=(8, 0))
     i18n_widgets["lbl_save_as"] = lbl_save_as
 
     ent_save_as = ttk.Entry(format_frame, textvariable=save_as_path_var)
-    ent_save_as.grid(row=3, column=1, sticky="we", pady=(8, 0))
+    ent_save_as.grid(row=4, column=1, sticky="we", pady=(8, 0))
     ent_save_as.bind("<FocusOut>", lambda *_: _sync_save_as_extension(show_info=False))
     ent_save_as.bind("<Return>", lambda *_: _sync_save_as_extension(show_info=False))
 
     btn_save_as = ttk.Button(format_frame, text=t("BTN_SAVE_AS"), command=choose_save_as_path)
-    btn_save_as.grid(row=3, column=2, padx=(10, 0), pady=(8, 0), sticky="w")
+    btn_save_as.grid(row=4, column=2, padx=(10, 0), pady=(8, 0), sticky="w")
     i18n_widgets["btn_save_as"] = btn_save_as
 
     btn_clear_save_as = ttk.Button(format_frame, text=t("BTN_CLEAR"), command=clear_save_as_path)
-    btn_clear_save_as.grid(row=3, column=3, padx=(8, 0), pady=(8, 0), sticky="w")
+    btn_clear_save_as.grid(row=4, column=3, padx=(8, 0), pady=(8, 0), sticky="w")
     i18n_widgets["btn_clear_save_as"] = btn_clear_save_as
 
     lbl_save_as_hint = ttk.Label(
@@ -11647,7 +12502,7 @@ def run_gui(connection_store, output_directory):
         text=t("LBL_SAVE_AS_HINT", dir=shorten_path(output_directory, max_len=60)),
         foreground="gray40",
     )
-    lbl_save_as_hint.grid(row=4, column=0, columnspan=4, sticky="w", pady=(4, 0))
+    lbl_save_as_hint.grid(row=5, column=0, columnspan=4, sticky="w", pady=(4, 0))
     i18n_widgets["lbl_save_as_hint"] = lbl_save_as_hint
 
     refresh_csv_profile_controls(csv_profile_state["config"].get("default_profile"))
@@ -11877,14 +12732,16 @@ def run_gui(connection_store, output_directory):
         btn_paste_sql.config(text=t("BTN_PASTE_SQL"))
         radio_xlsx.config(text=t("FORMAT_XLSX"))
         radio_csv.config(text=t("FORMAT_CSV"))
+        radio_sqlite.config(text=t("FORMAT_SQLITE"))
         lbl_csv_profile.config(text=t("LBL_CSV_PROFILE"))
         csv_profile_manage_btn.config(text=t("BTN_MANAGE_CSV_PROFILES"))
-        lbl_save_as.config(text=t("LBL_SAVE_AS"))
+        lbl_sqlite_table.config(text=t("LBL_SQLITE_TABLE"))
+        lbl_sqlite_mode.config(text=t("LBL_SQLITE_MODE"))
+        sqlite_mode_combo.configure(values=[t("SQLITE_MODE_REPLACE"), t("SQLITE_MODE_APPEND")])
+        sqlite_mode_display_var.set(_sqlite_mode_value_to_label(sqlite_mode_var.get()))
         btn_save_as.config(text=t("BTN_SAVE_AS"))
         btn_clear_save_as.config(text=t("BTN_CLEAR"))
-        lbl_save_as_hint.config(
-            text=t("LBL_SAVE_AS_HINT", dir=shorten_path(output_directory, max_len=60))
-        )
+        update_save_as_labels()
         chk_use_template.config(text=t("CHK_USE_TEMPLATE"))
         lbl_template_file.config(text=t("LBL_TEMPLATE_FILE"))
         choose_template_btn.config(text=t("BTN_SELECT_TEMPLATE"))
@@ -12750,8 +13607,15 @@ if __name__ == "__main__":
     parser.add_argument("--self-test", action="store_true", help=t("CLI_SELF_TEST_HELP"))
     parser.add_argument("-c", "--console", action="store_true", help=t("CLI_CONSOLE_HELP"))
     parser.add_argument("--sql", help=t("CLI_SQL_HELP"))
-    parser.add_argument("--format", choices=["xlsx", "csv"], help=t("CLI_FORMAT_HELP"))
+    parser.add_argument("--format", choices=["xlsx", "csv", "sqlite"], help=t("CLI_FORMAT_HELP"))
     parser.add_argument("-o", "--output", help=t("CLI_OUTPUT_HELP"))
+    parser.add_argument("--sqlite-table", help=t("CLI_SQLITE_TABLE_HELP"))
+    parser.add_argument(
+        "--sqlite-mode",
+        choices=["replace", "append"],
+        default="replace",
+        help=t("CLI_SQLITE_MODE_HELP"),
+    )
     grp = parser.add_mutually_exclusive_group()
     grp.add_argument("--connection", help=t("CLI_CONNECTION_HELP"))
     grp.add_argument("--demo", action="store_true", help=t("CLI_DEMO_HELP"))
@@ -12908,8 +13772,19 @@ if __name__ == "__main__":
             sys.exit(1)
         sys.exit(0)
 
-    headless = bool(args.sql)
+    headless = bool(args.sql or args.list_connections)
     prefer_gui_prompt = not (headless or args.console)
+
+    if args.list_connections:
+        select_data_dir_for_readonly_cli()
+        store = load_connections()
+        names = [c.get("name", "") for c in (store.get("connections") or []) if c.get("name")]
+        if names:
+            for name in names:
+                print(name)
+        else:
+            print("<none>")
+        sys.exit(0)
 
     # Require runtime deps only for normal app run (GUI / CLI query/export).
     # Avoid GUI popups in CLI mode.
@@ -12922,16 +13797,6 @@ if __name__ == "__main__":
         prefer_gui_prompt=prefer_gui_prompt,
         headless=headless,
     )
-
-    if args.list_connections:
-        store = load_connections()
-        names = [c.get("name", "") for c in (store.get("connections") or []) if c.get("name")]
-        if names:
-            for name in names:
-                print(name)
-        else:
-            print("<none>")
-        sys.exit(0)
 
     if args.lang:
         set_lang(args.lang)
@@ -13069,6 +13934,8 @@ if __name__ == "__main__":
                 output_format=args.format,
                 output_override=args.output,
                 archive_sql=args.archive_sql,
+                sqlite_table=args.sqlite_table,
+                sqlite_mode=args.sqlite_mode,
             )
             sys.exit(exit_code)
 

@@ -82,8 +82,6 @@ def _collect_t_calls(tree: ast.AST, lines: list[str]) -> list[TCallSite]:
         key: Optional[str] = None
         if isinstance(key_node, ast.Constant) and isinstance(key_node.value, str):
             key = key_node.value
-        elif isinstance(key_node, ast.Str):  # pragma: no cover (old Py)
-            key = key_node.s
 
         if not key:
             continue

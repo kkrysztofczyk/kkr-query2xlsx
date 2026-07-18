@@ -41,13 +41,18 @@ class UpdateCheckerErrorTests(unittest.TestCase):
 
     # --- _parse_retry_hint hardening ---
 
-    def test_parse_retry_hint_huge_retry_after_does_not_raise(self):
-        headers = {"retry-after": "9" * 200}  # absurdalnie duża liczba
-        try:
-            out = self.app._parse_retry_hint(headers)
-        except Exception as exc:  # noqa: BLE001
-            self.fail(f"_parse_retry_hint must not raise, but raised: {exc!r}")
-        self.assertTrue(out is None or isinstance(out, str))
+    def test_parse_retry_hint_without_headers_returns_none(self):
+        self.assertIsNone(self.app._parse_retry_hint(None))
+
+    def test_parse_retry_hint_headers_without_get_returns_none(self):
+        class HeadersWithoutGet:
+            pass
+
+        self.assertIsNone(self.app._parse_retry_hint(HeadersWithoutGet()))
+
+    def test_parse_retry_hint_very_huge_retry_after_does_not_raise(self):
+        headers = {"retry-after": "9" * 10000}
+        self.assertIsNone(self.app._parse_retry_hint(headers))
 
     def test_parse_retry_hint_falls_back_to_reset_when_retry_after_is_invalid(self):
         # Retry-After is absurdly large, but X-RateLimit-Reset is usable -> should not return None.
@@ -76,13 +81,9 @@ class UpdateCheckerErrorTests(unittest.TestCase):
         out = self.app._parse_retry_hint(headers)
         self.assertEqual(out, headers["retry-after"][:64])
 
-    def test_parse_retry_hint_huge_ratelimit_reset_does_not_raise(self):
-        headers = {"x-ratelimit-reset": str(10**200)}
-        try:
-            out = self.app._parse_retry_hint(headers)
-        except Exception as exc:  # noqa: BLE001
-            self.fail(f"_parse_retry_hint must not raise, but raised: {exc!r}")
-        self.assertTrue(out is None or isinstance(out, str))
+    def test_parse_retry_hint_very_huge_ratelimit_reset_does_not_raise(self):
+        headers = {"x-ratelimit-reset": "9" * 10000}
+        self.assertIsNone(self.app._parse_retry_hint(headers))
 
     # --- klasyfikacja błędów ---
 

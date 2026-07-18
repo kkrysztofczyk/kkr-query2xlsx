@@ -43,12 +43,18 @@ Thumbs.db
 .idea/
 .vscode/
 *.bat
-!export-local-diff.bat
 *kkr-query2xlsx.user.json*
 
 # --- Local diff exports ---
 all-local-changes-*.diff
 
+# --- Local review / scratch files ---
+todo.txt
+
 # --- Local AI helpers (not part of the project) ---
 kkr_code2ai.py
 kkr-code2ai.json
+kkr-query2xlsx_combined_*.txt
+kkr-query2xlsx_combined_*.zip
+summary.xlsx
+kkr-code2ai-manifest.txt

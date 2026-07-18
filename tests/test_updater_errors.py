@@ -28,21 +28,19 @@ class UpdaterErrorTests(unittest.TestCase):
         self.assertIsNone(updater._parse_retry_hint({}))
         self.assertIsNone(updater._parse_retry_hint(None))
 
-    def test_parse_retry_hint_huge_retry_after_does_not_raise(self):
-        headers = {"retry-after": "9" * 200}
-        try:
-            out = updater._parse_retry_hint(headers)
-        except Exception as exc:  # noqa: BLE001
-            self.fail(f"_parse_retry_hint must not raise, but raised: {exc!r}")
-        self.assertTrue(out is None or isinstance(out, str))
+    def test_parse_retry_hint_headers_without_get_returns_none(self):
+        class HeadersWithoutGet:
+            pass
 
-    def test_parse_retry_hint_huge_ratelimit_reset_does_not_raise(self):
-        headers = {"x-ratelimit-reset": str(10**200)}
-        try:
-            out = updater._parse_retry_hint(headers)
-        except Exception as exc:  # noqa: BLE001
-            self.fail(f"_parse_retry_hint must not raise, but raised: {exc!r}")
-        self.assertTrue(out is None or isinstance(out, str))
+        self.assertIsNone(updater._parse_retry_hint(HeadersWithoutGet()))
+
+    def test_parse_retry_hint_very_huge_retry_after_does_not_raise(self):
+        headers = {"retry-after": "9" * 10000}
+        self.assertIsNone(updater._parse_retry_hint(headers))
+
+    def test_parse_retry_hint_very_huge_ratelimit_reset_does_not_raise(self):
+        headers = {"x-ratelimit-reset": "9" * 10000}
+        self.assertIsNone(updater._parse_retry_hint(headers))
 
     def test_parse_retry_hint_invalid_retry_after_with_reset_prefers_reset(self):
         with patch.object(updater.time, "time", return_value=1000):
